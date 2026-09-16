@@ -9,7 +9,7 @@ architecture/optimizer classes with no side effects.
 import torch
 import torch.nn.functional as F
 
-from train_gpt_simple import MLP, MoE
+from train_gpt_simple import MLP, MoE, GPT, eager_prefix, make_head_loss
 
 
 def _make_dense_and_moe(dim=32):
@@ -129,3 +129,76 @@ def test_topk_multi_selection_matches_manual_softmax_weights():
                 expert_out = moe.experts[top_idx[i, slot].item()](x[i:i+1]).squeeze(0)
                 expected = expected + expert_out * top_probs[i, slot].type_as(expert_out)
             torch.testing.assert_close(out[i], expected, atol=1e-5, rtol=1e-4)
+
+
+def _make_small_gpt(mlp_type="dense", **moe_kwargs):
+    torch.manual_seed(0)
+    model = GPT(vocab_size=37, num_layers=2, model_dim=16, mlp_type=mlp_type, **moe_kwargs)
+    # Explicit nonzero projection weights: the real training init (in
+    # train_gpt_simple.py's __main__) zeros proj.weight, which would make an
+    # eager-vs-compiled head/loss comparison numerically degenerate (all-zero
+    # logits either way) and is not sufficient validation on its own.
+    model.proj.weight.data.normal_(std=0.02)
+    model.proj.bias.data.normal_(std=0.02)
+    return model
+
+
+_HEAD_LOSS_CONFIGS = [
+    ("dense", {}),
+    ("moe", dict(num_experts=1, top_k=1, normalize_topk=True)),
+]
+
+
+def test_eager_prefix_and_head_loss_match_monolithic_forward():
+    # eager_prefix(model, inputs) -> make_head_loss(model)(x, targets) must be
+    # an exact decomposition of GPT.forward, not an approximation of it.
+    for mlp_type, kwargs in _HEAD_LOSS_CONFIGS:
+        model = _make_small_gpt(mlp_type, **kwargs)
+        inputs = torch.randint(0, 37, (2, 6))
+        targets = torch.randint(0, 37, (2, 6))
+
+        monolithic = model(inputs, targets)
+        x = eager_prefix(model, inputs)
+        split = make_head_loss(model)(x, targets)
+
+        torch.testing.assert_close(split, monolithic)
+
+
+def test_head_loss_eager_vs_compiled_fullgraph_parity():
+    # The head/loss region is meant to run under torch.compile(fullgraph=True)
+    # in train_gpt_simple.py. Check loss AND gradients (w.r.t. both the
+    # block-output activation and the projection weight) match eager, with
+    # nonzero projection weights (see _make_small_gpt) so the check isn't
+    # vacuously true on all-zero logits.
+    for mlp_type, kwargs in _HEAD_LOSS_CONFIGS:
+        model = _make_small_gpt(mlp_type, **kwargs)
+        head_loss = make_head_loss(model)
+        compiled_head_loss = torch.compile(head_loss, fullgraph=True, dynamic=False)
+
+        torch.manual_seed(3)
+        x_base = torch.randn(2, 6, 16, dtype=torch.bfloat16)
+        targets = torch.randint(0, 37, (2, 6))
+
+        for p in model.parameters():
+            p.grad = None
+        x_eager = x_base.clone().requires_grad_(True)
+        loss_eager = head_loss(x_eager, targets)
+        loss_eager.backward()
+        grad_proj_eager = model.proj.weight.grad.clone()
+        grad_x_eager = x_eager.grad.clone()
+
+        for p in model.parameters():
+            p.grad = None
+        x_compiled = x_base.clone().requires_grad_(True)
+        loss_compiled = compiled_head_loss(x_compiled, targets)
+        loss_compiled.backward()
+        grad_proj_compiled = model.proj.weight.grad.clone()
+        grad_x_compiled = x_compiled.grad.clone()
+
+        assert not torch.allclose(grad_proj_eager, torch.zeros_like(grad_proj_eager)), (
+            "grad_proj is all zero -- nonzero-weight setup did not take effect, "
+            "this check would otherwise be degenerate")
+
+        torch.testing.assert_close(loss_compiled, loss_eager, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(grad_proj_compiled, grad_proj_eager, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(grad_x_compiled, grad_x_eager, atol=2e-2, rtol=2e-2)

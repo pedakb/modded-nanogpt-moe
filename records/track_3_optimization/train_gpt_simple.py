@@ -197,6 +197,39 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
 
 
+def eager_prefix(model: "GPT", inputs: Tensor) -> Tensor:
+    """GPT.forward's embed -> norm1 -> blocks section, run eagerly. Used in
+    place of whole-model compilation for mlp_type="moe": the expert dispatch
+    loop inside Block/MoE.forward contains a data-dependent-shaped op inside
+    a Python loop, which torch.compile cannot partially graph-break out of --
+    it skips compiling GPT.forward entirely (dense and MoE alike), dragging
+    the much larger head/loss computation into eager mode with it. Running
+    this prefix eagerly (unchanged from GPT.forward, no dispatch/routing
+    changes) and compiling only the head/loss tail in isolation (see
+    make_head_loss) avoids that, verified on an A100: MoE(E=1,k=1) eval peak
+    allocated dropped from an OOM (>37 GiB) to 6.944 GiB."""
+    x = model.norm1(model.embed(inputs))
+    for block in model.blocks:
+        x = block(x)
+    return x
+
+
+def make_head_loss(model: "GPT"):
+    """GPT.forward's tail -- norm2 -> proj -> float -> softcap ->
+    cross_entropy(reduction="sum") -- as a standalone callable closing over
+    model.norm2/model.proj directly (the same nn.Parameter objects; no
+    duplication), meant to be wrapped in torch.compile(fullgraph=True) and
+    called on eager_prefix's output. Byte-for-byte the same computation,
+    dtype casts, and loss reduction/scaling as GPT.forward -- this function
+    exists so the tail can be compiled independently of the (uncompiled)
+    block loop, not to change what is computed."""
+    def head_loss(x: Tensor, targets: Tensor) -> Tensor:
+        logits = model.proj(model.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+    return head_loss
+
+
 ########################################
 #              Optimizer               #
 ########################################
@@ -273,7 +306,8 @@ if __name__ == "__main__":
     # logging setup
     if dist.get_rank() == 0:
         os.makedirs("logs", exist_ok=True)
-        logfile = f"logs/{uuid.uuid4()}.txt"
+        run_id = uuid.uuid4()
+        logfile = f"logs/{run_id}.txt"
         print(logfile)
     def print0(s, console=False, log=True):
         if dist.get_rank() == 0:
@@ -297,19 +331,43 @@ if __name__ == "__main__":
 
     # MLP architecture: "dense" is the original single MLP; "moe" is a SparseMoE
     # of num_experts experts, routing each token to its top_k experts.
-    mlp_type = "dense"   # "dense" or "moe"
+    # (MLP_TYPE_OVERRIDE: opt-in override for smoke tests; unset -> unchanged "dense" default)
+    mlp_type = os.environ.get("MLP_TYPE_OVERRIDE", "dense")   # "dense" or "moe"
     num_experts = 1
     top_k = 1
     normalize_topk = True
 
+    # tensorboard logging (disabled by default; rank 0 only)
+    tensorboard_log = False
+
     model = GPT(vocab_size=50304, num_layers=12, model_dim=768, mlp_type=mlp_type,
                 num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk).cuda()
-    model.compile(dynamic=False)
+
+    # Compilation strategy, constructed once, outside the trial/step loops:
+    # - dense: unchanged whole-model compile (existing baseline, untouched).
+    # - moe: the expert dispatch loop forces a graph break inside GPT.forward's
+    #   own block loop, which skips compiling the WHOLE frame (including the
+    #   much larger head/loss tail) for either mlp_type. Instead, run the
+    #   block loop eagerly (dispatch/routing unchanged) and compile only the
+    #   head/loss tail, in isolation, with fullgraph=True so any future
+    #   internal break in that region fails loudly instead of silently
+    #   falling back. Verified on an A100 (eval peak 6.944 GiB vs an OOM).
+    if mlp_type == "dense":
+        model.compile(dynamic=False)
+        def run_forward(inputs, targets):
+            return model(inputs, targets)
+    elif mlp_type == "moe":
+        compiled_head_loss = torch.compile(make_head_loss(model), fullgraph=True, dynamic=False)
+        def run_forward(inputs, targets):
+            x = eager_prefix(model, inputs)
+            return compiled_head_loss(x, targets)
+    else:
+        raise ValueError(f"unknown mlp_type: {mlp_type!r}")
 
 
     num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
 
-    for _ in range(num_trials):
+    for trial_idx in range(num_trials):
 
 
         ########################################
@@ -317,7 +375,8 @@ if __name__ == "__main__":
         ########################################
 
         # we want to minimize this while still reaching 3.28 val loss
-        train_steps = 3250
+        # (TRAIN_STEPS_OVERRIDE: opt-in override for short smoke tests; unset -> unchanged default)
+        train_steps = int(os.environ.get("TRAIN_STEPS_OVERRIDE", 3250))
 
         # initialize model parameters
         for name, p in model.named_parameters():
@@ -368,6 +427,14 @@ if __name__ == "__main__":
         ########################################
 
         train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+
+        # tensorboard writer: rank 0 only, one run directory per trial, disabled by default
+        writer = None
+        if tensorboard_log and dist.get_rank() == 0:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_dir = os.path.join("logs", str(run_id), "tensorboard", f"trial_{trial_idx}")
+            writer = SummaryWriter(log_dir=tb_dir)
+
         for p in model.parameters():
             dist.broadcast(p.detach(), 0)
         # start the clock
@@ -391,11 +458,20 @@ if __name__ == "__main__":
                 with torch.no_grad():
                     assert len(val_inputs) % mbs == 0
                     for i in range(len(val_inputs) // mbs):
-                        val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+                        val_loss += run_forward(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
                 dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
                 val_loss /= val_tokens
                 print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
-                       + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+                       + f" step_avg:{1000*step_avg:.2f}ms"
+                       + f" mem_alloc:{torch.cuda.memory_allocated()/2**30:.3f}GiB"
+                       + f" mem_alloc_peak:{torch.cuda.max_memory_allocated()/2**30:.3f}GiB"
+                       + f" mem_reserved:{torch.cuda.memory_reserved()/2**30:.3f}GiB"
+                       + f" mem_reserved_peak:{torch.cuda.max_memory_reserved()/2**30:.3f}GiB",
+                       console=True)
+                if writer is not None:
+                    writer.add_scalar("eval/val_loss", float(val_loss), step)
+                    writer.add_scalar("perf/step_avg_ms", 1000 * step_avg, step)
+                    writer.flush()
                 model.train()
                 # start the clock again
                 dist.barrier()
@@ -409,17 +485,33 @@ if __name__ == "__main__":
             # accumulate across microbatches in case we are running with fewer than 8 gpus
             assert len(inputs) % mbs == 0
             for i in range(len(inputs) // mbs):
-                model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+                run_forward(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
             for name, p in model.named_parameters():
                 assert p.grad is not None, name
                 dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
             # set optimization hyperparameters and take a step
             set_hparams(step)
+            if writer is not None:
+                for opt_idx, opt in enumerate(optimizers):
+                    for grp_idx, group in enumerate(opt.param_groups):
+                        writer.add_scalar(f"optim/lr_opt{opt_idx}_group{grp_idx}", group["lr"], step)
             for opt in optimizers:
                 opt.step()
             model.zero_grad(set_to_none=True)
             approx_training_time = training_time + (time.perf_counter() - t0)
             print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-                   + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+                   + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms"
+                   + f" mem_alloc:{torch.cuda.memory_allocated()/2**30:.3f}GiB"
+                   + f" mem_alloc_peak:{torch.cuda.max_memory_allocated()/2**30:.3f}GiB"
+                   + f" mem_reserved:{torch.cuda.memory_reserved()/2**30:.3f}GiB"
+                   + f" mem_reserved_peak:{torch.cuda.max_memory_reserved()/2**30:.3f}GiB",
+                   console=True, log=False)
+            if writer is not None:
+                writer.add_scalar("perf/approx_training_time_s", approx_training_time, step + 1)
+                writer.add_scalar("perf/step_avg_ms", 1000 * approx_training_time / (step + 1), step + 1)
+                writer.flush()
+
+        if writer is not None:
+            writer.close()
 
     dist.destroy_process_group()
