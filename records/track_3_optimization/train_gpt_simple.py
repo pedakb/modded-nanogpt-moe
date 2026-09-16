@@ -7,8 +7,6 @@ It was prepared as a simplified version of the speedrun for use in neural net op
 
 import os
 import sys
-with open(sys.argv[0]) as f:
-    code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import time
 from pathlib import Path
@@ -125,11 +123,50 @@ class MLP(nn.Module):
         x = self.proj(x)
         return x
 
+class MoE(nn.Module):
+    """Top-k routed sparse MoE. Each expert is an MLP identical in architecture,
+    init, and dtype behavior to the dense MLP above. num_experts=1, top_k=1 reduces
+    exactly to a single MLP: softmax over one logit is always 1, so expert 0 receives
+    every token with routing weight 1."""
+    def __init__(self, dim: int, num_experts: int, top_k: int, normalize_topk: bool = True):
+        super().__init__()
+        assert 1 <= top_k <= num_experts
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.normalize_topk = normalize_topk
+        self.router = Linear(dim, num_experts)
+        self.experts = nn.ModuleList(MLP(dim) for _ in range(num_experts))
+
+    def forward(self, x: Tensor):
+        B, T, D = x.shape
+        x = x.view(-1, D)
+
+        router_logits = self.router(x)
+        routing_weights = F.softmax(router_logits.float(), dim=-1)
+        topk_weights, topk_experts = routing_weights.topk(self.top_k, dim=-1)
+        if self.normalize_topk:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights.type_as(x)
+
+        out = x.new_zeros(x.shape)
+        for expert_idx, expert in enumerate(self.experts):
+            token_idx, slot_idx = torch.where(topk_experts == expert_idx)
+            if token_idx.numel() == 0:
+                continue
+            out.index_add_(0, token_idx, expert(x[token_idx]) * topk_weights[token_idx, slot_idx, None])
+        return out.view(B, T, D)
+
 class Block(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, mlp_type: str = "dense", num_experts: int = 1,
+                 top_k: int = 1, normalize_topk: bool = True):
         super().__init__()
         self.attn = CausalSelfAttention(dim)
-        self.mlp = MLP(dim)
+        if mlp_type == "dense":
+            self.mlp = MLP(dim)
+        elif mlp_type == "moe":
+            self.mlp = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk)
+        else:
+            raise ValueError(f"unknown mlp_type: {mlp_type!r}")
         self.norm1 = RMSNorm(dim)
         self.norm2 = RMSNorm(dim)
 
@@ -139,10 +176,14 @@ class Block(nn.Module):
         return x
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int, mlp_type: str = "dense",
+                 num_experts: int = 1, top_k: int = 1, normalize_topk: bool = True):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
-        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([
+            Block(model_dim, mlp_type=mlp_type, num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk)
+            for _ in range(num_layers)
+        ])
         self.proj = Linear(model_dim, vocab_size)
         self.norm1 = RMSNorm(model_dim)
         self.norm2 = RMSNorm(model_dim)
@@ -217,156 +258,168 @@ class Muon(torch.optim.Optimizer):
 #                Setup                 #
 ########################################
 
-# torchrun sets these env variables
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
-dist.barrier()
-# this code can be run equivalently with 1, 2, 4, or 8 gpus.
-assert 8 % dist.get_world_size() == 0
+if __name__ == "__main__":
+    with open(sys.argv[0]) as f:
+        code = f.read() # read the code of this file ASAP, for logging
 
-# logging setup
-if dist.get_rank() == 0:
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{uuid.uuid4()}.txt"
-    print(logfile)
-def print0(s, console=False, log=True):
+    # torchrun sets these env variables
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    dist.barrier()
+    # this code can be run equivalently with 1, 2, 4, or 8 gpus.
+    assert 8 % dist.get_world_size() == 0
+
+    # logging setup
     if dist.get_rank() == 0:
-        if console:
-            print(s)
-        if log:
-            with open(logfile, "a") as f:
-                print(s, file=f)
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{uuid.uuid4()}.txt"
+        print(logfile)
+    def print0(s, console=False, log=True):
+        if dist.get_rank() == 0:
+            if console:
+                print(s)
+            if log:
+                with open(logfile, "a") as f:
+                    print(s, file=f)
 
-# we begin by logging this file itself
-print0(code)
-print0("="*100)
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
-       + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
-print0("="*100)
+    # we begin by logging this file itself
+    print0(code)
+    print0("="*100)
+    print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+           + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
+    print0("="*100)
 
-val_tokens = 20 * 524288
-batch_size = 8 * 64 * 1024
-mbs = 64
-val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+    val_tokens = 20 * 524288
+    batch_size = 8 * 64 * 1024
+    mbs = 64
+    val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
-model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
-model.compile(dynamic=False)
+    # MLP architecture: "dense" is the original single MLP; "moe" is a SparseMoE
+    # of num_experts experts, routing each token to its top_k experts.
+    mlp_type = "dense"   # "dense" or "moe"
+    num_experts = 1
+    top_k = 1
+    normalize_topk = True
+
+    model = GPT(vocab_size=50304, num_layers=12, model_dim=768, mlp_type=mlp_type,
+                num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk).cuda()
+    model.compile(dynamic=False)
 
 
-num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
+    num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
 
-for _ in range(num_trials):
+    for _ in range(num_trials):
 
 
-    ########################################
-    #       Init & Optim Hyperparams       #
-    ########################################
+        ########################################
+        #       Init & Optim Hyperparams       #
+        ########################################
 
-    # we want to minimize this while still reaching 3.28 val loss
-    train_steps = 3250
+        # we want to minimize this while still reaching 3.28 val loss
+        train_steps = 3250
 
-    # initialize model parameters
-    for name, p in model.named_parameters():
-        w = p.data
-        if name.endswith("weight"):
-            if "proj" in name:
+        # initialize model parameters
+        for name, p in model.named_parameters():
+            w = p.data
+            if name.endswith("weight"):
+                if "proj" in name:
+                    w.zero_()
+                elif "embed" in name:
+                    w.normal_()  # default torch init
+                else:
+                    w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+            elif name.endswith("bias"):
                 w.zero_()
-            elif "embed" in name:
-                w.normal_()  # default torch init
+            elif name.endswith("gains"):
+                w.normal_(mean=1, std=0)
             else:
-                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
-        elif name.endswith("bias"):
-            w.zero_()
-        elif name.endswith("gains"):
-            w.normal_(mean=1, std=0)
-        else:
-            raise Exception(f"Uninitialized parameter: {name}")
+                raise Exception(f"Uninitialized parameter: {name}")
 
-    # create the optimizer(s)
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
-                        dict(params=[model.proj.weight], lr=0.004),
-                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
-    optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.05)
-    optimizers = [optimizer1, optimizer2]
-    assert set(p for opt in optimizers for group in opt.param_groups
-               for p in group["params"]) == set(model.parameters())
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["initial_lr"] = group["lr"]
-
-    # learning rate schedule: stable then decay
-    def set_hparams(step, cooldown_frac=0.7):
-        progress = step / train_steps
-        assert 0 <= progress < 1
-        if progress < 1 - cooldown_frac:
-            eta = 1.0
-        else:
-            eta = (1 - progress) / cooldown_frac
+        # create the optimizer(s)
+        optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
+                            dict(params=[model.proj.weight], lr=0.004),
+                            dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
+                           betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
+        optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
+                          lr=0.025, weight_decay=0.05)
+        optimizers = [optimizer1, optimizer2]
+        assert set(p for opt in optimizers for group in opt.param_groups
+                   for p in group["params"]) == set(model.parameters())
         for opt in optimizers:
             for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * eta
+                group["initial_lr"] = group["lr"]
+
+        # learning rate schedule: stable then decay
+        def set_hparams(step, cooldown_frac=0.7):
+            progress = step / train_steps
+            assert 0 <= progress < 1
+            if progress < 1 - cooldown_frac:
+                eta = 1.0
+            else:
+                eta = (1 - progress) / cooldown_frac
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["lr"] = group["initial_lr"] * eta
 
 
-    ########################################
-    #        Training and Validation       #
-    ########################################
+        ########################################
+        #        Training and Validation       #
+        ########################################
 
-    train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
-    for p in model.parameters():
-        dist.broadcast(p.detach(), 0)
-    # start the clock
-    training_time = 0
-    last_val_step = 0
-    dist.barrier()
-    t0 = time.perf_counter()
-    for step in range(train_steps + 1):
+        train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+        for p in model.parameters():
+            dist.broadcast(p.detach(), 0)
+        # start the clock
+        training_time = 0
+        last_val_step = 0
+        dist.barrier()
+        t0 = time.perf_counter()
+        for step in range(train_steps + 1):
 
-        # --------------- VALIDATION SECTION -----------------
-        val_step_freq = 125 if step / train_steps < 0.9 else 25
-        if step == train_steps or step % val_step_freq == 0:
-            # stop the clock
-            dist.barrier()
-            time_since_last_val = time.perf_counter() - t0
-            step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
-            last_val_step = step
-            training_time += time_since_last_val
-            model.eval()
-            val_loss = 0
-            with torch.no_grad():
-                assert len(val_inputs) % mbs == 0
-                for i in range(len(val_inputs) // mbs):
-                    val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
-            dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
-            val_loss /= val_tokens
-            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
-                   + f" step_avg:{1000*step_avg:.2f}ms", console=True)
-            model.train()
-            # start the clock again
-            dist.barrier()
-            t0 = time.perf_counter()
+            # --------------- VALIDATION SECTION -----------------
+            val_step_freq = 125 if step / train_steps < 0.9 else 25
+            if step == train_steps or step % val_step_freq == 0:
+                # stop the clock
+                dist.barrier()
+                time_since_last_val = time.perf_counter() - t0
+                step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
+                last_val_step = step
+                training_time += time_since_last_val
+                model.eval()
+                val_loss = 0
+                with torch.no_grad():
+                    assert len(val_inputs) % mbs == 0
+                    for i in range(len(val_inputs) // mbs):
+                        val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+                dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+                val_loss /= val_tokens
+                print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+                       + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+                model.train()
+                # start the clock again
+                dist.barrier()
+                t0 = time.perf_counter()
 
-        if step == train_steps:
-            break
+            if step == train_steps:
+                break
 
-        # --------------- TRAINING SECTION -----------------
-        inputs, targets = next(train_loader)
-        # accumulate across microbatches in case we are running with fewer than 8 gpus
-        assert len(inputs) % mbs == 0
-        for i in range(len(inputs) // mbs):
-            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
-        for name, p in model.named_parameters():
-            assert p.grad is not None, name
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-        # set optimization hyperparameters and take a step
-        set_hparams(step)
-        for opt in optimizers:
-            opt.step()
-        model.zero_grad(set_to_none=True)
-        approx_training_time = training_time + (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-               + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+            # --------------- TRAINING SECTION -----------------
+            inputs, targets = next(train_loader)
+            # accumulate across microbatches in case we are running with fewer than 8 gpus
+            assert len(inputs) % mbs == 0
+            for i in range(len(inputs) // mbs):
+                model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+            for name, p in model.named_parameters():
+                assert p.grad is not None, name
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            # set optimization hyperparameters and take a step
+            set_hparams(step)
+            for opt in optimizers:
+                opt.step()
+            model.zero_grad(set_to_none=True)
+            approx_training_time = training_time + (time.perf_counter() - t0)
+            print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+                   + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
-dist.destroy_process_group()
+    dist.destroy_process_group()
