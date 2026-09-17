@@ -19,13 +19,14 @@ trans_b)` callable is injected. Two are provided:
   - reference_gmm: pure PyTorch (a per-group loop of `torch.matmul`), works
     on CPU or CUDA, no extension required. Mathematically equivalent to
     grouped_gemm.ops.gmm by construction, NOT a claim about the real CUDA
-    kernels' correctness. This is what --backend reference exercises, and
-    is what has actually been run (on this machine, CPU, no GPU available)
-    while writing this harness.
+    kernels' correctness. This is what --backend reference exercises.
   - real_gmm: a thin wrapper around the real `grouped_gemm.ops.gmm`
     (fanshiqing/grouped_gemm). Requires CUDA and the package installed --
-    see INSTALL. This is the actual milestone validation and is PENDING: it
-    has not been run anywhere yet.
+    see INSTALL. BF16 correctness passed on an LS6 A100 for all eight
+    correctness cases (both layouts, including empty experts), with a
+    profiler-observed CUTLASS GemmGrouped execution. Performance is not
+    implied by that correctness result; --mode benchmark and --mode profile
+    below are the opt-in performance diagnostics.
 
 No GPU-capability assumption (SM80 or otherwise) is hardcoded anywhere in
 GroupedGemmMoE or in the pack/combine logic: `torch.cuda.get_device_capability()`
@@ -87,7 +88,7 @@ grouped_gemm/csrc/grouped_gemm.cu and grouped_gemm/ops.py:
   three ever is, and only on capability 8.0.
 
 ================================================================================
-INSTALL (LS6 / A100 / SM80 -- validate this first; nothing has been run)
+INSTALL (LS6 / A100 / SM80)
 
 Package: `nv-grouped-gemm` on PyPI (source: github.com/fanshiqing/grouped_gemm).
 NOT the same as PyPI `grouped-gemm` (tgale96's original -- a different,
@@ -222,8 +223,16 @@ Vista / GH200 / SM90 -- documented for later, UNVERIFIED, do not treat as tested
 ================================================================================
 """
 import argparse
+import copy
+import gc
+import hashlib
 import os
+from pathlib import Path
+import re
+import statistics
 import sys
+import time
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -307,7 +316,7 @@ class GroupedGemmMoE(nn.Module):
              an arbitrary transposed view."""
 
     def __init__(self, dim, num_experts, top_k, normalize_topk=True, gmm_fn=reference_gmm,
-                 forward_trans_b=True):
+                 forward_trans_b=True, profile_stages=False):
         super().__init__()
         assert 1 <= top_k <= num_experts
         self.num_experts = num_experts
@@ -315,6 +324,7 @@ class GroupedGemmMoE(nn.Module):
         self.normalize_topk = normalize_topk
         self.gmm_fn = gmm_fn
         self.forward_trans_b = forward_trans_b
+        self.profile_stages = profile_stages
         hdim = 4 * dim
         self.router = tgs.Linear(dim, num_experts)
         self.fc_weight = nn.ParameterList(nn.Parameter(torch.empty(hdim, dim)) for _ in range(num_experts))
@@ -342,47 +352,59 @@ class GroupedGemmMoE(nn.Module):
         # back to the original [out, in] Parameters through both ops.
         return w.transpose(-2, -1).contiguous()  # [E, in, out]
 
+    def _scope(self, name):
+        return torch.profiler.record_function(name) if self.profile_stages else nullcontext()
+
     def forward(self, x):
         B, T, D = x.shape
         x = x.reshape(-1, D)
         N = x.shape[0]
         device = x.device
 
-        router_logits = self.router(x)
-        routing_weights = F.softmax(router_logits.float(), dim=-1)
-        topk_weights, topk_experts = routing_weights.topk(self.top_k, dim=-1)
-        if self.normalize_topk:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights.type_as(x)
+        with self._scope("moe.routing"):
+            router_logits = self.router(x)
+            routing_weights = F.softmax(router_logits.float(), dim=-1)
+            topk_weights, topk_experts = routing_weights.topk(self.top_k, dim=-1)
+            if self.normalize_topk:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights = topk_weights.type_as(x)
 
         # ---- pack assignments by expert (backend-independent) ----
-        flat_experts = topk_experts.reshape(-1)                                    # [N*k]
-        flat_tokens = torch.arange(N, device=device).repeat_interleave(self.top_k)  # [N*k]
-        order = torch.argsort(flat_experts, stable=True)
-        sorted_experts = flat_experts[order]
-        x_sorted = x[flat_tokens[order]]  # gather of ACTIVATIONS; never a weight copy
+        with self._scope("moe.pack"):
+            flat_experts = topk_experts.reshape(-1)                                    # [N*k]
+            flat_tokens = torch.arange(N, device=device).repeat_interleave(self.top_k)  # [N*k]
+            order = torch.argsort(flat_experts, stable=True)
+            sorted_experts = flat_experts[order]
+            x_sorted = x[flat_tokens[order]]  # gather of ACTIVATIONS; never a weight copy
 
         # Required CPU int64 token-count metadata for grouped_gemm, and the
         # one explicit device-to-host sync that produces it (see real_gmm's
         # docstring and INSTALL notes above). bincount runs on `device`;
         # only the resulting length-E tensor is synced to host, not the
         # (potentially large) activations.
-        batch_sizes = torch.bincount(sorted_experts, minlength=self.num_experts).to(torch.int64).cpu()
+        with self._scope("moe.count_and_cpu_transfer"):
+            batch_sizes = torch.bincount(sorted_experts, minlength=self.num_experts).to(torch.int64).cpu()
 
-        fc_w = self._stacked_weight(self.fc_weight).type_as(x_sorted)
-        fc_b = torch.stack(list(self.fc_bias)).type_as(x_sorted)        # [E, 4D]
-        proj_w = self._stacked_weight(self.proj_weight).type_as(x_sorted)
-        proj_b = torch.stack(list(self.proj_bias)).type_as(x_sorted)    # [E, D]
+        with self._scope("moe.fc1_weight_stack_and_layout"):
+            fc_w = self._stacked_weight(self.fc_weight).type_as(x_sorted)
+            fc_b = torch.stack(list(self.fc_bias)).type_as(x_sorted)        # [E, 4D]
+        with self._scope("moe.fc2_weight_stack_and_layout"):
+            proj_w = self._stacked_weight(self.proj_weight).type_as(x_sorted)
+            proj_b = torch.stack(list(self.proj_bias)).type_as(x_sorted)    # [E, D]
 
-        h = self.gmm_fn(x_sorted, fc_w, batch_sizes, trans_b=self.forward_trans_b) + fc_b[sorted_experts]
-        h = h.relu().square()
-        out_sorted = (self.gmm_fn(h.type_as(x_sorted), proj_w, batch_sizes, trans_b=self.forward_trans_b)
-                      + proj_b[sorted_experts])
+        with self._scope("moe.fc1_grouped_gemm_and_bias"):
+            h = self.gmm_fn(x_sorted, fc_w, batch_sizes, trans_b=self.forward_trans_b) + fc_b[sorted_experts]
+        with self._scope("moe.activation"):
+            h = h.relu().square()
+        with self._scope("moe.fc2_grouped_gemm_and_bias"):
+            out_sorted = (self.gmm_fn(h.type_as(x_sorted), proj_w, batch_sizes,
+                                      trans_b=self.forward_trans_b) + proj_b[sorted_experts])
 
         # ---- unpermute + weighted combine (backend-independent) ----
-        out_flat = torch.empty_like(out_sorted)
-        out_flat[order] = out_sorted
-        out = (out_flat.view(N, self.top_k, D) * topk_weights.unsqueeze(-1)).sum(dim=1)
+        with self._scope("moe.combine"):
+            out_flat = torch.empty_like(out_sorted)
+            out_flat[order] = out_sorted
+            out = (out_flat.view(N, self.top_k, D) * topk_weights.unsqueeze(-1)).sum(dim=1)
         return out.view(B, T, D)
 
 
@@ -482,6 +504,234 @@ CASES = [
 ]
 
 
+# The first case exactly matches one training MoE layer's flattened token and
+# matrix dimensions. The E=8 case intentionally uses 1/16 as many tokens so
+# all three implementations can be investigated quickly before committing to
+# a full training-step profile.
+BENCHMARK_CASES = {
+    "train_e1_k1": dict(name="train_e1_k1", batch=64, seq_len=1024, dim=768,
+                         num_experts=1, top_k=1, seed=101),
+    "small_e8_k2": dict(name="small_e8_k2", batch=4, seq_len=1024, dim=768,
+                         num_experts=8, top_k=2, seed=202),
+}
+
+BENCHMARK_CONFIGS = (
+    ("loop", None),
+    ("grouped_trans_b_false", False),
+    ("grouped_trans_b_true", True),
+)
+
+
+def _make_benchmark_inputs(case, activation_dtype):
+    """Create one CPU source of truth reused by every sequential config.
+
+    Production keeps MoE parameters in FP32 (`GPT(...).cuda()`) and receives
+    BF16 residual-stream activations from the BF16 embedding. Linear.forward
+    and the grouped path cast weights/biases to the activation dtype on every
+    call. Preserve that mixed-dtype behavior here instead of moving the model
+    itself to BF16.
+    """
+    generator = torch.Generator(device="cpu").manual_seed(case["seed"])
+    canonical = tgs.MoE(case["dim"], num_experts=case["num_experts"],
+                        top_k=case["top_k"], normalize_topk=True).to(dtype=torch.float32)
+    with torch.no_grad():
+        for p in canonical.parameters():
+            p.copy_(torch.randn(p.shape, generator=generator, dtype=torch.float32) * 0.02)
+    x_cpu = torch.randn(case["batch"], case["seq_len"], case["dim"],
+                        generator=generator, dtype=activation_dtype)
+    return canonical, x_cpu
+
+
+def _canonical_parameter_pairs(canonical, candidate, config_name):
+    if config_name == "loop":
+        canonical_params = list(canonical.named_parameters())
+        candidate_params = list(candidate.named_parameters())
+        assert [n for n, _ in canonical_params] == [n for n, _ in candidate_params]
+        return [(name, expected, actual) for (name, expected), (_, actual)
+                in zip(canonical_params, candidate_params, strict=True)]
+
+    pairs = []
+    for name, expected in canonical.router.named_parameters():
+        pairs.append((f"router.{name}", expected, dict(candidate.router.named_parameters())[name]))
+    for i, expert in enumerate(canonical.experts):
+        pairs.extend((
+            (f"experts.{i}.fc.weight", expert.fc.weight, candidate.fc_weight[i]),
+            (f"experts.{i}.fc.bias", expert.fc.bias, candidate.fc_bias[i]),
+            (f"experts.{i}.proj.weight", expert.proj.weight, candidate.proj_weight[i]),
+            (f"experts.{i}.proj.bias", expert.proj.bias, candidate.proj_bias[i]),
+        ))
+    return pairs
+
+
+def _assert_identical_benchmark_parameters(canonical, candidate, config_name):
+    """Fail before timing if a config did not receive byte-identical weights."""
+    for name, expected, actual in _canonical_parameter_pairs(canonical, candidate, config_name):
+        assert expected.shape == actual.shape, name
+        assert expected.dtype == actual.dtype == torch.float32, name
+        actual_cpu = actual.detach().cpu()
+        assert torch.equal(expected.detach(), actual_cpu), name
+
+
+def _make_benchmark_model(canonical, case, config_name, forward_trans_b, device,
+                          profile_stages=False):
+    if config_name == "loop":
+        model = copy.deepcopy(canonical).to(device=device)
+    else:
+        model = GroupedGemmMoE(
+            case["dim"], case["num_experts"], case["top_k"], normalize_topk=True,
+            gmm_fn=real_gmm, forward_trans_b=forward_trans_b,
+            profile_stages=profile_stages,
+        ).to(device=device, dtype=torch.float32)
+        model.load_from_moe(canonical)
+    _assert_identical_benchmark_parameters(canonical, model, config_name)
+    return model
+
+
+@torch.no_grad()
+def _routing_snapshot(router, x, top_k):
+    flat_x = x.reshape(-1, x.shape[-1])
+    probabilities = F.softmax(router(flat_x).float(), dim=-1)
+    weights, experts = probabilities.topk(top_k, dim=-1)
+    weights = (weights / weights.sum(dim=-1, keepdim=True)).type_as(flat_x)
+    return experts.cpu(), weights.cpu()
+
+
+def _assert_identical_routing(snapshot, expected, config_name):
+    if expected is None:
+        return snapshot
+    assert torch.equal(snapshot[0], expected[0]), f"{config_name}: top-k expert indices differ"
+    assert torch.equal(snapshot[1], expected[1]), f"{config_name}: top-k routing weights differ"
+    return expected
+
+
+def _cuda_measure(fn, prepare, warmup, iterations):
+    """Wall-clock CUDA work with device-wide boundaries.
+
+    torch.cuda.synchronize() waits for all streams on the device, including
+    the auxiliary streams created inside nv-grouped-gemm. CUDA events on the
+    current stream alone would undercount that work.
+    """
+    for _ in range(warmup):
+        prepare()
+        fn()
+        torch.cuda.synchronize()
+
+    torch.cuda.reset_peak_memory_stats()
+    samples_ms = []
+    for _ in range(iterations):
+        prepare()
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        samples_ms.append((time.perf_counter() - start) * 1e3)
+    peak_gib = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    return samples_ms, peak_gib
+
+
+def _print_latency(label, samples_ms, peak_gib):
+    print(f"  {label}: median={statistics.median(samples_ms):.3f} ms "
+          f"mean={statistics.mean(samples_ms):.3f} ms "
+          f"min={min(samples_ms):.3f} ms max={max(samples_ms):.3f} ms "
+          f"peak_allocated={peak_gib:.3f} GiB n={len(samples_ms)}", flush=True)
+
+
+def _release_cuda_tensors():
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+
+def benchmark_one_configuration(canonical, x_cpu, case, config_name, forward_trans_b,
+                                dtype, warmup, iterations, expected_routing):
+    print(f"[{case['name']}:{config_name}] allocating", flush=True)
+    model = _make_benchmark_model(canonical, case, config_name, forward_trans_b,
+                                  device="cuda")
+    x = x_cpu.to(device="cuda").requires_grad_(True)
+    assert x.dtype == dtype
+    assert torch.equal(x.detach().cpu(), x_cpu), f"{config_name}: input copy differs"
+    snapshot = _routing_snapshot(model.router, x, case["top_k"])
+    expected_routing = _assert_identical_routing(snapshot, expected_routing, config_name)
+    counts = torch.bincount(snapshot[0].reshape(-1), minlength=case["num_experts"])
+    print(f"  exact weights/input/routing verified; assignment_counts={counts.tolist()}", flush=True)
+
+    last_out = None
+
+    def forward_only():
+        nonlocal last_out
+        last_out = model(x)
+
+    def clear_forward():
+        nonlocal last_out
+        last_out = None
+
+    forward_ms, forward_peak = _cuda_measure(forward_only, clear_forward, warmup, iterations)
+    _print_latency("forward", forward_ms, forward_peak)
+    last_out = None
+    _release_cuda_tensors()
+
+    grad_out = torch.randn_like(x)
+
+    def forward_backward():
+        nonlocal last_out
+        last_out = model(x)
+        last_out.backward(grad_out)
+
+    def clear_gradients():
+        nonlocal last_out
+        last_out = None
+        x.grad = None
+        for p in model.parameters():
+            p.grad = None
+
+    fwd_bwd_ms, fwd_bwd_peak = _cuda_measure(
+        forward_backward, clear_gradients, warmup, iterations)
+    _print_latency("forward+backward", fwd_bwd_ms, fwd_bwd_peak)
+
+    del last_out, grad_out, x, model, snapshot
+    _release_cuda_tensors()
+    return expected_routing, dict(
+        forward_median_ms=statistics.median(forward_ms),
+        forward_backward_median_ms=statistics.median(fwd_bwd_ms),
+        forward_peak_gib=forward_peak,
+        forward_backward_peak_gib=fwd_bwd_peak,
+    )
+
+
+def run_benchmarks(args, dtype):
+    if args.backend != "grouped_gemm" or args.device != "cuda":
+        raise SystemExit("--mode benchmark requires --backend grouped_gemm --device cuda")
+    selected = BENCHMARK_CASES if args.benchmark_case == "all" \
+        else {args.benchmark_case: BENCHMARK_CASES[args.benchmark_case]}
+    print("BENCHMARK MODE: eager isolated layers; profiler is disabled in this process.", flush=True)
+    print("Latency is wall time between device-wide synchronizations and includes extension "
+          "auxiliary-stream work. Configurations run sequentially.", flush=True)
+    for case in selected.values():
+        n_tokens = case["batch"] * case["seq_len"]
+        print("=" * 100, flush=True)
+        print(f"case={case['name']} N={n_tokens} D={case['dim']} hidden={4 * case['dim']} "
+              f"E={case['num_experts']} k={case['top_k']} "
+              f"activation_dtype={dtype} parameter_dtype={torch.float32}", flush=True)
+        canonical, x_cpu = _make_benchmark_inputs(case, dtype)
+        expected_routing = None
+        results = {}
+        for config_name, forward_trans_b in BENCHMARK_CONFIGS:
+            expected_routing, results[config_name] = benchmark_one_configuration(
+                canonical, x_cpu, case, config_name, forward_trans_b, dtype,
+                args.warmup, args.iterations, expected_routing)
+        loop_result = results["loop"]
+        print(f"[{case['name']}] median latency comparison (ratio vs loop):", flush=True)
+        for config_name, _ in BENCHMARK_CONFIGS:
+            result = results[config_name]
+            print(f"  {config_name}: forward={result['forward_median_ms']:.3f} ms "
+                  f"({result['forward_median_ms'] / loop_result['forward_median_ms']:.3f}x), "
+                  f"forward+backward={result['forward_backward_median_ms']:.3f} ms "
+                  f"({result['forward_backward_median_ms'] / loop_result['forward_backward_median_ms']:.3f}x)",
+                  flush=True)
+        del results, expected_routing, x_cpu, canonical
+        _release_cuda_tensors()
+
+
 def log_environment(args):
     print("=" * 100, flush=True)
     print(f"torch={torch.__version__} cuda={torch.version.cuda}", flush=True)
@@ -490,14 +740,14 @@ def log_environment(args):
         print(f"device={torch.cuda.get_device_name(0)} capability=sm_{cap[0]}{cap[1]}", flush=True)
     else:
         print("CUDA not available on this machine -- only --backend reference can run here.", flush=True)
-    print(f"backend={args.backend} device={args.device} dtype={args.dtype}", flush=True)
+    print(f"mode={args.mode} backend={args.backend} device={args.device} dtype={args.dtype}", flush=True)
     if args.backend == "grouped_gemm":
         import grouped_gemm
         print(f"grouped_gemm module file: {getattr(grouped_gemm, '__file__', 'unknown')}", flush=True)
         print(f"grouped_gemm version attr: {getattr(grouped_gemm, '__version__', 'unknown (not exported)')}",
               flush=True)
-        print("This run exercises the REAL CUDA extension, in BOTH forward_trans_b configs "
-              "(see the module docstring's BACKEND DISPATCH NOTES): weight-grad is always "
+        print("This run exercises the REAL CUDA extension; the selected mode controls which "
+              "forward_trans_b configs run (see BACKEND DISPATCH NOTES). Weight-grad is always "
               "cuBLAS regardless; forward and input-grad each become CUTLASS-eligible in "
               "exactly one of the two configs, and only if this extension was built with "
               "GROUPED_GEMM_DEVICE_CAPABILITY=80 defined (see INSTALL). These are source-"
@@ -506,8 +756,7 @@ def log_environment(args):
     else:
         print("This run uses the pure-PyTorch reference backend: it validates pack/unpack/"
               "combine/autograd scaffolding, NOT the real grouped_gemm CUDA kernels. "
-              "The real-CUDA-kernel validation is PENDING until run with "
-              "--backend grouped_gemm on a CUDA machine with the package installed.",
+              "Use --backend grouped_gemm on CUDA to exercise the installed extension.",
               flush=True)
     print("=" * 100, flush=True)
 
@@ -601,21 +850,341 @@ def profile_gmm_dispatch(gmm_fn, dim, num_experts, n_tokens_per_expert, forward_
     return dict(forward=fwd_evidence, backward=bwd_evidence)
 
 
+def report_extension_binary_and_build_flags(build_log):
+    """Report binary identity and flags from the captured *actual* build.
+
+    Python extension modules do not embed a standardized copy of their nvcc
+    command line, so setup.py defaults are not evidence of how the installed
+    .so was built. A verbose build log is the source of truth here. If none is
+    supplied (or it contains no nvcc command), say so rather than inferring.
+    """
+    import grouped_gemm
+
+    package_dir = Path(grouped_gemm.__file__).resolve().parent
+    shared_objects = sorted(package_dir.rglob("*.so"))
+    print("=" * 100, flush=True)
+    print("Installed grouped_gemm binary identity:", flush=True)
+    if not shared_objects:
+        print(f"  NO .so FOUND under {package_dir}", flush=True)
+    for so_path in shared_objects:
+        digest = hashlib.sha256()
+        with so_path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        print(f"  {so_path} sha256={digest.hexdigest()}", flush=True)
+
+    if build_log is None:
+        print("Build optimization flags: UNVERIFIED (--build-log was not supplied).", flush=True)
+        return
+    log_path = Path(build_log)
+    if not log_path.is_file():
+        print(f"Build optimization flags: UNVERIFIED ({log_path} does not exist).", flush=True)
+        return
+    lines = log_path.read_text(errors="replace").splitlines()
+    nvcc_lines = [line.strip() for line in lines if re.search(r"(^|\s)(nvcc|[^ ]*/nvcc)(\s|$)", line)]
+    if not nvcc_lines:
+        print(f"Build optimization flags: UNVERIFIED (no nvcc invocation in {log_path}).", flush=True)
+        return
+
+    joined = "\n".join(nvcc_lines)
+    flag_patterns = (
+        r"(?<!\S)-O(?:0|1|2|3|s|fast)(?!\S)",
+        r"(?<!\S)--use_fast_math(?!\S)",
+        r"(?<!\S)-G(?!\S)",
+        r"(?<!\S)-g(?!\S)",
+        r"(?<!\S)-lineinfo(?!\S)",
+        r"(?<!\S)-DNDEBUG(?!\S)",
+        r"-DGROUPED_GEMM_DEVICE_CAPABILITY=\d+",
+        r"(?:-gencode|--generate-code)(?:=|\s+)[^\s]+",
+    )
+    flags = sorted({match.group(0) for pattern in flag_patterns
+                    for match in re.finditer(pattern, joined)})
+    debug_device_code = bool(re.search(r"(?<!\S)-G(?!\S)", joined))
+    print(f"Build-log evidence: {log_path.resolve()} ({len(nvcc_lines)} nvcc invocation(s))", flush=True)
+    print(f"  observed optimization/codegen flags: {flags or '(none matched)'}", flush=True)
+    print(f"  debug device code (-G) observed: {debug_device_code}", flush=True)
+    print(f"  fast math observed: {'--use_fast_math' in joined}", flush=True)
+    print("  nvcc command(s), verbatim:", flush=True)
+    for line in nvcc_lines:
+        print(f"    {line}", flush=True)
+
+
+@torch.no_grad()
+def report_production_dtype_conversions(moe, x):
+    """Execute the production stacking/layout/cast expressions and report copies."""
+    x_flat = x.reshape(-1, x.shape[-1])
+    print("Production dtype/layout conversion probe (same expressions as train_gpt_simple.MoE):",
+          flush=True)
+    print(f"  activation={x_flat.dtype}; router.weight={moe.router.weight.dtype}", flush=True)
+    for label, params in (
+        ("fc.weight", [e.fc.weight for e in moe.experts]),
+        ("proj.weight", [e.proj.weight for e in moe.experts]),
+    ):
+        stacked = torch.stack(params)
+        transposed_contiguous = stacked.transpose(-2, -1).contiguous()
+        cast = transposed_contiguous.type_as(x_flat)
+        print(f"  {label}: stored={params[0].dtype} stacked={stacked.dtype} "
+              f"stacked_shape={tuple(stacked.shape)} trans_b=False_shape={tuple(cast.shape)} "
+              f"transpose_contiguous_copy={transposed_contiguous.data_ptr() != stacked.data_ptr()} "
+              f"type_as_copy={cast.data_ptr() != transposed_contiguous.data_ptr()}", flush=True)
+        del cast, transposed_contiguous, stacked
+    for label, params in (
+        ("fc.bias", [e.fc.bias for e in moe.experts]),
+        ("proj.bias", [e.proj.bias for e in moe.experts]),
+    ):
+        stacked = torch.stack(params)
+        cast = stacked.type_as(x_flat)
+        print(f"  {label}: stored={params[0].dtype} stacked={stacked.dtype} "
+              f"type_as_copy={cast.data_ptr() != stacked.data_ptr()}", flush=True)
+        del cast, stacked
+    torch.cuda.synchronize()
+
+
+def _profiled_loop_forward(moe, x):
+    """Production loop forward split only into profiler annotation ranges."""
+    B, T, D = x.shape
+    flat_x = x.reshape(-1, D)
+    with torch.profiler.record_function("moe.routing"):
+        router_logits = moe.router(flat_x)
+        routing_weights = F.softmax(router_logits.float(), dim=-1)
+        topk_weights, topk_experts = routing_weights.topk(moe.top_k, dim=-1)
+        if moe.normalize_topk:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights.type_as(flat_x)
+    with torch.profiler.record_function("moe.loop_expert_dispatch_and_combine"):
+        out = flat_x.new_zeros(flat_x.shape)
+        for expert_idx, expert in enumerate(moe.experts):
+            token_idx, slot_idx = torch.where(topk_experts == expert_idx)
+            if token_idx.numel() == 0:
+                continue
+            out.index_add_(0, token_idx,
+                           expert(flat_x[token_idx]) * topk_weights[token_idx, slot_idx, None])
+    return out.view(B, T, D)
+
+
+def _profile_total_timing_attr(avgs):
+    if not avgs:
+        return None
+    for name in ("device_time_total", "cuda_time_total"):
+        if hasattr(avgs[0], name):
+            return name
+    return None
+
+
+def _report_full_layer_profile(prof, label):
+    avgs = prof.key_averages()
+    timing_attr = _profile_total_timing_attr(avgs)
+    print(f"[profile:{label}] annotated stage totals (profiler overhead present; not benchmark data):",
+          flush=True)
+    stages = [event for event in avgs
+              if event.key.startswith("moe.") and event.key != "moe.full_forward_backward"]
+    for event in stages:
+        device_us = getattr(event, timing_attr) if timing_attr is not None else None
+        print(f"  {event.key}: cpu_total_us={event.cpu_time_total:.3f} "
+              f"device_total_us={device_us if device_us is not None else 'unavailable'} "
+              f"count={event.count}", flush=True)
+    if stages:
+        host_dominant = max(stages, key=lambda event: event.cpu_time_total)
+        print(f"  largest annotated forward host range: {host_dominant.key} "
+              f"({host_dominant.cpu_time_total:.3f} us)", flush=True)
+        if timing_attr is not None:
+            device_dominant = max(stages, key=lambda event: getattr(event, timing_attr))
+            print(f"  largest annotated forward device range: {device_dominant.key} "
+                  f"({getattr(device_dominant, timing_attr):.3f} us)", flush=True)
+    print(f"[profile:{label}] top-10 ops/ranges by self CPU time:", flush=True)
+    for event in sorted(avgs, key=lambda item: item.self_cpu_time_total, reverse=True)[:10]:
+        print(f"  {event.key}: self_cpu_time_total={event.self_cpu_time_total:.3f} "
+              f"count={event.count}", flush=True)
+    _report_kernel_evidence(avgs, label)
+
+
+def profile_full_layer(model, x, grad_out, case_name, config_name, trace_dir, warmup):
+    from torch.profiler import ProfilerActivity, profile
+
+    def call_model():
+        return _profiled_loop_forward(model, x) if config_name == "loop" else model(x)
+
+    for _ in range(warmup):
+        out = call_model()
+        out.backward(grad_out)
+        x.grad = None
+        for p in model.parameters():
+            p.grad = None
+        torch.cuda.synchronize()
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                 record_shapes=True) as prof:
+        with torch.profiler.record_function("moe.full_forward_backward"):
+            out = call_model()
+            out.backward(grad_out)
+        torch.cuda.synchronize()
+    trace_path = trace_dir / f"{case_name}_{config_name}_full_layer.json"
+    prof.export_chrome_trace(str(trace_path))
+    _report_full_layer_profile(prof, f"{config_name} FULL_LAYER")
+    print(f"[profile:{config_name}] chrome trace: {trace_path}", flush=True)
+
+
+def _profile_raw_gmm_phase(case_name, phase, gemm_name, in_dim, out_dim, batch_sizes,
+                           forward_trans_b, dtype, trace_dir):
+    """Profile exactly one native forward, input-grad, or weight-grad call.
+
+    Do not obtain dgrad/wgrad by calling the custom autograd Function's
+    backward: nv-grouped-gemm computes both there. Invoke the same backend.gmm
+    calls used by ops.py directly so each trace contains only the named phase.
+    """
+    from torch.profiler import ProfilerActivity, profile
+    from grouped_gemm import backend
+
+    total = int(batch_sizes.sum())
+    a = torch.randn(total, in_dim, device="cuda", dtype=dtype)
+    natural_w = torch.randn(len(batch_sizes), out_dim, in_dim, device="cuda", dtype=dtype)
+    b = natural_w if forward_trans_b else natural_w.transpose(-2, -1).contiguous()
+    grad_out = torch.randn(total, out_dim, device="cuda", dtype=dtype) if phase != "forward" else None
+
+    def phase_call():
+        if phase == "forward":
+            return backend.gmm(a, b, batch_sizes, False, forward_trans_b)
+        if phase == "input_grad":
+            return backend.gmm(grad_out, b, batch_sizes, False, not forward_trans_b)
+        # Exact GroupedGemm.backward weight-gradient argument order from ops.py.
+        lhs, rhs = (grad_out, a) if forward_trans_b else (a, grad_out)
+        return backend.gmm(lhs, rhs, batch_sizes, True, False)
+
+    warm_out = phase_call()
+    torch.cuda.synchronize()
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                 record_shapes=True) as prof:
+        out = phase_call()
+        torch.cuda.synchronize()
+
+    layout = f"trans_b_{str(forward_trans_b).lower()}"
+    label = f"{case_name}_{layout}_{gemm_name}_{phase}"
+    trace_path = trace_dir / f"{label}.json"
+    prof.export_chrome_trace(str(trace_path))
+    avgs = prof.key_averages()
+    _report_kernel_evidence(avgs, label)
+    print(f"[profile:{label}] chrome trace: {trace_path}", flush=True)
+    timing_attr = _pick_timing_attr(avgs)
+    if timing_attr is None:
+        summary = dict(label=label, device_work_us=None, top_device_op=None, top_device_us=None)
+    else:
+        top = max(avgs, key=lambda event: getattr(event, timing_attr))
+        summary = dict(
+            label=label,
+            # Sum of kernel/device work, not wall time: auxiliary streams can overlap.
+            device_work_us=sum(getattr(event, timing_attr) for event in avgs),
+            top_device_op=top.key,
+            top_device_us=getattr(top, timing_attr),
+        )
+    del out, warm_out, grad_out, b, natural_w, a
+    _release_cuda_tensors()
+    return summary
+
+
+def profile_raw_gmm_phases(case, batch_sizes, forward_trans_b, dtype, trace_dir):
+    print("Raw extension phase profiles: each trace contains only one forward, input-gradient, "
+          "or weight-gradient phase; profiler timings are not benchmark timings.", flush=True)
+    summaries = []
+    for gemm_name, in_dim, out_dim in (
+        ("fc1", case["dim"], 4 * case["dim"]),
+        ("fc2", 4 * case["dim"], case["dim"]),
+    ):
+        for phase in ("forward", "input_grad", "weight_grad"):
+            summaries.append(_profile_raw_gmm_phase(
+                case["name"], phase, gemm_name, in_dim, out_dim,
+                batch_sizes, forward_trans_b, dtype, trace_dir))
+    available = [summary for summary in summaries if summary["device_work_us"] is not None]
+    if available:
+        print("Raw phase device-work summary (summed kernel time, not wall time; streams may overlap):",
+              flush=True)
+        for summary in sorted(available, key=lambda item: item["device_work_us"], reverse=True):
+            print(f"  {summary['label']}: device_work_us={summary['device_work_us']:.3f} "
+                  f"largest_op={summary['top_device_op']} "
+                  f"largest_op_us={summary['top_device_us']:.3f}", flush=True)
+
+
+def run_profiles(args, dtype):
+    if args.backend != "grouped_gemm" or args.device != "cuda":
+        raise SystemExit("--mode profile requires --backend grouped_gemm --device cuda")
+    case = BENCHMARK_CASES[args.profile_case]
+    trace_dir = Path(args.trace_dir)
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    canonical, x_cpu = _make_benchmark_inputs(case, dtype)
+
+    # Probe the actual production expressions independently of the diagnostic
+    # GroupedGemmMoE class. This is setup work, outside every timed/profiled region.
+    production_probe = copy.deepcopy(canonical).to(device="cuda")
+    x_probe = x_cpu.to(device="cuda")
+    report_production_dtype_conversions(production_probe, x_probe)
+    del x_probe, production_probe
+    _release_cuda_tensors()
+
+    configs = BENCHMARK_CONFIGS if args.profile_config == "all" else tuple(
+        config for config in BENCHMARK_CONFIGS if config[0] == args.profile_config)
+    expected_routing = None
+    for config_name, forward_trans_b in configs:
+        print("=" * 100, flush=True)
+        print(f"PROFILE MODE case={case['name']} config={config_name}", flush=True)
+        model = _make_benchmark_model(canonical, case, config_name, forward_trans_b,
+                                      device="cuda", profile_stages=True)
+        x = x_cpu.to(device="cuda").requires_grad_(True)
+        snapshot = _routing_snapshot(model.router, x, case["top_k"])
+        expected_routing = _assert_identical_routing(snapshot, expected_routing, config_name)
+        batch_sizes = torch.bincount(snapshot[0].reshape(-1),
+                                     minlength=case["num_experts"]).to(torch.int64)
+        grad_out = torch.randn_like(x)
+        profile_full_layer(model, x, grad_out, case["name"], config_name,
+                           trace_dir, args.profile_warmup)
+        del grad_out, snapshot, x, model
+        _release_cuda_tensors()
+        if config_name != "loop" and not args.skip_raw_gmm_profiles:
+            profile_raw_gmm_phases(case, batch_sizes, forward_trans_b, dtype, trace_dir)
+        del batch_sizes
+
+    del expected_routing, x_cpu, canonical
+    _release_cuda_tensors()
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["validate", "benchmark", "profile"], default="validate",
+                    help="benchmark and profile are opt-in; validate preserves the original harness")
     ap.add_argument("--backend", choices=list(BACKENDS), default="reference")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
     ap.add_argument("--atol", type=float, default=2e-2)
     ap.add_argument("--rtol", type=float, default=2e-2)
+    ap.add_argument("--benchmark-case", choices=["all", *BENCHMARK_CASES], default="all")
+    ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument("--iterations", type=int, default=5)
+    ap.add_argument("--profile-case", choices=list(BENCHMARK_CASES), default="train_e1_k1")
+    ap.add_argument("--profile-config", choices=["all", *(name for name, _ in BENCHMARK_CONFIGS)],
+                    default="all")
+    ap.add_argument("--profile-warmup", type=int, default=1)
+    ap.add_argument("--trace-dir", default="/tmp/grouped_gemm_profiles")
+    ap.add_argument("--skip-raw-gmm-profiles", action="store_true",
+                    help="profile only the annotated full layer, not isolated FC1/FC2 fwd/dgrad/wgrad")
+    ap.add_argument("--build-log", help="verbose nvcc build log used to report actual optimization flags")
     args = ap.parse_args()
 
     if args.backend == "grouped_gemm" and args.device != "cuda":
         raise SystemExit("--backend grouped_gemm requires --device cuda")
+    if args.warmup < 1 or args.iterations < 1 or args.profile_warmup < 1:
+        raise SystemExit("warmup and iteration counts must be positive")
 
     log_environment(args)
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
+    if args.backend == "grouped_gemm":
+        report_extension_binary_and_build_flags(args.build_log)
+    if args.mode == "benchmark":
+        run_benchmarks(args, dtype)
+        return
+    if args.mode == "profile":
+        run_profiles(args, dtype)
+        return
+
     all_ok = True
     # Both configurations from BACKEND DISPATCH NOTES: forward_trans_b=True
     # (natural nn.Linear layout, forward is cuBLAS / input-grad is
