@@ -512,14 +512,62 @@ def log_environment(args):
     print("=" * 100, flush=True)
 
 
+def _pick_timing_attr(avgs):
+    """Return the name of the self-time-in-device attribute actually
+    supported by the installed torch version's FunctionEventAvg, preferring
+    the current (non-deprecated) name. torch 2.11 deprecated
+    self_cuda_time_total in favor of the device-agnostic
+    self_device_time_total (confirmed directly against this project's
+    installed torch: `cuda_time` raises `FutureWarning: ... please use
+    device_time instead`). Returns None if NEITHER attribute exists, so
+    callers report timing as unavailable instead of silently treating
+    missing data as zero."""
+    if not avgs:
+        return None
+    for name in ("self_device_time_total", "self_cuda_time_total"):
+        if hasattr(avgs[0], name):
+            return name
+    return None
+
+
+def _report_kernel_evidence(avgs, label):
+    names = [e.key for e in avgs]
+    cutlass_hits = [n for n in names if "cutlass" in n.lower()]
+    cublas_hits = [n for n in names if "cublas" in n.lower() or "gemm" in n.lower()]
+    print(f"[profile:{label}] {len(names)} distinct op/kernel names recorded", flush=True)
+    print(f"[profile:{label}] names containing 'cutlass': {cutlass_hits or '(none)'}", flush=True)
+    print(f"[profile:{label}] names containing 'cublas'/'gemm': {cublas_hits or '(none)'}", flush=True)
+
+    timing_attr = _pick_timing_attr(avgs)
+    if timing_attr is None:
+        print(f"[profile:{label}] TIMING DATA UNAVAILABLE -- this torch version's "
+              f"FunctionEventAvg exposes neither self_device_time_total nor "
+              f"self_cuda_time_total. Reported as unavailable, not as zero.", flush=True)
+    else:
+        note = " (deprecated name; self_device_time_total not found on this torch version)" \
+            if timing_attr == "self_cuda_time_total" else ""
+        print(f"[profile:{label}] timing field used: {timing_attr}{note}", flush=True)
+        top = sorted(avgs, key=lambda e: getattr(e, timing_attr), reverse=True)[:10]
+        print(f"[profile:{label}] top-10 ops by {timing_attr}:", flush=True)
+        for e in top:
+            print(f"    {e.key}  {timing_attr}={getattr(e, timing_attr)}  count={e.count}", flush=True)
+    return dict(cutlass_observed=bool(cutlass_hits), cublas_or_gemm_observed=bool(cublas_hits),
+                timing_available=timing_attr is not None)
+
+
 def profile_gmm_dispatch(gmm_fn, dim, num_experts, n_tokens_per_expert, forward_trans_b, device, dtype):
-    """Run gmm_fn's forward AND backward under torch.profiler and report
-    which CUDA kernels actually executed -- REAL runtime evidence for which
-    branch (CUTLASS vs cuBLAS) was taken, rather than the source-derived
-    expectations in BACKEND DISPATCH NOTES. Only meaningful for
-    --backend grouped_gemm on CUDA; main() does not call this for
-    --backend reference (plain torch.matmul, no dispatch ambiguity to
-    confirm)."""
+    """Run gmm_fn's forward and backward SEPARATELY, each under its own
+    torch.profiler session, and report which CUDA kernels actually executed
+    in each phase -- REAL runtime evidence for which branch (CUTLASS vs
+    cuBLAS) was taken, rather than the source-derived expectations in
+    BACKEND DISPATCH NOTES. Forward and backward are profiled separately
+    (not one combined trace) because backward launches TWO different
+    kernels -- the input-gradient GEMM and the separate weight-gradient
+    "variable-K" GEMM -- and conflating them with forward's kernel into one
+    trace would make it impossible to attribute evidence to the right call.
+    Only meaningful for --backend grouped_gemm on CUDA; main() does not call
+    this for --backend reference (plain torch.matmul, no dispatch ambiguity
+    to confirm)."""
     from torch.profiler import ProfilerActivity, profile
 
     hdim = 4 * dim
@@ -529,33 +577,28 @@ def profile_gmm_dispatch(gmm_fn, dim, num_experts, n_tokens_per_expert, forward_
     w = torch.randn(num_experts, hdim, dim, dtype=dtype, device=device, requires_grad=True)
     b_arg = w if forward_trans_b else w.detach().transpose(-2, -1).contiguous().requires_grad_(True)
 
-    def call():
-        out = gmm_fn(a, b_arg, batch_sizes, trans_b=forward_trans_b)
-        out.sum().backward()
-
-    call()  # warm up (first-call cuBLAS handle / workspace allocation) before profiling
+    # Warm up OUTSIDE any profiler context (first-call cuBLAS handle /
+    # workspace allocation, first-call CUTLASS kernel selection), so the
+    # profiled runs below reflect steady-state dispatch, not one-time setup.
+    warm_out = gmm_fn(a, b_arg, batch_sizes, trans_b=forward_trans_b)
+    warm_out.sum().backward()
     a.grad = None
     b_arg.grad = None
-
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        call()
-        torch.cuda.synchronize()
-
-    avgs = prof.key_averages()
-    names = [e.key for e in avgs]
-    cutlass_hits = [n for n in names if "cutlass" in n.lower()]
-    cublas_hits = [n for n in names if "cublas" in n.lower() or "gemm" in n.lower()]
+    torch.cuda.synchronize()
 
     label = f"forward_trans_b={forward_trans_b}"
-    print(f"[profile:{label}] {len(names)} distinct op/kernel names recorded", flush=True)
-    print(f"[profile:{label}] names containing 'cutlass': {cutlass_hits or '(none)'}", flush=True)
-    print(f"[profile:{label}] names containing 'cublas'/'gemm': {cublas_hits or '(none)'}", flush=True)
-    top = sorted(avgs, key=lambda e: getattr(e, "self_cuda_time_total", 0), reverse=True)[:10]
-    print(f"[profile:{label}] top-10 ops by self CUDA time:", flush=True)
-    for e in top:
-        print(f"    {e.key}  self_cuda_time_total_us={getattr(e, 'self_cuda_time_total', 0)}  count={e.count}",
-              flush=True)
-    return dict(cutlass_observed=bool(cutlass_hits), cublas_or_gemm_observed=bool(cublas_hits))
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as fwd_prof:
+        out = gmm_fn(a, b_arg, batch_sizes, trans_b=forward_trans_b)
+        torch.cuda.synchronize()
+    fwd_evidence = _report_kernel_evidence(fwd_prof.key_averages(), f"{label} FORWARD")
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as bwd_prof:
+        out.sum().backward()
+        torch.cuda.synchronize()
+    bwd_evidence = _report_kernel_evidence(bwd_prof.key_averages(), f"{label} BACKWARD")
+
+    return dict(forward=fwd_evidence, backward=bwd_evidence)
 
 
 def main():

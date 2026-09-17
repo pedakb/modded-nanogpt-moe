@@ -6,10 +6,15 @@ train_gpt_simple.py is a torchrun script (module-level CUDA/NCCL setup is guarde
 under `if __name__ == "__main__":`), so importing it here only pulls in the
 architecture/optimizer classes with no side effects.
 """
+import importlib.util
+
+import pytest
 import torch
 import torch.nn.functional as F
 
 from train_gpt_simple import MLP, MoE, GPT, eager_prefix, make_head_loss
+
+GROUPED_GEMM_AVAILABLE = importlib.util.find_spec("grouped_gemm") is not None
 
 
 def _make_dense_and_moe(dim=32):
@@ -202,3 +207,98 @@ def test_head_loss_eager_vs_compiled_fullgraph_parity():
         torch.testing.assert_close(loss_compiled, loss_eager, atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(grad_proj_compiled, grad_proj_eager, atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(grad_x_compiled, grad_x_eager, atol=2e-2, rtol=2e-2)
+
+
+# --------------------------------------------------------------------------- #
+# moe_backend selector: "loop" (default, existing) vs "grouped_gemm" (new)
+# --------------------------------------------------------------------------- #
+
+def test_moe_backend_defaults_to_loop_and_is_backward_compatible():
+    # Existing call sites (no moe_backend kwarg) must keep working unchanged.
+    moe = MoE(16, num_experts=4, top_k=2)
+    assert moe.moe_backend == "loop"
+
+
+def test_gpt_threads_moe_backend_to_every_block():
+    model = GPT(vocab_size=37, num_layers=3, model_dim=16, mlp_type="moe",
+                num_experts=4, top_k=2, moe_backend="loop")
+    for block in model.blocks:
+        assert block.mlp.moe_backend == "loop"
+
+
+def test_grouped_gemm_backend_rejects_unknown_backend_name():
+    with pytest.raises(AssertionError):
+        MoE(16, num_experts=2, top_k=1, moe_backend="not_a_real_backend")
+
+
+@pytest.mark.skipif(GROUPED_GEMM_AVAILABLE, reason="grouped_gemm IS installed; this test "
+                     "targets the unavailable-dependency error path specifically")
+def test_grouped_gemm_backend_unavailable_raises_clear_error():
+    # "fail clearly if unavailable": constructing with moe_backend="grouped_gemm"
+    # without the package installed must raise immediately, at construction time
+    # (not buried inside a later forward/backward call), naming the package and
+    # pointing at install instructions.
+    with pytest.raises(ImportError, match="grouped_gemm"):
+        MoE(16, num_experts=4, top_k=2, moe_backend="grouped_gemm")
+
+
+@pytest.mark.skipif(not GROUPED_GEMM_AVAILABLE, reason="requires the grouped_gemm package "
+                     "(PyPI nv-grouped-gemm) -- pending LS6, not installed here")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="grouped_gemm requires CUDA, none "
+                     "available here")
+def test_grouped_gemm_backend_matches_loop_backend_output_and_gradients():
+    # Requirement: output/gradient parity using IDENTICAL weights and inputs,
+    # plus an explicit checkpoint-key / optimizer-parameter-coverage comparison.
+    # Both backends share the exact same nn.ModuleList(MLP) storage, so a
+    # state_dict trained under one backend loads directly into the other.
+    dim, num_experts, top_k = 16, 8, 2
+    torch.manual_seed(6)
+    moe_loop = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=True,
+                   moe_backend="loop").cuda()
+    for p in moe_loop.parameters():
+        p.data = torch.empty_like(p.data, dtype=torch.bfloat16).normal_(std=0.05)
+    # Force one expert to receive zero tokens, to exercise the documented
+    # None-vs-present-and-zero gradient difference between backends.
+    with torch.no_grad():
+        moe_loop.router.bias[3] = -1.0e4
+
+    moe_gg = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=True,
+                 moe_backend="grouped_gemm").cuda()
+    moe_gg.load_state_dict(moe_loop.state_dict())
+
+    # Checkpoint keys / optimizer-parameter coverage: identical by construction
+    # (same nn.ModuleList(MLP) storage for both backends), asserted explicitly
+    # rather than assumed.
+    assert set(moe_loop.state_dict().keys()) == set(moe_gg.state_dict().keys())
+    assert set(id(p) for p in moe_loop.parameters()) != set(id(p) for p in moe_gg.parameters()), (
+        "sanity check: these must be two distinct parameter sets (loaded via "
+        "load_state_dict, not the same objects), or this test would be vacuous")
+
+    torch.manual_seed(7)
+    x = torch.randn(2, 20, dim, dtype=torch.bfloat16, device="cuda")
+    x_loop = x.clone().requires_grad_(True)
+    x_gg = x.clone().requires_grad_(True)
+
+    out_loop = moe_loop(x_loop)
+    out_loop.float().sum().backward()
+    out_gg = moe_gg(x_gg)
+    out_gg.float().sum().backward()
+
+    torch.testing.assert_close(out_loop, out_gg, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(x_loop.grad, x_gg.grad, atol=2e-2, rtol=2e-2)
+
+    for i in range(num_experts):
+        e_loop, e_gg = moe_loop.experts[i], moe_gg.experts[i]
+        if i == 3:
+            # Documented difference (see MoE._forward_grouped_gemm docstring):
+            # "loop" leaves an unused expert's grad as None; "grouped_gemm"
+            # produces a present, exactly-zero grad. Both are checked
+            # explicitly, not assumed.
+            assert e_loop.fc.weight.grad is None
+            assert e_gg.fc.weight.grad is not None
+            assert torch.count_nonzero(e_gg.fc.weight.grad) == 0
+            continue
+        torch.testing.assert_close(e_loop.fc.weight.grad, e_gg.fc.weight.grad, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(e_loop.fc.bias.grad, e_gg.fc.bias.grad, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(e_loop.proj.weight.grad, e_gg.proj.weight.grad, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(e_loop.proj.bias.grad, e_gg.proj.bias.grad, atol=2e-2, rtol=2e-2)

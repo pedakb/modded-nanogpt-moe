@@ -127,17 +127,64 @@ class MoE(nn.Module):
     """Top-k routed sparse MoE. Each expert is an MLP identical in architecture,
     init, and dtype behavior to the dense MLP above. num_experts=1, top_k=1 reduces
     exactly to a single MLP: softmax over one logit is always 1, so expert 0 receives
-    every token with routing weight 1."""
-    def __init__(self, dim: int, num_experts: int, top_k: int, normalize_topk: bool = True):
+    every token with routing weight 1.
+
+    moe_backend selects HOW self.experts is executed, not how it is stored:
+      "loop" (default): the original Python loop over experts, unchanged.
+      "grouped_gemm": packs tokens by expert and calls the fanshiqing/
+        grouped_gemm CUDA extension (package `grouped_gemm`, PyPI
+        `nv-grouped-gemm`) for both expert matmuls. self.experts remains the
+        exact same nn.ModuleList of MLP for both backends -- same checkpoint
+        keys, same Parameter identities, same optimizer grouping by
+        p.ndim/p.shape. grouped_gemm only changes how those Parameters are
+        *read* at forward time (stacked into one tensor per matmul, freshly
+        every call -- see _forward_grouped_gemm's docstring for the two
+        costs specific to this that are not present in "loop", neither
+        benchmarked yet).
+
+    Correctness of "grouped_gemm" against "loop" (identical weights,
+    identical inputs, including E=8/k=2 with deliberately empty experts) was
+    validated in records/track_3_optimization/validate_grouped_gemm.py, then
+    confirmed on an LS6 A100 in BF16 (all 8 cases, both trans_b layouts, a
+    profiler-confirmed CUTLASS GemmGrouped kernel). This class's own
+    forward-time packing here is written independently of that harness (no
+    import from it) but implements the same validated pipeline against the
+    production nn.ModuleList instead of a separate ParameterList."""
+    def __init__(self, dim: int, num_experts: int, top_k: int, normalize_topk: bool = True,
+                 moe_backend: str = "loop"):
         super().__init__()
         assert 1 <= top_k <= num_experts
+        assert moe_backend in ("loop", "grouped_gemm"), f"unknown moe_backend: {moe_backend!r}"
         self.num_experts = num_experts
         self.top_k = top_k
         self.normalize_topk = normalize_topk
+        self.moe_backend = moe_backend
         self.router = Linear(dim, num_experts)
         self.experts = nn.ModuleList(MLP(dim) for _ in range(num_experts))
+        if moe_backend == "grouped_gemm":
+            # Imported only when this backend is selected -- "loop" (the
+            # default) never touches this import, and dense models never
+            # construct a MoE at all.
+            try:
+                import grouped_gemm
+            except ImportError as e:
+                raise ImportError(
+                    "moe_backend='grouped_gemm' requires the `grouped_gemm` package "
+                    "(PyPI: nv-grouped-gemm) to be importable in this environment. It is "
+                    "NOT a project dependency (not in pyproject.toml/uv.lock) and must be "
+                    "installed manually -- see the INSTALL section in "
+                    "records/track_3_optimization/validate_grouped_gemm.py for exact, "
+                    "pinned, architecture-specific build commands. It also requires CUDA "
+                    "(no CPU fallback exists in that extension)."
+                ) from e
+            self._gmm = grouped_gemm.ops.gmm
 
     def forward(self, x: Tensor):
+        if self.moe_backend == "grouped_gemm":
+            return self._forward_grouped_gemm(x)
+        return self._forward_loop(x)
+
+    def _forward_loop(self, x: Tensor):
         B, T, D = x.shape
         x = x.view(-1, D)
 
@@ -156,15 +203,96 @@ class MoE(nn.Module):
             out.index_add_(0, token_idx, expert(x[token_idx]) * topk_weights[token_idx, slot_idx, None])
         return out.view(B, T, D)
 
+    def _forward_grouped_gemm(self, x: Tensor):
+        """route -> pack assignments by expert -> grouped FC1 -> bias ->
+        ReLU^2 -> grouped FC2 -> bias -> routing weight -> combine. Router
+        softmax/top-k/renormalize and the final weighted-combine are
+        byte-for-byte the same computation as _forward_loop -- only expert
+        execution differs. Dropless: every one of the N*top_k assignments is
+        computed, no capacity limit, no token dropping, no padding.
+
+        Two costs specific to this backend that _forward_loop does not have,
+        NEITHER benchmarked yet (no speedup or memory-feasibility claim is
+        made anywhere in this module):
+          - batch_sizes.cpu() below is a required device-to-host
+            synchronization -- grouped_gemm's C++ extension asserts its
+            token-count tensor is CPU-resident int64. This happens once per
+            MoE layer per forward call (so once per layer per microbatch,
+            i.e. num_layers times per training step).
+          - the four torch.stack(...) calls (two of which also
+            .transpose(-2,-1).contiguous()) rebuild the [E, ...] weight
+            tensors from self.experts fresh on every call rather than
+            caching them across calls -- O(num_experts) extra allocation
+            and copy per matmul per layer per call.
+        """
+        B, T, D = x.shape
+        x = x.view(-1, D)
+        N = x.shape[0]
+        device = x.device
+
+        router_logits = self.router(x)
+        routing_weights = F.softmax(router_logits.float(), dim=-1)
+        topk_weights, topk_experts = routing_weights.topk(self.top_k, dim=-1)
+        if self.normalize_topk:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights.type_as(x)
+
+        # ---- pack assignments by expert ----
+        flat_experts = topk_experts.reshape(-1)                                    # [N*k]
+        flat_tokens = torch.arange(N, device=device).repeat_interleave(self.top_k)  # [N*k]
+        order = torch.argsort(flat_experts, stable=True)
+        sorted_experts = flat_experts[order]
+        x_sorted = x[flat_tokens[order]]  # gather of ACTIVATIONS; never a weight copy
+
+        # Required CPU int64 token-count metadata -- explicit D2H sync, see docstring.
+        batch_sizes = torch.bincount(sorted_experts, minlength=self.num_experts).to(torch.int64).cpu()
+
+        # Differentiable, contiguous transposed weight stacks (trans_b=False):
+        # gradients flow back to self.experts[i].fc/proj.weight exactly as
+        # under "loop" -- these are views/copies built fresh per call, not
+        # new stored Parameters. trans_b=False is the layout validated end
+        # to end on an LS6 A100 with a profiler-confirmed CUTLASS kernel.
+        fc_w = torch.stack([e.fc.weight for e in self.experts]).transpose(-2, -1).contiguous().type_as(x_sorted)
+        fc_b = torch.stack([e.fc.bias for e in self.experts]).type_as(x_sorted)
+        proj_w = torch.stack([e.proj.weight for e in self.experts]).transpose(-2, -1).contiguous().type_as(x_sorted)
+        proj_b = torch.stack([e.proj.bias for e in self.experts]).type_as(x_sorted)
+
+        h = self._gmm(x_sorted, fc_w, batch_sizes, trans_b=False) + fc_b[sorted_experts]
+        h = h.relu().square()
+        out_sorted = self._gmm(h.type_as(x_sorted), proj_w, batch_sizes, trans_b=False) + proj_b[sorted_experts]
+
+        # ---- unpermute + weighted combine ----
+        # NOTE on optimizer semantics, not just numerics: when an expert
+        # gets zero tokens (batch_sizes[e] == 0), "loop" above never touches
+        # that expert's Parameters, so their .grad stays None after
+        # backward() -- which crashes this file's `assert p.grad is not
+        # None` in the training loop today (a known, still-unfixed
+        # limitation of "loop" for num_experts > 1). "grouped_gemm" instead
+        # produces a PRESENT, exactly-zero .grad for that expert (verified
+        # on an LS6 A100). That avoids the crash, but is NOT equivalent to
+        # "no update happened": both optimizers used in this file apply
+        # weight decay unconditionally (regardless of the gradient value),
+        # and Muon additionally computes an orthogonalized update from
+        # momentum.lerp_(grad=0, 1-mu) -- which decays prior momentum
+        # toward zero rather than leaving it untouched, and can still
+        # produce a NONZERO parameter update from residual momentum alone.
+        # Whether that is benign or causes drift for experts that are
+        # repeatedly starved of tokens has not been checked empirically.
+        out_flat = torch.empty_like(out_sorted)
+        out_flat[order] = out_sorted
+        out = (out_flat.view(N, self.top_k, D) * topk_weights.unsqueeze(-1)).sum(dim=1)
+        return out.view(B, T, D)
+
 class Block(nn.Module):
     def __init__(self, dim: int, mlp_type: str = "dense", num_experts: int = 1,
-                 top_k: int = 1, normalize_topk: bool = True):
+                 top_k: int = 1, normalize_topk: bool = True, moe_backend: str = "loop"):
         super().__init__()
         self.attn = CausalSelfAttention(dim)
         if mlp_type == "dense":
             self.mlp = MLP(dim)
         elif mlp_type == "moe":
-            self.mlp = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk)
+            self.mlp = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
+                            moe_backend=moe_backend)
         else:
             raise ValueError(f"unknown mlp_type: {mlp_type!r}")
         self.norm1 = RMSNorm(dim)
@@ -177,11 +305,13 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, mlp_type: str = "dense",
-                 num_experts: int = 1, top_k: int = 1, normalize_topk: bool = True):
+                 num_experts: int = 1, top_k: int = 1, normalize_topk: bool = True,
+                 moe_backend: str = "loop"):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
         self.blocks = nn.ModuleList([
-            Block(model_dim, mlp_type=mlp_type, num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk)
+            Block(model_dim, mlp_type=mlp_type, num_experts=num_experts, top_k=top_k,
+                  normalize_topk=normalize_topk, moe_backend=moe_backend)
             for _ in range(num_layers)
         ])
         self.proj = Linear(model_dim, vocab_size)
@@ -326,22 +456,30 @@ if __name__ == "__main__":
 
     val_tokens = 20 * 524288
     batch_size = 8 * 64 * 1024
-    mbs = 64
+    # (MBS_OVERRIDE: opt-in override for smoke tests; unset -> unchanged default of 64.
+    # Global batch is preserved regardless of mbs: the gradient-accumulation loop
+    # below runs len(inputs)//mbs microbatches per step, so a smaller mbs means
+    # more microbatches accumulated into the same fixed batch_size, not a smaller
+    # effective step.)
+    mbs = int(os.environ.get("MBS_OVERRIDE", 64))
     val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
     # MLP architecture: "dense" is the original single MLP; "moe" is a SparseMoE
     # of num_experts experts, routing each token to its top_k experts.
-    # (MLP_TYPE_OVERRIDE: opt-in override for smoke tests; unset -> unchanged "dense" default)
+    # (*_OVERRIDE: opt-in overrides for smoke tests; all unset -> unchanged defaults:
+    # mlp_type="dense", num_experts=1, top_k=1, moe_backend="loop")
     mlp_type = os.environ.get("MLP_TYPE_OVERRIDE", "dense")   # "dense" or "moe"
-    num_experts = 1
-    top_k = 1
+    num_experts = int(os.environ.get("NUM_EXPERTS_OVERRIDE", 1))
+    top_k = int(os.environ.get("TOP_K_OVERRIDE", 1))
     normalize_topk = True
+    moe_backend = os.environ.get("MOE_BACKEND_OVERRIDE", "loop")   # "loop" or "grouped_gemm"
 
     # tensorboard logging (disabled by default; rank 0 only)
     tensorboard_log = False
 
     model = GPT(vocab_size=50304, num_layers=12, model_dim=768, mlp_type=mlp_type,
-                num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk).cuda()
+                num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
+                moe_backend=moe_backend).cuda()
 
     # Compilation strategy, constructed once, outside the trial/step loops:
     # - dense: unchanged whole-model compile (existing baseline, untouched).
