@@ -6,18 +6,28 @@ It was prepared as a simplified version of the speedrun for use in neural net op
 """
 
 import os
+import platform
+import random
+import socket
+import subprocess
 import sys
+import tempfile
 import uuid
 import time
 import math
+from datetime import datetime, timezone
 from contextlib import nullcontext
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
+
+
+CHECKPOINT_FORMAT_VERSION = 1
 
 
 def nsys_range(enabled: bool, name: str):
@@ -29,32 +39,240 @@ def nsys_range(enabled: bool, name: str):
 #              Dataloader              #
 ########################################
 
-def _load_data_shard(file: Path):
+def _read_data_shard_header(file: Path):
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2]) # number of tokens (claimed)
+    return header, num_tokens
+
+
+def _load_data_shard(file: Path, pin_memory=True):
+    _, num_tokens = _read_data_shard_header(file)
     with file.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=pin_memory)
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
-    files = sorted(Path.cwd().glob(filename_pattern))
-    assert batch_size % dist.get_world_size() == 0
-    local_batch_size = batch_size // dist.get_world_size()
-    file_iter = iter(files)
-    tokens, pos = _load_data_shard(next(file_iter)), 0
-    while True:
-        if pos + batch_size + 1 >= len(tokens):
-            tokens, pos = _load_data_shard(next(file_iter)), 0
-        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
-        pos += batch_size
-        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
+
+def _data_shard_identity(file: Path):
+    header, num_tokens = _read_data_shard_header(file)
+    return {
+        "name": file.name,
+        "size_bytes": file.stat().st_size,
+        "num_tokens": num_tokens,
+        "header": header.tolist(),
+    }
+
+
+class DistributedDataLoader:
+    """Sequential shard loader with an explicit, relocatable cursor state."""
+    def __init__(self, filename_pattern: str, batch_size: int, seq_len=1024,
+                 data_root: str | Path | None = None, world_size: int | None = None,
+                 rank: int | None = None, device: str | torch.device = "cuda"):
+        self.filename_pattern = filename_pattern
+        self.data_root = Path.cwd() if data_root is None else Path(data_root)
+        self.files = sorted(self.data_root.glob(filename_pattern))
+        if not self.files:
+            raise FileNotFoundError(
+                f"no data shards match {filename_pattern!r} under {self.data_root}")
+        distributed = dist.is_available() and dist.is_initialized()
+        self.world_size = dist.get_world_size() if world_size is None and distributed else (world_size or 1)
+        self.rank = dist.get_rank() if rank is None and distributed else (rank or 0)
+        if not 0 <= self.rank < self.world_size:
+            raise ValueError(f"rank {self.rank} is invalid for world_size {self.world_size}")
+        if batch_size % self.world_size != 0:
+            raise ValueError("batch_size must be divisible by world_size")
+        self.batch_size = batch_size
+        self.local_batch_size = batch_size // self.world_size
+        self.seq_len = seq_len
+        self.device = torch.device(device)
+        self.shard_identities = [_data_shard_identity(file) for file in self.files]
+        self.shard_index = 0
+        self.pos = 0
+        self.tokens = _load_data_shard(
+            self.files[self.shard_index], pin_memory=self.device.type == "cuda")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.pos + self.batch_size + 1 >= len(self.tokens):
+            self.shard_index += 1
+            if self.shard_index >= len(self.files):
+                raise StopIteration("training data shards exhausted")
+            self.tokens = _load_data_shard(
+                self.files[self.shard_index], pin_memory=self.device.type == "cuda")
+            self.pos = 0
+        start = self.pos + self.rank * self.local_batch_size
+        buf = self.tokens[start:][:self.local_batch_size + 1]
+        inputs = buf[:-1].to(device=self.device, dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device=self.device, dtype=torch.int64, non_blocking=True)
+        self.pos += self.batch_size
+        return inputs.view(-1, self.seq_len), targets.view(-1, self.seq_len)
+
+    def state_dict(self):
+        return {
+            "format_version": 1,
+            "filename_pattern": self.filename_pattern,
+            "shards": self.shard_identities,
+            "shard_index": self.shard_index,
+            "token_offset": self.pos,
+            "batch_size": self.batch_size,
+            "seq_len": self.seq_len,
+            "world_size": self.world_size,
+            "rank": self.rank,
+            "epoch": 0,
+            "shuffle": False,
+        }
+
+    def load_state_dict(self, state):
+        if state.get("format_version") != 1:
+            raise ValueError(f"unsupported data-loader state version: {state.get('format_version')}")
+        expected = {
+            "filename_pattern": self.filename_pattern,
+            "shards": self.shard_identities,
+            "batch_size": self.batch_size,
+            "seq_len": self.seq_len,
+            "world_size": self.world_size,
+            "rank": self.rank,
+            "epoch": 0,
+            "shuffle": False,
+        }
+        for key, value in expected.items():
+            if state.get(key) != value:
+                raise ValueError(f"incompatible data-loader {key}: checkpoint={state.get(key)!r}, current={value!r}")
+        shard_index = int(state["shard_index"])
+        token_offset = int(state["token_offset"])
+        if not 0 <= shard_index < len(self.files):
+            raise ValueError(f"invalid checkpoint shard_index: {shard_index}")
+        if token_offset < 0 or token_offset % self.batch_size != 0:
+            raise ValueError(f"invalid checkpoint token_offset: {token_offset}")
+        self.shard_index = shard_index
+        self.pos = token_offset
+        self.tokens = _load_data_shard(
+            self.files[self.shard_index], pin_memory=self.device.type == "cuda")
+        if self.pos > len(self.tokens):
+            raise ValueError(
+                f"checkpoint token_offset {self.pos} exceeds shard length {len(self.tokens)}")
+
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024,
+                               data_root: str | Path | None = None):
+    return DistributedDataLoader(filename_pattern, batch_size, seq_len, data_root=data_root)
+
+
+def capture_rng_state():
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def restore_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def collect_environment_metadata():
+    def git_output(*args):
+        result = subprocess.run(
+            ["git", *args], cwd=Path(__file__).resolve().parents[2],
+            text=True, capture_output=True, check=False)
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    metadata = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "hostname": socket.gethostname(),
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        "git_commit": git_output("rev-parse", "HEAD"),
+        "git_branch": git_output("branch", "--show-current"),
+        "git_dirty": bool(git_output("status", "--porcelain")),
+    }
+    if torch.cuda.is_available():
+        metadata["gpu"] = torch.cuda.get_device_name(torch.cuda.current_device())
+        metadata["cuda_capability"] = list(torch.cuda.get_device_capability())
+    return metadata
+
+
+def atomic_save_checkpoint(payload, checkpoint_dir: str | Path):
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    latest = checkpoint_dir / "latest.pt"
+    previous = checkpoint_dir / "previous.pt"
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w+b", prefix=".checkpoint-", suffix=".tmp",
+                dir=checkpoint_dir, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            torch.save(payload, temporary)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        if latest.exists():
+            os.replace(latest, previous)
+        os.replace(temporary_path, latest)
+        directory_fd = os.open(checkpoint_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return latest
+    except BaseException:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+        raise
+
+
+def validate_checkpoint_config(checkpoint, resolved_config):
+    if checkpoint.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+        raise ValueError(
+            f"unsupported checkpoint format version: {checkpoint.get('format_version')}")
+    checkpoint_config = checkpoint.get("resolved_config")
+    if checkpoint_config != resolved_config:
+        raise ValueError(
+            f"checkpoint configuration is incompatible:\n"
+            f"checkpoint={checkpoint_config!r}\ncurrent={resolved_config!r}")
+
+
+def unwrap_model(model):
+    """Return the underlying module if a future compile path wraps it."""
+    return getattr(model, "_orig_mod", model)
+
+
+def make_training_checkpoint(model, optimizers, completed_updates, batch_size,
+                             resolved_config, train_loader, run_id, trial_idx,
+                             training_time, current_segment_time, last_val_step,
+                             environment_metadata):
+    return {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "model": unwrap_model(model).state_dict(),
+        "optimizers": [
+            {"name": type(optimizer).__name__, "state": optimizer.state_dict()}
+            for optimizer in optimizers
+        ],
+        "completed_updates": completed_updates,
+        "processed_training_tokens": completed_updates * batch_size,
+        "resolved_config": resolved_config,
+        "data_loader": train_loader.state_dict(),
+        "rng": capture_rng_state(),
+        "run": {"run_id": str(run_id), "trial_idx": trial_idx},
+        "timing": {
+            "training_time": training_time,
+            "current_segment_time": current_segment_time,
+            "last_val_step": last_val_step,
+        },
+        "environment": environment_metadata,
+    }
 
 
 ########################################
@@ -499,10 +717,52 @@ if __name__ == "__main__":
     # this code can be run equivalently with 1, 2, 4, or 8 gpus.
     assert 8 % dist.get_world_size() == 0
 
+    num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
+    checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "")
+    checkpoint_interval = int(os.environ.get("CHECKPOINT_INTERVAL", 0))
+    resume_checkpoint_path = os.environ.get("RESUME_CHECKPOINT", "")
+    stop_after_value = os.environ.get("STOP_AFTER_COMPLETED_UPDATES", "")
+    stop_after_updates = int(stop_after_value) if stop_after_value else None
+    checkpointing_requested = bool(
+        checkpoint_dir or checkpoint_interval or resume_checkpoint_path
+        or stop_after_updates is not None)
+    if checkpoint_interval < 0:
+        raise ValueError("CHECKPOINT_INTERVAL must be nonnegative")
+    if checkpointing_requested:
+        if dist.get_world_size() != 1:
+            raise ValueError("checkpoint/resume currently requires exactly one GPU")
+        if num_trials != 1:
+            raise ValueError("checkpoint/resume currently requires exactly one trial")
+        if not checkpoint_dir:
+            raise ValueError(
+                "CHECKPOINT_DIR is required when checkpointing, resuming, or stopping early")
+    if stop_after_updates is not None and stop_after_updates <= 0:
+        raise ValueError("STOP_AFTER_COMPLETED_UPDATES must be positive")
+
+    resume_checkpoint = None
+    if resume_checkpoint_path:
+        resume_checkpoint = torch.load(
+            resume_checkpoint_path, map_location="cpu", weights_only=False)
+        if resume_checkpoint.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+            raise ValueError(
+                f"unsupported checkpoint format version: "
+                f"{resume_checkpoint.get('format_version')}")
+        if resume_checkpoint.get("run", {}).get("trial_idx") != 0:
+            raise ValueError("resume currently supports only trial_idx=0")
+
+    seed_value = os.environ.get("SEED_OVERRIDE", "")
+    seed = int(seed_value) if seed_value else None
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
     # logging setup
     if dist.get_rank() == 0:
         os.makedirs("logs", exist_ok=True)
-        run_id = uuid.uuid4()
+        run_id = (resume_checkpoint["run"]["run_id"]
+                  if resume_checkpoint is not None else str(uuid.uuid4()))
         logfile = f"logs/{run_id}.txt"
         print(logfile)
     def print0(s, console=False, log=True):
@@ -519,16 +779,26 @@ if __name__ == "__main__":
     print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
            + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
     print0("="*100)
+    if checkpointing_requested:
+        print0(
+            f"checkpointing: directory={checkpoint_dir} interval={checkpoint_interval} "
+            f"resume={resume_checkpoint_path or 'none'} "
+            f"stop_after={stop_after_updates if stop_after_updates is not None else 'none'}",
+            console=True,
+        )
 
     val_tokens = 20 * 524288
     batch_size = 8 * 64 * 1024
+    data_root = os.environ.get("DATA_ROOT", str(Path.cwd()))
     # (MBS_OVERRIDE: opt-in override for smoke tests; unset -> unchanged default of 64.
     # Global batch is preserved regardless of mbs: the gradient-accumulation loop
     # below runs len(inputs)//mbs microbatches per step, so a smaller mbs means
     # more microbatches accumulated into the same fixed batch_size, not a smaller
     # effective step.)
     mbs = int(os.environ.get("MBS_OVERRIDE", 64))
-    val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+    val_loader = distributed_data_generator(
+        "data/fineweb10B/fineweb_val_*.bin", val_tokens, data_root=data_root)
+    val_inputs, val_targets = next(val_loader)
 
     # MLP architecture: "dense" is the original single MLP; "moe" is a SparseMoE
     # of num_experts experts, routing each token to its top_k experts.
@@ -546,7 +816,6 @@ if __name__ == "__main__":
     tb_system = os.environ.get("TB_SYSTEM", "unknown")
     tensorboard_log = bool(tb_root)
 
-    num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
     nsys_profile_value = os.environ.get("NSYS_PROFILE", "0")
     if nsys_profile_value not in ("0", "1"):
         raise ValueError(f"NSYS_PROFILE must be 0 or 1, got {nsys_profile_value!r}")
@@ -570,6 +839,9 @@ if __name__ == "__main__":
             f"{nsys_warmup_steps + nsys_active_steps}",
             console=True,
         )
+    if nsys_profile and checkpointing_requested:
+        raise ValueError(
+            "combining NSYS_PROFILE with checkpoint/resume is not yet supported")
     model_dim = 768
     model = GPT(vocab_size=50304, num_layers=12, model_dim=model_dim, mlp_type=mlp_type,
                 num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
@@ -608,6 +880,9 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"unknown mlp_type: {mlp_type!r}")
 
+    environment_metadata = (
+        collect_environment_metadata() if checkpointing_requested else None)
+    stopped_early = False
     for trial_idx in range(num_trials):
 
 
@@ -618,6 +893,11 @@ if __name__ == "__main__":
         # we want to minimize this while still reaching 3.28 val loss
         # (TRAIN_STEPS_OVERRIDE: opt-in override for short smoke tests; unset -> unchanged default)
         train_steps = int(os.environ.get("TRAIN_STEPS_OVERRIDE", 3250))
+        if train_steps <= 0:
+            raise ValueError("TRAIN_STEPS_OVERRIDE must be positive")
+        if stop_after_updates is not None and stop_after_updates > train_steps:
+            raise ValueError(
+                "STOP_AFTER_COMPLETED_UPDATES cannot exceed the total training steps")
         if nsys_profile and train_steps < nsys_warmup_steps + nsys_active_steps:
             raise ValueError(
                 f"NSYS_PROFILE capture ends after update "
@@ -667,12 +947,92 @@ if __name__ == "__main__":
                 for group in opt.param_groups:
                     group["lr"] = group["initial_lr"] * eta
 
+        resolved_config = {
+            "model": {
+                "vocab_size": 50304,
+                "num_layers": 12,
+                "model_dim": model.model_dim,
+                "mlp_type": mlp_type,
+                "mlp_ratio": float(model.mlp_ratio),
+                "hidden_dim": model.hidden_dim,
+                "num_experts": num_experts,
+                "top_k": top_k,
+                "normalize_topk": normalize_topk,
+                "moe_backend": moe_backend,
+            },
+            "training": {
+                "sequence_length": 1024,
+                "global_batch_tokens": batch_size,
+                "microbatch_sequences": mbs,
+                "accumulation_count": accumulation_count,
+                "validation_tokens": val_tokens,
+                "total_steps": train_steps,
+                "cooldown_fraction": 0.7,
+                "training_shard_pattern": "data/fineweb10B/fineweb_train_*.bin",
+                "validation_shard_pattern": "data/fineweb10B/fineweb_val_*.bin",
+            },
+            "optimizers": {
+                "adamw": {
+                    "group_lrs": [0.7, 0.004, 0.015],
+                    "betas": [0.8, 0.95],
+                    "eps": 1e-10,
+                    "weight_decay": 0.001,
+                    "fused": True,
+                },
+                "muon": {"lr": 0.025, "weight_decay": 0.05, "mu": 0.95},
+            },
+            "datasets": {
+                "validation_shards": val_loader.shard_identities,
+            },
+            "seed_override": seed,
+        }
+
 
         ########################################
         #        Training and Validation       #
         ########################################
 
-        train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+        train_loader = distributed_data_generator(
+            "data/fineweb10B/fineweb_train_*.bin", batch_size, data_root=data_root)
+
+        completed_updates = 0
+        training_time = 0.0
+        current_segment_time = 0.0
+        last_val_step = 0
+        if resume_checkpoint is not None:
+            validate_checkpoint_config(resume_checkpoint, resolved_config)
+            completed_updates = int(resume_checkpoint["completed_updates"])
+            if not 0 <= completed_updates <= train_steps:
+                raise ValueError(
+                    f"invalid completed update count in checkpoint: {completed_updates}")
+            if resume_checkpoint.get("processed_training_tokens") != completed_updates * batch_size:
+                raise ValueError("checkpoint processed-training-token count is inconsistent")
+            if (stop_after_updates is not None
+                    and stop_after_updates <= completed_updates):
+                raise ValueError(
+                    "STOP_AFTER_COMPLETED_UPDATES must be greater than the restored update count")
+            unwrap_model(model).load_state_dict(resume_checkpoint["model"])
+            optimizer_states = resume_checkpoint.get("optimizers", [])
+            if len(optimizer_states) != len(optimizers):
+                raise ValueError("checkpoint optimizer count is incompatible")
+            for optimizer, saved_optimizer in zip(optimizers, optimizer_states):
+                expected_name = type(optimizer).__name__
+                if saved_optimizer.get("name") != expected_name:
+                    raise ValueError(
+                        f"checkpoint optimizer is incompatible: expected {expected_name}, "
+                        f"got {saved_optimizer.get('name')!r}")
+                optimizer.load_state_dict(saved_optimizer["state"])
+            train_loader.load_state_dict(resume_checkpoint["data_loader"])
+            timing = resume_checkpoint["timing"]
+            training_time = float(timing["training_time"])
+            current_segment_time = float(timing["current_segment_time"])
+            last_val_step = int(timing["last_val_step"])
+            print0(
+                f"Resuming {run_id} from {resume_checkpoint_path}: "
+                f"completed_updates={completed_updates} "
+                f"processed_training_tokens={resume_checkpoint['processed_training_tokens']}",
+                console=True,
+            )
 
         # tensorboard writer: rank 0 only, one run directory per trial, disabled by default
         writer = None
@@ -681,17 +1041,34 @@ if __name__ == "__main__":
             tb_dir = os.path.join(
                 tb_root, "modded-nanogpt-moe", tb_system, str(run_id), f"trial_{trial_idx}")
             print0(f"TensorBoard event directory: {tb_dir}", console=True)
-            writer = SummaryWriter(log_dir=tb_dir)
+            writer_kwargs = {"log_dir": tb_dir}
+            if resume_checkpoint is not None:
+                # Hide any stale events at or after the restored update. This keeps a
+                # reused run directory coherent if work progressed past the checkpoint.
+                writer_kwargs["purge_step"] = completed_updates
+            writer = SummaryWriter(**writer_kwargs)
+            if resume_checkpoint is not None and completed_updates > 0:
+                restored_elapsed = training_time + current_segment_time
+                writer.add_scalar(
+                    "perf/approx_training_time_s", restored_elapsed, completed_updates)
+                writer.add_scalar(
+                    "perf/step_avg_ms",
+                    1000 * restored_elapsed / completed_updates,
+                    completed_updates,
+                )
+                writer.flush()
 
         for p in model.parameters():
             dist.broadcast(p.detach(), 0)
+        if resume_checkpoint is not None:
+            # Model/optimizer construction and writer setup may consume randomness.
+            # Restore last so the next training update sees the saved RNG streams.
+            restore_rng_state(resume_checkpoint["rng"])
         # start the clock
-        training_time = 0
-        last_val_step = 0
         dist.barrier()
-        t0 = time.perf_counter()
+        t0 = time.perf_counter() - current_segment_time
         nsys_capture_active = False
-        for step in range(train_steps + 1):
+        for step in range(completed_updates, train_steps + 1):
 
             # --------------- VALIDATION SECTION -----------------
             val_step_freq = 125 if step / train_steps < 0.9 else 25
@@ -785,7 +1162,61 @@ if __name__ == "__main__":
                 writer.add_scalar("perf/step_avg_ms", 1000 * approx_training_time / (step + 1), step + 1)
                 writer.flush()
 
+            completed_updates = step + 1
+            save_due = bool(checkpoint_dir) and (
+                completed_updates == train_steps
+                or (checkpoint_interval > 0
+                    and completed_updates % checkpoint_interval == 0)
+                or completed_updates == stop_after_updates)
+            if save_due:
+                for name, parameter in model.named_parameters():
+                    if parameter.grad is not None:
+                        raise RuntimeError(
+                            f"refusing to checkpoint before gradients are cleared: {name}")
+                checkpoint_started = time.perf_counter()
+                checkpoint = make_training_checkpoint(
+                    model=model,
+                    optimizers=optimizers,
+                    completed_updates=completed_updates,
+                    batch_size=batch_size,
+                    resolved_config=resolved_config,
+                    train_loader=train_loader,
+                    run_id=run_id,
+                    trial_idx=trial_idx,
+                    training_time=training_time,
+                    current_segment_time=checkpoint_started - t0,
+                    last_val_step=last_val_step,
+                    environment_metadata=environment_metadata,
+                )
+                saved_path = atomic_save_checkpoint(checkpoint, checkpoint_dir)
+                checkpoint_duration = time.perf_counter() - checkpoint_started
+                # Checkpoint I/O is bookkeeping rather than training time.
+                t0 += checkpoint_duration
+                print0(
+                    f"Saved checkpoint after update {completed_updates}: {saved_path}",
+                    console=True,
+                )
+
+            if completed_updates == stop_after_updates:
+                if nsys_capture_active:
+                    torch.cuda.synchronize()
+                    torch.cuda.profiler.stop()
+                    nsys_capture_active = False
+                    print0(
+                        f"Nsight Systems capture ended early after update {completed_updates}",
+                        console=True,
+                    )
+                print0(
+                    f"Stopped cleanly after requested update {completed_updates}; "
+                    f"schedule horizon remains {train_steps}",
+                    console=True,
+                )
+                stopped_early = True
+                break
+
         if writer is not None:
             writer.close()
+        if stopped_early:
+            break
 
     dist.destroy_process_group()
