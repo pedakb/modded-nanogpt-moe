@@ -10,6 +10,7 @@ import sys
 import uuid
 import time
 import math
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -17,6 +18,11 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
+
+
+def nsys_range(enabled: bool, name: str):
+    """Return an NVTX range only while the opt-in Nsight capture is active."""
+    return torch.cuda.nvtx.range(name) if enabled else nullcontext()
 
 
 ########################################
@@ -541,6 +547,29 @@ if __name__ == "__main__":
     tensorboard_log = bool(tb_root)
 
     num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
+    nsys_profile_value = os.environ.get("NSYS_PROFILE", "0")
+    if nsys_profile_value not in ("0", "1"):
+        raise ValueError(f"NSYS_PROFILE must be 0 or 1, got {nsys_profile_value!r}")
+    nsys_profile = nsys_profile_value == "1"
+    nsys_warmup_steps = 10
+    nsys_active_steps = 2
+    if nsys_profile:
+        nsys_warmup_steps = int(os.environ.get("NSYS_WARMUP_STEPS", nsys_warmup_steps))
+        nsys_active_steps = int(os.environ.get("NSYS_ACTIVE_STEPS", nsys_active_steps))
+        if dist.get_world_size() != 1:
+            raise ValueError("NSYS_PROFILE=1 currently requires exactly one GPU")
+        if num_trials != 1:
+            raise ValueError("NSYS_PROFILE=1 currently requires exactly one trial")
+        if nsys_warmup_steps < 0:
+            raise ValueError("NSYS_WARMUP_STEPS must be nonnegative")
+        if nsys_active_steps <= 0:
+            raise ValueError("NSYS_ACTIVE_STEPS must be positive")
+        print0(
+            f"Nsight Systems profiling enabled: warmup_updates={nsys_warmup_steps} "
+            f"captured_updates={nsys_warmup_steps + 1}-"
+            f"{nsys_warmup_steps + nsys_active_steps}",
+            console=True,
+        )
     model_dim = 768
     model = GPT(vocab_size=50304, num_layers=12, model_dim=model_dim, mlp_type=mlp_type,
                 num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
@@ -589,6 +618,11 @@ if __name__ == "__main__":
         # we want to minimize this while still reaching 3.28 val loss
         # (TRAIN_STEPS_OVERRIDE: opt-in override for short smoke tests; unset -> unchanged default)
         train_steps = int(os.environ.get("TRAIN_STEPS_OVERRIDE", 3250))
+        if nsys_profile and train_steps < nsys_warmup_steps + nsys_active_steps:
+            raise ValueError(
+                f"NSYS_PROFILE capture ends after update "
+                f"{nsys_warmup_steps + nsys_active_steps}, but TRAIN_STEPS_OVERRIDE "
+                f"requests only {train_steps} updates")
 
         # initialize model parameters
         for name, p in model.named_parameters():
@@ -656,6 +690,7 @@ if __name__ == "__main__":
         last_val_step = 0
         dist.barrier()
         t0 = time.perf_counter()
+        nsys_capture_active = False
         for step in range(train_steps + 1):
 
             # --------------- VALIDATION SECTION -----------------
@@ -695,23 +730,48 @@ if __name__ == "__main__":
                 break
 
             # --------------- TRAINING SECTION -----------------
-            inputs, targets = next(train_loader)
-            # accumulate across microbatches in case we are running with fewer than 8 gpus
-            assert len(inputs) % mbs == 0
-            for i in range(len(inputs) // mbs):
-                run_forward(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
-            for name, p in model.named_parameters():
-                assert p.grad is not None, name
-                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-            # set optimization hyperparameters and take a step
-            set_hparams(step)
-            if writer is not None:
+            if nsys_profile and step == nsys_warmup_steps:
+                torch.cuda.synchronize()
+                print0(f"Nsight Systems capture starting before update {step + 1}", console=True)
+                torch.cuda.profiler.start()
+                nsys_capture_active = True
+
+            with nsys_range(nsys_capture_active, f"optimizer_step.update_{step + 1}"):
+                with nsys_range(nsys_capture_active, "data_preparation"):
+                    inputs, targets = next(train_loader)
+                # accumulate across microbatches in case we are running with fewer than 8 gpus
+                assert len(inputs) % mbs == 0
+                for i in range(len(inputs) // mbs):
+                    with nsys_range(nsys_capture_active, f"forward.microbatch_{i}"):
+                        loss = run_forward(
+                            inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+                    with nsys_range(nsys_capture_active, f"backward.microbatch_{i}"):
+                        loss.backward()
+                    del loss
+                for name, p in model.named_parameters():
+                    assert p.grad is not None, name
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                # set optimization hyperparameters and take a step
+                set_hparams(step)
+                if writer is not None:
+                    for opt_idx, opt in enumerate(optimizers):
+                        for grp_idx, group in enumerate(opt.param_groups):
+                            writer.add_scalar(
+                                f"optim/lr_opt{opt_idx}_group{grp_idx}", group["lr"], step)
                 for opt_idx, opt in enumerate(optimizers):
-                    for grp_idx, group in enumerate(opt.param_groups):
-                        writer.add_scalar(f"optim/lr_opt{opt_idx}_group{grp_idx}", group["lr"], step)
-            for opt in optimizers:
-                opt.step()
-            model.zero_grad(set_to_none=True)
+                    optimizer_name = type(opt).__name__
+                    with nsys_range(
+                            nsys_capture_active,
+                            f"optimizer_update.index_{opt_idx}.{optimizer_name}"):
+                        opt.step()
+                model.zero_grad(set_to_none=True)
+
+            if (nsys_capture_active
+                    and step + 1 == nsys_warmup_steps + nsys_active_steps):
+                torch.cuda.synchronize()
+                torch.cuda.profiler.stop()
+                nsys_capture_active = False
+                print0(f"Nsight Systems capture ended after update {step + 1}", console=True)
             approx_training_time = training_time + (time.perf_counter() - t0)
             print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
                    + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms"
