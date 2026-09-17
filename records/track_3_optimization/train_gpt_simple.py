@@ -9,6 +9,7 @@ import os
 import sys
 import uuid
 import time
+import math
 from pathlib import Path
 
 import torch
@@ -110,12 +111,37 @@ class CausalSelfAttention(nn.Module):
         y = self.proj(y)
         return y
 
+def resolve_mlp_hidden_dim(model_dim: int, mlp_ratio: float = 4) -> int:
+    """Resolve an experiment-level MLP ratio without silently rounding it."""
+    if isinstance(mlp_ratio, bool) or not isinstance(mlp_ratio, (int, float)):
+        raise ValueError(f"mlp_ratio must be a finite positive number, got {mlp_ratio!r}")
+    try:
+        ratio = float(mlp_ratio)
+    except OverflowError as exc:
+        raise ValueError(f"mlp_ratio must be finite and positive, got {mlp_ratio!r}") from exc
+    if not math.isfinite(ratio) or ratio <= 0:
+        raise ValueError(f"mlp_ratio must be finite and positive, got {mlp_ratio!r}")
+    try:
+        product = model_dim * ratio
+    except OverflowError as exc:
+        raise ValueError(
+            f"model_dim * mlp_ratio must be a finite positive integer, got "
+            f"{model_dim} * {mlp_ratio!r}") from exc
+    if not math.isfinite(product) or product <= 0 or not product.is_integer():
+        raise ValueError(
+            f"model_dim * mlp_ratio must be a finite positive integer, got "
+            f"{model_dim} * {mlp_ratio!r} = {product!r}")
+    return int(product)
+
+
 class MLP(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, hidden_dim: int | None = None):
         super().__init__()
-        hdim = 4 * dim
-        self.fc = Linear(dim, hdim)
-        self.proj = Linear(hdim, dim)
+        hidden_dim = 4 * dim if hidden_dim is None else hidden_dim
+        if isinstance(hidden_dim, bool) or not isinstance(hidden_dim, int) or hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be a positive integer, got {hidden_dim!r}")
+        self.fc = Linear(dim, hidden_dim)
+        self.proj = Linear(hidden_dim, dim)
 
     def forward(self, x: Tensor):
         x = self.fc(x)
@@ -171,7 +197,7 @@ class MoE(nn.Module):
     import from it) but implements the same validated pipeline against the
     production nn.ModuleList instead of a separate ParameterList."""
     def __init__(self, dim: int, num_experts: int, top_k: int, normalize_topk: bool = True,
-                 moe_backend: str = "loop"):
+                 moe_backend: str = "loop", hidden_dim: int | None = None):
         super().__init__()
         assert 1 <= top_k <= num_experts
         assert moe_backend in ("loop", "grouped_gemm"), f"unknown moe_backend: {moe_backend!r}"
@@ -180,7 +206,7 @@ class MoE(nn.Module):
         self.normalize_topk = normalize_topk
         self.moe_backend = moe_backend
         self.router = Linear(dim, num_experts)
-        self.experts = nn.ModuleList(MLP(dim) for _ in range(num_experts))
+        self.experts = nn.ModuleList(MLP(dim, hidden_dim) for _ in range(num_experts))
         if moe_backend == "grouped_gemm":
             # Imported only when this backend is selected -- "loop" (the
             # default) never touches this import, and dense models never
@@ -307,14 +333,15 @@ class MoE(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim: int, mlp_type: str = "dense", num_experts: int = 1,
-                 top_k: int = 1, normalize_topk: bool = True, moe_backend: str = "loop"):
+                 top_k: int = 1, normalize_topk: bool = True, moe_backend: str = "loop",
+                 hidden_dim: int | None = None):
         super().__init__()
         self.attn = CausalSelfAttention(dim)
         if mlp_type == "dense":
-            self.mlp = MLP(dim)
+            self.mlp = MLP(dim, hidden_dim)
         elif mlp_type == "moe":
             self.mlp = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
-                            moe_backend=moe_backend)
+                            moe_backend=moe_backend, hidden_dim=hidden_dim)
         else:
             raise ValueError(f"unknown mlp_type: {mlp_type!r}")
         self.norm1 = RMSNorm(dim)
@@ -328,12 +355,17 @@ class Block(nn.Module):
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, mlp_type: str = "dense",
                  num_experts: int = 1, top_k: int = 1, normalize_topk: bool = True,
-                 moe_backend: str = "loop"):
+                 moe_backend: str = "loop", mlp_ratio: float = 4):
         super().__init__()
+        hidden_dim = resolve_mlp_hidden_dim(model_dim, mlp_ratio)
+        self.model_dim = model_dim
+        self.mlp_ratio = mlp_ratio
+        self.hidden_dim = hidden_dim
         self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
         self.blocks = nn.ModuleList([
             Block(model_dim, mlp_type=mlp_type, num_experts=num_experts, top_k=top_k,
-                  normalize_topk=normalize_topk, moe_backend=moe_backend)
+                  normalize_topk=normalize_topk, moe_backend=moe_backend,
+                  hidden_dim=hidden_dim)
             for _ in range(num_layers)
         ])
         self.proj = Linear(model_dim, vocab_size)
@@ -489,8 +521,9 @@ if __name__ == "__main__":
     # MLP architecture: "dense" is the original single MLP; "moe" is a SparseMoE
     # of num_experts experts, routing each token to its top_k experts.
     # (*_OVERRIDE: opt-in overrides for smoke tests; all unset -> unchanged defaults:
-    # mlp_type="dense", num_experts=1, top_k=1, moe_backend="loop")
+    # mlp_type="dense", mlp_ratio=4, num_experts=1, top_k=1, moe_backend="loop")
     mlp_type = os.environ.get("MLP_TYPE_OVERRIDE", "dense")   # "dense" or "moe"
+    mlp_ratio = float(os.environ.get("MLP_RATIO_OVERRIDE", 4))
     num_experts = int(os.environ.get("NUM_EXPERTS_OVERRIDE", 1))
     top_k = int(os.environ.get("TOP_K_OVERRIDE", 1))
     normalize_topk = True
@@ -499,9 +532,23 @@ if __name__ == "__main__":
     # tensorboard logging (disabled by default; rank 0 only)
     tensorboard_log = False
 
-    model = GPT(vocab_size=50304, num_layers=12, model_dim=768, mlp_type=mlp_type,
+    num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
+    model_dim = 768
+    model = GPT(vocab_size=50304, num_layers=12, model_dim=model_dim, mlp_type=mlp_type,
                 num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
-                moe_backend=moe_backend).cuda()
+                moe_backend=moe_backend, mlp_ratio=mlp_ratio)
+    local_sequences = batch_size // dist.get_world_size() // 1024
+    assert local_sequences % mbs == 0
+    accumulation_count = local_sequences // mbs
+    print0(
+        f"configuration: model_dim={model.model_dim} mlp_ratio={float(model.mlp_ratio):g} "
+        f"hidden_dim={model.hidden_dim} model_type={mlp_type} moe_backend={moe_backend} "
+        f"E={num_experts} k={top_k} microbatch={mbs} "
+        f"global_batch={batch_size} accumulation_count={accumulation_count} "
+        f"trial_count={num_trials}",
+        console=True,
+    )
+    model.cuda()
 
     # Compilation strategy, constructed once, outside the trial/step loops:
     # - dense: unchanged whole-model compile (existing baseline, untouched).
@@ -523,9 +570,6 @@ if __name__ == "__main__":
             return compiled_head_loss(x, targets)
     else:
         raise ValueError(f"unknown mlp_type: {mlp_type!r}")
-
-
-    num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
 
     for trial_idx in range(num_trials):
 

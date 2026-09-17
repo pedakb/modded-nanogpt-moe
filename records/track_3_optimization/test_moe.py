@@ -33,6 +33,51 @@ def _make_dense_and_moe(dim=32):
     return dense, moe
 
 
+def test_default_mlp_width_and_checkpoint_keys_remain_compatible():
+    default = GPT(vocab_size=37, num_layers=2, model_dim=16)
+    explicit = GPT(vocab_size=37, num_layers=2, model_dim=16, mlp_ratio=4)
+
+    assert default.hidden_dim == explicit.hidden_dim == 64
+    assert list(default.state_dict()) == list(explicit.state_dict())
+    assert [name for name in default.state_dict() if ".mlp." in name] == [
+        "blocks.0.mlp.fc.weight", "blocks.0.mlp.fc.bias",
+        "blocks.0.mlp.proj.weight", "blocks.0.mlp.proj.bias",
+        "blocks.1.mlp.fc.weight", "blocks.1.mlp.fc.bias",
+        "blocks.1.mlp.proj.weight", "blocks.1.mlp.proj.bias",
+    ]
+    for name, default_tensor in default.state_dict().items():
+        assert default_tensor.shape == explicit.state_dict()[name].shape, name
+    for block in default.blocks:
+        assert block.mlp.fc.weight.shape == (64, 16)
+        assert block.mlp.fc.bias.shape == (64,)
+        assert block.mlp.proj.weight.shape == (16, 64)
+        assert block.mlp.proj.bias.shape == (16,)
+
+
+def test_ratio_two_sets_dense_and_expert_width_independently_of_top_k():
+    dense = GPT(vocab_size=37, num_layers=1, model_dim=16, mlp_ratio=2)
+    assert dense.hidden_dim == 32
+    assert dense.blocks[0].mlp.fc.weight.shape == (32, 16)
+    assert dense.blocks[0].mlp.proj.weight.shape == (16, 32)
+
+    for top_k in (1, 2):
+        moe = GPT(vocab_size=37, num_layers=1, model_dim=16, mlp_type="moe",
+                  mlp_ratio=2, num_experts=8, top_k=top_k)
+        assert moe.hidden_dim == 32
+        assert len(moe.blocks[0].mlp.experts) == 8
+        for expert in moe.blocks[0].mlp.experts:
+            assert expert.fc.weight.shape == (32, 16)
+            assert expert.fc.bias.shape == (32,)
+            assert expert.proj.weight.shape == (16, 32)
+            assert expert.proj.bias.shape == (16,)
+
+
+@pytest.mark.parametrize("mlp_ratio", [0, -1, float("nan"), float("inf"), float("-inf"), 0.1])
+def test_invalid_mlp_ratios_are_rejected(mlp_ratio):
+    with pytest.raises(ValueError):
+        GPT(vocab_size=37, num_layers=1, model_dim=16, mlp_ratio=mlp_ratio)
+
+
 def test_forward_equivalence():
     dense, moe = _make_dense_and_moe()
     x = torch.randn(2, 5, 32)
@@ -271,7 +316,8 @@ def test_grouped_gemm_backend_unavailable_raises_clear_error():
                      "(PyPI nv-grouped-gemm) -- pending LS6, not installed here")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="grouped_gemm requires CUDA, none "
                      "available here")
-def test_grouped_gemm_backend_matches_loop_backend_output_and_gradients():
+@pytest.mark.parametrize("hidden_dim", [64, 32], ids=["ratio_4", "ratio_2"])
+def test_grouped_gemm_backend_matches_loop_backend_output_and_gradients(hidden_dim):
     # Requirement: output/gradient parity using IDENTICAL weights and inputs,
     # plus an explicit checkpoint-key / optimizer-parameter-coverage comparison.
     # Both backends share the exact same nn.ModuleList(MLP) storage, so a
@@ -279,9 +325,11 @@ def test_grouped_gemm_backend_matches_loop_backend_output_and_gradients():
     dim, num_experts, top_k = 16, 8, 2
     torch.manual_seed(6)
     moe_loop = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=True,
-                   moe_backend="loop").to(device="cuda", dtype=torch.bfloat16)
+                   moe_backend="loop", hidden_dim=hidden_dim).to(
+                       device="cuda", dtype=torch.bfloat16)
     moe_gg = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=True,
-                 moe_backend="grouped_gemm").to(device="cuda", dtype=torch.bfloat16)
+                 moe_backend="grouped_gemm", hidden_dim=hidden_dim).to(
+                     device="cuda", dtype=torch.bfloat16)
     for p in moe_loop.parameters():
         p.data.normal_(std=0.05)
     # Force one expert to receive zero tokens, to exercise the documented

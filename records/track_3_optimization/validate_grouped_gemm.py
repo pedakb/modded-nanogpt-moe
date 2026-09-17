@@ -317,7 +317,7 @@ class GroupedGemmMoE(nn.Module):
              an arbitrary transposed view."""
 
     def __init__(self, dim, num_experts, top_k, normalize_topk=True, gmm_fn=reference_gmm,
-                 forward_trans_b=True, profile_stages=False):
+                 forward_trans_b=True, profile_stages=False, hidden_dim=None):
         super().__init__()
         assert 1 <= top_k <= num_experts
         self.num_experts = num_experts
@@ -326,7 +326,7 @@ class GroupedGemmMoE(nn.Module):
         self.gmm_fn = gmm_fn
         self.forward_trans_b = forward_trans_b
         self.profile_stages = profile_stages
-        hdim = 4 * dim
+        hdim = 4 * dim if hidden_dim is None else hidden_dim
         self.router = tgs.Linear(dim, num_experts)
         self.fc_weight = nn.ParameterList(nn.Parameter(torch.empty(hdim, dim)) for _ in range(num_experts))
         self.fc_bias = nn.ParameterList(nn.Parameter(torch.empty(hdim)) for _ in range(num_experts))
@@ -388,7 +388,7 @@ class GroupedGemmMoE(nn.Module):
 
         with self._scope("moe.fc1_weight_stack_and_layout"):
             fc_w = self._stacked_weight(self.fc_weight).type_as(x_sorted)
-            fc_b = torch.stack(list(self.fc_bias)).type_as(x_sorted)        # [E, 4D]
+            fc_b = torch.stack(list(self.fc_bias)).type_as(x_sorted)        # [E, hidden_dim]
         with self._scope("moe.fc2_weight_stack_and_layout"):
             proj_w = self._stacked_weight(self.proj_weight).type_as(x_sorted)
             proj_b = torch.stack(list(self.proj_bias)).type_as(x_sorted)    # [E, D]
@@ -431,18 +431,19 @@ def _biased_router_excluding(router: nn.Linear, excluded_experts, bias_value=-1.
 
 def run_case(name, dim, num_experts, top_k, n_tokens, backend_name, device, dtype,
              normalize_topk=True, excluded_experts=(), atol=2e-2, rtol=2e-2, seed=0,
-             forward_trans_b=True):
+             forward_trans_b=True, hidden_dim=None):
     gmm_fn = BACKENDS[backend_name]
     torch.manual_seed(seed)
 
-    moe = tgs.MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk).to(device)
+    moe = tgs.MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
+                  hidden_dim=hidden_dim).to(device)
     for p in moe.parameters():
         p.data = torch.empty_like(p.data, dtype=dtype).normal_(std=0.05)
     if excluded_experts:
         _biased_router_excluding(moe.router, excluded_experts)
 
     gg = GroupedGemmMoE(dim, num_experts, top_k, normalize_topk=normalize_topk, gmm_fn=gmm_fn,
-                         forward_trans_b=forward_trans_b).to(device)
+                         forward_trans_b=forward_trans_b, hidden_dim=hidden_dim).to(device)
     gg.load_from_moe(moe)
 
     torch.manual_seed(seed + 1)
@@ -507,6 +508,8 @@ CASES = [
     dict(name="E8_k2_random_uneven", dim=16, num_experts=8, top_k=2, n_tokens=37, seed=3),
     dict(name="E8_k2_forced_empty_experts", dim=16, num_experts=8, top_k=2, n_tokens=37,
          excluded_experts=(2, 5), seed=4),
+    dict(name="E8_k2_ratio2_forced_empty_experts", dim=16, hidden_dim=32,
+         num_experts=8, top_k=2, n_tokens=37, excluded_experts=(2, 5), seed=4),
     dict(name="E8_k2_normalize_false", dim=16, num_experts=8, top_k=2, n_tokens=37,
          normalize_topk=False, seed=5),
 ]
@@ -518,9 +521,9 @@ CASES = [
 # a full training-step profile.
 BENCHMARK_CASES = {
     "train_e1_k1": dict(name="train_e1_k1", batch=64, seq_len=1024, dim=768,
-                         num_experts=1, top_k=1, seed=101),
+                         hidden_dim=3072, num_experts=1, top_k=1, seed=101),
     "small_e8_k2": dict(name="small_e8_k2", batch=4, seq_len=1024, dim=768,
-                         num_experts=8, top_k=2, seed=202),
+                         hidden_dim=1536, num_experts=8, top_k=2, seed=202),
 }
 
 BENCHMARK_CONFIGS = (
@@ -541,7 +544,8 @@ def _make_benchmark_inputs(case, activation_dtype):
     """
     generator = torch.Generator(device="cpu").manual_seed(case["seed"])
     canonical = tgs.MoE(case["dim"], num_experts=case["num_experts"],
-                        top_k=case["top_k"], normalize_topk=True).to(dtype=torch.float32)
+                        top_k=case["top_k"], normalize_topk=True,
+                        hidden_dim=case["hidden_dim"]).to(dtype=torch.float32)
     with torch.no_grad():
         for p in canonical.parameters():
             p.copy_(torch.randn(p.shape, generator=generator, dtype=torch.float32) * 0.02)
@@ -588,7 +592,7 @@ def _make_benchmark_model(canonical, case, config_name, forward_trans_b, device,
         model = GroupedGemmMoE(
             case["dim"], case["num_experts"], case["top_k"], normalize_topk=True,
             gmm_fn=real_gmm, forward_trans_b=forward_trans_b,
-            profile_stages=profile_stages,
+            profile_stages=profile_stages, hidden_dim=case["hidden_dim"],
         ).to(device=device, dtype=torch.float32)
         model.load_from_moe(canonical)
     _assert_identical_benchmark_parameters(canonical, model, config_name)
@@ -717,7 +721,7 @@ def run_benchmarks(args, dtype):
     for case in selected.values():
         n_tokens = case["batch"] * case["seq_len"]
         print("=" * 100, flush=True)
-        print(f"case={case['name']} N={n_tokens} D={case['dim']} hidden={4 * case['dim']} "
+        print(f"case={case['name']} N={n_tokens} D={case['dim']} hidden={case['hidden_dim']} "
               f"E={case['num_experts']} k={case['top_k']} "
               f"activation_dtype={dtype} parameter_dtype={torch.float32}", flush=True)
         canonical, x_cpu = _make_benchmark_inputs(case, dtype)
@@ -931,7 +935,7 @@ def run_indexing_benchmarks(args, dtype):
               f"k={case['top_k']} counts={metadata['counts_cpu'].tolist()}", flush=True)
         benchmark_pack_candidates(case, metadata, dtype, args.warmup, args.iterations)
         benchmark_bias_add_candidates(
-            case, metadata, 4 * case["dim"], dtype, args.warmup, args.iterations)
+            case, metadata, case["hidden_dim"], dtype, args.warmup, args.iterations)
         benchmark_bias_add_candidates(
             case, metadata, case["dim"], dtype, args.warmup, args.iterations)
         benchmark_unpermute_candidates(case, metadata, dtype, args.warmup, args.iterations)
@@ -1294,8 +1298,8 @@ def profile_raw_gmm_phases(case, batch_sizes, forward_trans_b, dtype, trace_dir)
           "or weight-gradient phase; profiler timings are not benchmark timings.", flush=True)
     summaries = []
     for gemm_name, in_dim, out_dim in (
-        ("fc1", case["dim"], 4 * case["dim"]),
-        ("fc2", 4 * case["dim"], case["dim"]),
+        ("fc1", case["dim"], case["hidden_dim"]),
+        ("fc2", case["hidden_dim"], case["dim"]),
     ):
         for phase in ("forward", "input_grad", "weight_grad"):
             summaries.append(_profile_raw_gmm_phase(
@@ -1412,7 +1416,7 @@ def main():
                 excluded_experts=case.get("excluded_experts", ()),
                 backend_name=args.backend, device=args.device, dtype=dtype,
                 atol=args.atol, rtol=args.rtol, seed=case.get("seed", 0),
-                forward_trans_b=forward_trans_b,
+                forward_trans_b=forward_trans_b, hidden_dim=case.get("hidden_dim"),
             )
             all_ok = all_ok and ok
 
