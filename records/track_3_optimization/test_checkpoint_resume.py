@@ -141,20 +141,40 @@ def test_repro_diagnostic_records_exact_state_without_advancing_rng(tmp_path):
 
     model = torch.nn.Linear(3, 2)
     optimizer = torch.optim.AdamW(model.parameters())
+    optimizer.state[model.weight]["probe"] = torch.arange(6).reshape(2, 3)
     random.seed(44)
     np.random.seed(44)
     torch.manual_seed(44)
     rng_before = capture_rng_state()
+    inputs = torch.arange(6).reshape(2, 3)
     payload = make_repro_diagnostic(
-        "initialized", model, [optimizer], Loader(), 0, {"seed": 44})
+        "initialized", model, [optimizer], Loader(), 0, {"seed": 44},
+        inputs=inputs)
+    expected_model = {
+        name: value.detach().clone() for name, value in model.state_dict().items()
+    }
+    expected_inputs = inputs.clone()
+    expected_optimizer_probe = optimizer.state[model.weight]["probe"].clone()
+    with torch.no_grad():
+        model.weight.add_(1)
+    inputs.zero_()
+    optimizer.state[model.weight]["probe"].zero_()
     path = save_repro_diagnostic(payload, tmp_path, "initialized.pt")
     rng_after = capture_rng_state()
     loaded = torch.load(path, map_location="cpu", weights_only=False)
 
     assert loaded["stage"] == "initialized"
     assert loaded["data_loader"] == {"cursor": 7}
-    for name, value in model.state_dict().items():
+    for name, value in expected_model.items():
         torch.testing.assert_close(loaded["model"][name], value, rtol=0, atol=0)
+    torch.testing.assert_close(loaded["inputs"], expected_inputs, rtol=0, atol=0)
+    optimizer_state = loaded["optimizers"][0]["state"]["state"]
+    torch.testing.assert_close(
+        next(iter(optimizer_state.values()))["probe"],
+        expected_optimizer_probe,
+        rtol=0,
+        atol=0,
+    )
     assert rng_before["python"] == rng_after["python"]
     np.testing.assert_array_equal(rng_before["numpy"][1], rng_after["numpy"][1])
     torch.testing.assert_close(

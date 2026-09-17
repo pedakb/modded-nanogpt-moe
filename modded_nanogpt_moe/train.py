@@ -493,28 +493,38 @@ def main(argv=None):
                         inputs=inputs,
                         targets=targets,
                     )
+                if repro_diagnostics_dir and step == 1:
+                    save_repro(
+                        "before_update_2_forward",
+                        1,
+                        "before_update_2_forward.pt",
+                        inputs=inputs,
+                        targets=targets,
+                    )
                 # accumulate across microbatches in case we are running with fewer than 8 gpus
                 assert len(inputs) % mbs == 0
-                first_update_losses = [] if repro_diagnostics_dir and step == 0 else None
+                diagnostic_update = (
+                    step + 1 if repro_diagnostics_dir and step in (0, 1) else None)
+                diagnostic_losses = [] if diagnostic_update is not None else None
                 for i in range(len(inputs) // mbs):
                     with nsys_range(nsys_capture_active, f"forward.microbatch_{i}"):
                         loss = run_forward(
                             inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
-                        if first_update_losses is not None:
-                            first_update_losses.append(loss.detach())
+                        if diagnostic_losses is not None:
+                            diagnostic_losses.append(loss.detach())
                     with nsys_range(nsys_capture_active, f"backward.microbatch_{i}"):
                         loss.backward()
                     del loss
                 for name, p in model.named_parameters():
                     assert p.grad is not None, name
                     dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                first_update_gradients = None
-                if first_update_losses is not None:
-                    first_update_gradients = {
+                diagnostic_gradients = None
+                if diagnostic_losses is not None:
+                    diagnostic_gradients = {
                         name: parameter.grad.detach().cpu().clone()
                         for name, parameter in model.named_parameters()
                     }
-                    first_update_losses = torch.stack(first_update_losses).cpu()
+                    diagnostic_losses = torch.stack(diagnostic_losses).cpu()
                 # set optimization hyperparameters and take a step
                 set_hparams(step)
                 if writer is not None:
@@ -529,13 +539,23 @@ def main(argv=None):
                             f"optimizer_update.index_{opt_idx}.{optimizer_name}"):
                         opt.step()
                 model.zero_grad(set_to_none=True)
-                if first_update_gradients is not None:
+                if diagnostic_gradients is not None:
+                    stage = (
+                        "after_first_update"
+                        if diagnostic_update == 1
+                        else "after_update_2"
+                    )
+                    filename = (
+                        "after_first_update.pt"
+                        if diagnostic_update == 1
+                        else "after_update_2.pt"
+                    )
                     save_repro(
-                        "after_first_update",
-                        1,
-                        "after_first_update.pt",
-                        losses=first_update_losses,
-                        gradients=first_update_gradients,
+                        stage,
+                        diagnostic_update,
+                        filename,
+                        losses=diagnostic_losses,
+                        gradients=diagnostic_gradients,
                     )
     
             if (nsys_capture_active

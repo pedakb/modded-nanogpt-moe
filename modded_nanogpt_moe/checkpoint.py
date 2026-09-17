@@ -145,7 +145,22 @@ def make_repro_diagnostic(stage, model, optimizers, train_loader,
             for optimizer in optimizers
         ]
     payload.update(extra)
-    return payload
+    return _clone_repro_value(payload)
+
+
+def _clone_repro_value(value):
+    """Make a detached CPU snapshot that later training cannot mutate."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, dict):
+        return {key: _clone_repro_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_repro_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_repro_value(item) for item in value)
+    return value
 
 
 def save_repro_diagnostic(payload, diagnostics_dir: str | Path, filename: str):
