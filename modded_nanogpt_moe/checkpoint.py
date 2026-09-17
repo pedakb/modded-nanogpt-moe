@@ -126,6 +126,49 @@ def make_training_checkpoint(model, optimizers, completed_updates, batch_size,
         "environment": environment_metadata,
     }
 
+
+def make_repro_diagnostic(stage, model, optimizers, train_loader,
+                          completed_updates, runtime, include_training_state=True,
+                          **extra):
+    """Capture exact trainer state only for opt-in reproducibility diagnosis."""
+    payload = {
+        "stage": stage,
+        "completed_updates": completed_updates,
+        "data_loader": train_loader.state_dict(),
+        "rng": capture_rng_state(),
+        "runtime": runtime,
+    }
+    if include_training_state:
+        payload["model"] = unwrap_model(model).state_dict()
+        payload["optimizers"] = [
+            {"name": type(optimizer).__name__, "state": optimizer.state_dict()}
+            for optimizer in optimizers
+        ]
+    payload.update(extra)
+    return payload
+
+
+def save_repro_diagnostic(payload, diagnostics_dir: str | Path, filename: str):
+    """Atomically write a named diagnostic without rotating training checkpoints."""
+    diagnostics_dir = Path(diagnostics_dir)
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    destination = diagnostics_dir / filename
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w+b", prefix=f".{filename}-", suffix=".tmp",
+                dir=diagnostics_dir, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            torch.save(payload, temporary)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, destination)
+        return destination
+    except BaseException:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+        raise
+
 def restore_training_checkpoint(checkpoint, resolved_config, model, optimizers,
                                 train_loader, train_steps, batch_size,
                                 stop_after_updates=None):

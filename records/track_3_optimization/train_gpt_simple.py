@@ -18,9 +18,11 @@ from modded_nanogpt_moe.checkpoint import (  # noqa: E402,F401
     atomic_save_checkpoint,
     capture_rng_state,
     collect_environment_metadata,
+    make_repro_diagnostic,
     make_training_checkpoint,
     restore_rng_state,
     restore_training_checkpoint,
+    save_repro_diagnostic,
     unwrap_model,
     validate_checkpoint_config,
 )

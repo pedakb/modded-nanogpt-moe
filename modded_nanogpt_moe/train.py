@@ -16,9 +16,11 @@ from .checkpoint import (
     CHECKPOINT_FORMAT_VERSION,
     atomic_save_checkpoint,
     collect_environment_metadata,
+    make_repro_diagnostic,
     make_training_checkpoint,
     restore_rng_state,
     restore_training_checkpoint,
+    save_repro_diagnostic,
 )
 from .data import distributed_data_generator
 from .model import GPT, eager_prefix, make_head_loss
@@ -61,6 +63,12 @@ def main(argv=None):
     assert 8 % dist.get_world_size() == 0
     
     num_trials = int(argv[-1]) if len(argv) > 1 else 1
+    repro_diagnostics_dir = os.environ.get("REPRO_DIAGNOSTICS_DIR", "")
+    if repro_diagnostics_dir:
+        if dist.get_world_size() != 1:
+            raise ValueError("REPRO_DIAGNOSTICS_DIR currently requires exactly one GPU")
+        if num_trials != 1:
+            raise ValueError("REPRO_DIAGNOSTICS_DIR currently requires exactly one trial")
     checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "")
     checkpoint_interval = int(os.environ.get("CHECKPOINT_INTERVAL", 0))
     resume_checkpoint_path = os.environ.get("RESUME_CHECKPOINT", "")
@@ -127,6 +135,11 @@ def main(argv=None):
             f"checkpointing: directory={checkpoint_dir} interval={checkpoint_interval} "
             f"resume={resume_checkpoint_path or 'none'} "
             f"stop_after={stop_after_updates if stop_after_updates is not None else 'none'}",
+            console=True,
+        )
+    if repro_diagnostics_dir:
+        print0(
+            f"reproducibility diagnostics: directory={repro_diagnostics_dir}",
             console=True,
         )
     
@@ -326,6 +339,35 @@ def main(argv=None):
     
         train_loader = distributed_data_generator(
             "data/fineweb10B/fineweb_train_*.bin", batch_size, data_root=data_root)
+
+        repro_runtime = {
+            "seed_override": seed,
+            "stop_after_completed_updates": stop_after_updates,
+            "train_steps": train_steps,
+            "mlp_type": mlp_type,
+            "moe_backend": moe_backend,
+            "torch_initial_seed": torch.initial_seed(),
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        }
+
+        def save_repro(stage, completed, filename, **extra):
+            if not repro_diagnostics_dir:
+                return
+            payload = make_repro_diagnostic(
+                stage,
+                model,
+                optimizers,
+                train_loader,
+                completed,
+                repro_runtime,
+                **extra,
+            )
+            path = save_repro_diagnostic(payload, repro_diagnostics_dir, filename)
+            print0(f"Saved reproducibility diagnostic: {path}", console=True)
     
         completed_updates = 0
         training_time = 0.0
@@ -383,6 +425,13 @@ def main(argv=None):
             # Model/optimizer construction and writer setup may consume randomness.
             # Restore last so the next training update sees the saved RNG streams.
             restore_rng_state(resume_checkpoint["rng"])
+            save_repro(
+                "after_restore",
+                completed_updates,
+                f"after_restore_update_{completed_updates}.pt",
+            )
+        else:
+            save_repro("initialized", 0, "initialized.pt")
         # start the clock
         dist.barrier()
         t0 = time.perf_counter() - current_segment_time
@@ -435,18 +484,37 @@ def main(argv=None):
             with nsys_range(nsys_capture_active, f"optimizer_step.update_{step + 1}"):
                 with nsys_range(nsys_capture_active, "data_preparation"):
                     inputs, targets = next(train_loader)
+                if repro_diagnostics_dir and step == 0:
+                    save_repro(
+                        "first_training_batch",
+                        0,
+                        "first_training_batch.pt",
+                        include_training_state=False,
+                        inputs=inputs,
+                        targets=targets,
+                    )
                 # accumulate across microbatches in case we are running with fewer than 8 gpus
                 assert len(inputs) % mbs == 0
+                first_update_losses = [] if repro_diagnostics_dir and step == 0 else None
                 for i in range(len(inputs) // mbs):
                     with nsys_range(nsys_capture_active, f"forward.microbatch_{i}"):
                         loss = run_forward(
                             inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+                        if first_update_losses is not None:
+                            first_update_losses.append(loss.detach())
                     with nsys_range(nsys_capture_active, f"backward.microbatch_{i}"):
                         loss.backward()
                     del loss
                 for name, p in model.named_parameters():
                     assert p.grad is not None, name
                     dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                first_update_gradients = None
+                if first_update_losses is not None:
+                    first_update_gradients = {
+                        name: parameter.grad.detach().cpu().clone()
+                        for name, parameter in model.named_parameters()
+                    }
+                    first_update_losses = torch.stack(first_update_losses).cpu()
                 # set optimization hyperparameters and take a step
                 set_hparams(step)
                 if writer is not None:
@@ -461,6 +529,14 @@ def main(argv=None):
                             f"optimizer_update.index_{opt_idx}.{optimizer_name}"):
                         opt.step()
                 model.zero_grad(set_to_none=True)
+                if first_update_gradients is not None:
+                    save_repro(
+                        "after_first_update",
+                        1,
+                        "after_first_update.pt",
+                        losses=first_update_losses,
+                        gradients=first_update_gradients,
+                    )
     
             if (nsys_capture_active
                     and step + 1 == nsys_warmup_steps + nsys_active_steps):
@@ -492,6 +568,11 @@ def main(argv=None):
                     if parameter.grad is not None:
                         raise RuntimeError(
                             f"refusing to checkpoint before gradients are cleared: {name}")
+                save_repro(
+                    "before_checkpoint_save",
+                    completed_updates,
+                    f"before_save_update_{completed_updates}.pt",
+                )
                 checkpoint_started = time.perf_counter()
                 checkpoint = make_training_checkpoint(
                     model=model,

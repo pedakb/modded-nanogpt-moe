@@ -4,13 +4,16 @@ import numpy as np
 import pytest
 import torch
 
+from compare_repro_diagnostics import _tensor_difference
 from train_gpt_simple import (
     CHECKPOINT_FORMAT_VERSION,
     DistributedDataLoader,
     Muon,
     atomic_save_checkpoint,
     capture_rng_state,
+    make_repro_diagnostic,
     restore_rng_state,
+    save_repro_diagnostic,
     validate_checkpoint_config,
 )
 
@@ -129,3 +132,38 @@ def test_muon_state_dict_includes_persistent_momentum():
         restored.state[restored_parameter]["momentum"], momentum, rtol=0, atol=0)
     assert restored.param_groups[0]["lr"] == 0.025
     assert restored.param_groups[0]["weight_decay"] == 0.05
+
+
+def test_repro_diagnostic_records_exact_state_without_advancing_rng(tmp_path):
+    class Loader:
+        def state_dict(self):
+            return {"cursor": 7}
+
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    random.seed(44)
+    np.random.seed(44)
+    torch.manual_seed(44)
+    rng_before = capture_rng_state()
+    payload = make_repro_diagnostic(
+        "initialized", model, [optimizer], Loader(), 0, {"seed": 44})
+    path = save_repro_diagnostic(payload, tmp_path, "initialized.pt")
+    rng_after = capture_rng_state()
+    loaded = torch.load(path, map_location="cpu", weights_only=False)
+
+    assert loaded["stage"] == "initialized"
+    assert loaded["data_loader"] == {"cursor": 7}
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(loaded["model"][name], value, rtol=0, atol=0)
+    assert rng_before["python"] == rng_after["python"]
+    np.testing.assert_array_equal(rng_before["numpy"][1], rng_after["numpy"][1])
+    torch.testing.assert_close(
+        rng_before["torch_cpu"], rng_after["torch_cpu"], rtol=0, atol=0)
+
+
+def test_repro_tensor_difference_reports_quantitative_error():
+    difference = _tensor_difference(
+        torch.tensor([3.0, 4.0]), torch.tensor([0.0, 0.0]))
+    assert not difference["exact"]
+    assert difference["relative_l2"] == 1.0
+    assert difference["max_abs"] == 4.0
