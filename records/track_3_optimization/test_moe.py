@@ -254,16 +254,16 @@ def test_grouped_gemm_backend_matches_loop_backend_output_and_gradients():
     dim, num_experts, top_k = 16, 8, 2
     torch.manual_seed(6)
     moe_loop = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=True,
-                   moe_backend="loop").cuda()
+                   moe_backend="loop").to(device="cuda", dtype=torch.bfloat16)
+    moe_gg = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=True,
+                 moe_backend="grouped_gemm").to(device="cuda", dtype=torch.bfloat16)
     for p in moe_loop.parameters():
-        p.data = torch.empty_like(p.data, dtype=torch.bfloat16).normal_(std=0.05)
+        p.data.normal_(std=0.05)
     # Force one expert to receive zero tokens, to exercise the documented
     # None-vs-present-and-zero gradient difference between backends.
     with torch.no_grad():
         moe_loop.router.bias[3] = -1.0e4
 
-    moe_gg = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=True,
-                 moe_backend="grouped_gemm").cuda()
     moe_gg.load_state_dict(moe_loop.state_dict())
 
     # Checkpoint keys / optimizer-parameter coverage: identical by construction
@@ -273,6 +273,13 @@ def test_grouped_gemm_backend_matches_loop_backend_output_and_gradients():
     assert set(id(p) for p in moe_loop.parameters()) != set(id(p) for p in moe_gg.parameters()), (
         "sanity check: these must be two distinct parameter sets (loaded via "
         "load_state_dict, not the same objects), or this test would be vacuous")
+    loop_named_params = list(moe_loop.named_parameters())
+    gg_named_params = list(moe_gg.named_parameters())
+    assert [name for name, _ in loop_named_params] == [name for name, _ in gg_named_params]
+    for (name, p_loop), (_, p_gg) in zip(loop_named_params, gg_named_params, strict=True):
+        assert p_loop.shape == p_gg.shape, name
+        assert p_loop.dtype == p_gg.dtype == torch.bfloat16, name
+        assert torch.equal(p_loop, p_gg), name
 
     torch.manual_seed(7)
     x = torch.randn(2, 20, dim, dtype=torch.bfloat16, device="cuda")
@@ -286,19 +293,28 @@ def test_grouped_gemm_backend_matches_loop_backend_output_and_gradients():
 
     torch.testing.assert_close(out_loop, out_gg, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(x_loop.grad, x_gg.grad, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(moe_loop.router.weight.grad, moe_gg.router.weight.grad,
+                               atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(moe_loop.router.bias.grad, moe_gg.router.bias.grad,
+                               atol=2e-2, rtol=2e-2)
 
     for i in range(num_experts):
         e_loop, e_gg = moe_loop.experts[i], moe_gg.experts[i]
+        loop_expert_params = dict(e_loop.named_parameters())
+        gg_expert_params = dict(e_gg.named_parameters())
+        assert loop_expert_params.keys() == gg_expert_params.keys()
         if i == 3:
             # Documented difference (see MoE._forward_grouped_gemm docstring):
             # "loop" leaves an unused expert's grad as None; "grouped_gemm"
             # produces a present, exactly-zero grad. Both are checked
             # explicitly, not assumed.
-            assert e_loop.fc.weight.grad is None
-            assert e_gg.fc.weight.grad is not None
-            assert torch.count_nonzero(e_gg.fc.weight.grad) == 0
+            for name in loop_expert_params:
+                assert loop_expert_params[name].grad is None, name
+                gg_grad = gg_expert_params[name].grad
+                assert gg_grad is not None, name
+                assert gg_grad.dtype == gg_expert_params[name].dtype, name
+                assert torch.count_nonzero(gg_grad) == 0, name
             continue
-        torch.testing.assert_close(e_loop.fc.weight.grad, e_gg.fc.weight.grad, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(e_loop.fc.bias.grad, e_gg.fc.bias.grad, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(e_loop.proj.weight.grad, e_gg.proj.weight.grad, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(e_loop.proj.bias.grad, e_gg.proj.bias.grad, atol=2e-2, rtol=2e-2)
+        for name in loop_expert_params:
+            torch.testing.assert_close(loop_expert_params[name].grad, gg_expert_params[name].grad,
+                                       atol=2e-2, rtol=2e-2)
