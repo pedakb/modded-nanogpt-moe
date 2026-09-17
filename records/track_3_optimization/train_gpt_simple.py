@@ -123,6 +123,26 @@ class MLP(nn.Module):
         x = self.proj(x)
         return x
 
+
+def add_bias_by_expert_segments(x: Tensor, bias: Tensor, batch_sizes: Tensor):
+    """Add one expert bias to each contiguous packed-token segment.
+
+    `batch_sizes` is the CPU int64 metadata already required by grouped_gemm.
+    Splitting by those counts and broadcasting each row avoids the repeated
+    advanced-index backward in `bias[sorted_experts]`. Empty experts still
+    participate through a zero-length chunk, so their bias gradient is a
+    present, exactly-zero tensor rather than None. This is deliberately
+    generic for every expert count; there is no E=1 special case.
+    """
+    assert batch_sizes.device.type == "cpu" and batch_sizes.dtype == torch.int64
+    counts = batch_sizes.tolist()
+    assert len(counts) == bias.shape[0] and sum(counts) == x.shape[0]
+    return torch.cat([
+        x_segment + bias_row
+        for x_segment, bias_row in zip(x.split(counts, dim=0), bias.unbind(0), strict=True)
+    ], dim=0)
+
+
 class MoE(nn.Module):
     """Top-k routed sparse MoE. Each expert is an MLP identical in architecture,
     init, and dtype behavior to the dense MLP above. num_experts=1, top_k=1 reduces
@@ -257,9 +277,11 @@ class MoE(nn.Module):
         proj_w = torch.stack([e.proj.weight for e in self.experts]).transpose(-2, -1).contiguous().type_as(x_sorted)
         proj_b = torch.stack([e.proj.bias for e in self.experts]).type_as(x_sorted)
 
-        h = self._gmm(x_sorted, fc_w, batch_sizes, trans_b=False) + fc_b[sorted_experts]
+        h = add_bias_by_expert_segments(
+            self._gmm(x_sorted, fc_w, batch_sizes, trans_b=False), fc_b, batch_sizes)
         h = h.relu().square()
-        out_sorted = self._gmm(h.type_as(x_sorted), proj_w, batch_sizes, trans_b=False) + proj_b[sorted_experts]
+        out_sorted = add_bias_by_expert_segments(
+            self._gmm(h.type_as(x_sorted), proj_w, batch_sizes, trans_b=False), proj_b, batch_sizes)
 
         # ---- unpermute + weighted combine ----
         # NOTE on optimizer semantics, not just numerics: when an expert

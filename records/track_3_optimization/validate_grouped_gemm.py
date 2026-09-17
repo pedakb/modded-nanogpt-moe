@@ -22,11 +22,12 @@ trans_b)` callable is injected. Two are provided:
     kernels' correctness. This is what --backend reference exercises.
   - real_gmm: a thin wrapper around the real `grouped_gemm.ops.gmm`
     (fanshiqing/grouped_gemm). Requires CUDA and the package installed --
-    see INSTALL. BF16 correctness passed on an LS6 A100 for all eight
-    correctness cases (both layouts, including empty experts), with a
-    profiler-observed CUTLASS GemmGrouped execution. Performance is not
-    implied by that correctness result; --mode benchmark and --mode profile
-    below are the opt-in performance diagnostics.
+    see INSTALL. The prior indexed-bias implementation passed BF16
+    correctness on an LS6 A100 for all eight correctness cases (both
+    layouts, including empty experts), with a profiler-observed CUTLASS
+    GemmGrouped execution. Changes after that result require rerunning
+    --mode validate. Performance is not implied by correctness;
+    --mode benchmark, --mode indexing, and --mode profile are opt-in.
 
 No GPU-capability assumption (SM80 or otherwise) is hardcoded anywhere in
 GroupedGemmMoE or in the pack/combine logic: `torch.cuda.get_device_capability()`
@@ -392,13 +393,20 @@ class GroupedGemmMoE(nn.Module):
             proj_w = self._stacked_weight(self.proj_weight).type_as(x_sorted)
             proj_b = torch.stack(list(self.proj_bias)).type_as(x_sorted)    # [E, D]
 
-        with self._scope("moe.fc1_grouped_gemm_and_bias"):
-            h = self.gmm_fn(x_sorted, fc_w, batch_sizes, trans_b=self.forward_trans_b) + fc_b[sorted_experts]
+        with self._scope("moe.fc1_grouped_gemm"):
+            h = self.gmm_fn(x_sorted, fc_w, batch_sizes, trans_b=self.forward_trans_b)
+        with self._scope("moe.fc1_segmented_bias"):
+            h = tgs.add_bias_by_expert_segments(
+                h, fc_b, batch_sizes)
         with self._scope("moe.activation"):
             h = h.relu().square()
-        with self._scope("moe.fc2_grouped_gemm_and_bias"):
-            out_sorted = (self.gmm_fn(h.type_as(x_sorted), proj_w, batch_sizes,
-                                      trans_b=self.forward_trans_b) + proj_b[sorted_experts])
+        with self._scope("moe.fc2_grouped_gemm"):
+            out_sorted = self.gmm_fn(
+                h.type_as(x_sorted), proj_w, batch_sizes,
+                trans_b=self.forward_trans_b)
+        with self._scope("moe.fc2_segmented_bias"):
+            out_sorted = tgs.add_bias_by_expert_segments(
+                out_sorted, proj_b, batch_sizes)
 
         # ---- unpermute + weighted combine (backend-independent) ----
         with self._scope("moe.combine"):
@@ -729,6 +737,205 @@ def run_benchmarks(args, dtype):
                   f"({result['forward_backward_median_ms'] / loop_result['forward_backward_median_ms']:.3f}x)",
                   flush=True)
         del results, expected_routing, x_cpu, canonical
+        _release_cuda_tensors()
+
+
+def _measure_autograd_implementation(make_output, clear_gradients, grad_out, warmup, iterations):
+    """Measure forward, isolated backward, and combined forward+backward."""
+    output = None
+
+    def clear_forward():
+        nonlocal output
+        output = None
+        clear_gradients()
+
+    def forward():
+        nonlocal output
+        output = make_output()
+
+    forward_ms, _ = _cuda_measure(forward, clear_forward, warmup, iterations)
+    output = None
+    _release_cuda_tensors()
+
+    def prepare_backward():
+        nonlocal output
+        output = None
+        clear_gradients()
+        output = make_output()
+
+    def backward():
+        output.backward(grad_out)
+
+    backward_ms, _ = _cuda_measure(backward, prepare_backward, warmup, iterations)
+    output = None
+    _release_cuda_tensors()
+
+    def forward_backward():
+        nonlocal output
+        output = make_output()
+        output.backward(grad_out)
+
+    fwd_bwd_ms, peak_gib = _cuda_measure(
+        forward_backward, clear_forward, warmup, iterations)
+    output = None
+    _release_cuda_tensors()
+    return dict(
+        forward_ms=statistics.median(forward_ms),
+        backward_ms=statistics.median(backward_ms),
+        forward_backward_ms=statistics.median(fwd_bwd_ms),
+        peak_gib=peak_gib,
+    )
+
+
+def _print_indexing_comparison(label, results):
+    baseline = results[next(iter(results))]
+    print(f"[{label}] medians and ratios vs {next(iter(results))}:", flush=True)
+    for name, result in results.items():
+        print(f"  {name}: forward={result['forward_ms']:.3f} ms "
+              f"({result['forward_ms'] / baseline['forward_ms']:.3f}x), "
+              f"backward={result['backward_ms']:.3f} ms "
+              f"({result['backward_ms'] / baseline['backward_ms']:.3f}x), "
+              f"forward+backward={result['forward_backward_ms']:.3f} ms "
+              f"({result['forward_backward_ms'] / baseline['forward_backward_ms']:.3f}x), "
+              f"peak={result['peak_gib']:.3f} GiB", flush=True)
+
+
+def _make_indexing_metadata(case):
+    n_tokens = case["batch"] * case["seq_len"]
+    assignments = n_tokens * case["top_k"]
+    if case["num_experts"] == 1:
+        counts_list = [assignments]
+    else:
+        # Deliberately uneven, sums to 8192 for the provided E=8/k=2 case.
+        counts_list = [2048, 1536, 1280, 1024, 768, 640, 512, 384]
+        assert len(counts_list) == case["num_experts"] and sum(counts_list) == assignments
+    counts_cpu = torch.tensor(counts_list, dtype=torch.int64)
+    sorted_experts_cpu = torch.repeat_interleave(
+        torch.arange(case["num_experts"], dtype=torch.int64), counts_cpu)
+    generator = torch.Generator(device="cpu").manual_seed(case["seed"] + 1000)
+    shuffled_experts = sorted_experts_cpu[torch.randperm(assignments, generator=generator)]
+    order_cpu = torch.argsort(shuffled_experts, stable=True)
+    flat_tokens_cpu = torch.arange(n_tokens).repeat_interleave(case["top_k"])
+    pack_index_cpu = flat_tokens_cpu[order_cpu]
+    inverse_order_cpu = torch.empty_like(order_cpu)
+    inverse_order_cpu[order_cpu] = torch.arange(assignments)
+    return dict(
+        counts_cpu=counts_cpu,
+        counts_cuda=counts_cpu.cuda(),
+        sorted_experts=sorted_experts_cpu.cuda(),
+        order=order_cpu.cuda(),
+        inverse_order=inverse_order_cpu.cuda(),
+        pack_index=pack_index_cpu.cuda(),
+        n_tokens=n_tokens,
+        assignments=assignments,
+    )
+
+
+def benchmark_bias_add_candidates(case, metadata, width, dtype, warmup, iterations):
+    label = f"{case['name']}:bias_width_{width}"
+    results = {}
+    for candidate_name in ("advanced_index", "index_select", "repeat_interleave", "segment_add_cat"):
+        torch.manual_seed(case["seed"] + width)
+        values = torch.randn(metadata["assignments"], width, device="cuda", dtype=dtype,
+                             requires_grad=True)
+        bias_params = [torch.randn(width, device="cuda", dtype=torch.float32, requires_grad=True)
+                       for _ in range(case["num_experts"])]
+        grad_out = torch.randn_like(values)
+
+        def make_output():
+            bias = torch.stack(bias_params).type_as(values)
+            if candidate_name == "advanced_index":
+                return values + bias[metadata["sorted_experts"]]
+            if candidate_name == "index_select":
+                return values + bias.index_select(0, metadata["sorted_experts"])
+            if candidate_name == "repeat_interleave":
+                expanded = torch.repeat_interleave(
+                    bias, metadata["counts_cuda"], dim=0,
+                    output_size=metadata["assignments"])
+                return values + expanded
+            return tgs.add_bias_by_expert_segments(values, bias, metadata["counts_cpu"])
+
+        def clear_gradients():
+            values.grad = None
+            for bias_param in bias_params:
+                bias_param.grad = None
+
+        results[candidate_name] = _measure_autograd_implementation(
+            make_output, clear_gradients, grad_out, warmup, iterations)
+        del grad_out, bias_params, values
+        _release_cuda_tensors()
+    _print_indexing_comparison(label, results)
+
+
+def benchmark_pack_candidates(case, metadata, dtype, warmup, iterations):
+    results = {}
+    for candidate_name in ("advanced_index", "index_select"):
+        torch.manual_seed(case["seed"] + 2000)
+        source = torch.randn(metadata["n_tokens"], case["dim"], device="cuda", dtype=dtype,
+                             requires_grad=True)
+        grad_out = torch.randn(metadata["assignments"], case["dim"], device="cuda", dtype=dtype)
+
+        def make_output():
+            if candidate_name == "advanced_index":
+                return source[metadata["pack_index"]]
+            return source.index_select(0, metadata["pack_index"])
+
+        def clear_gradients():
+            source.grad = None
+
+        results[candidate_name] = _measure_autograd_implementation(
+            make_output, clear_gradients, grad_out, warmup, iterations)
+        del grad_out, source
+        _release_cuda_tensors()
+    _print_indexing_comparison(f"{case['name']}:activation_pack", results)
+
+
+def benchmark_unpermute_candidates(case, metadata, dtype, warmup, iterations):
+    results = {}
+    for candidate_name in ("index_put", "inverse_index_select"):
+        torch.manual_seed(case["seed"] + 3000)
+        source = torch.randn(metadata["assignments"], case["dim"], device="cuda", dtype=dtype,
+                             requires_grad=True)
+        grad_out = torch.randn_like(source)
+
+        def make_output():
+            if candidate_name == "index_put":
+                output = torch.empty_like(source)
+                output[metadata["order"]] = source
+                return output
+            return source.index_select(0, metadata["inverse_order"])
+
+        def clear_gradients():
+            source.grad = None
+
+        results[candidate_name] = _measure_autograd_implementation(
+            make_output, clear_gradients, grad_out, warmup, iterations)
+        del grad_out, source
+        _release_cuda_tensors()
+    _print_indexing_comparison(f"{case['name']}:unpermute", results)
+
+
+def run_indexing_benchmarks(args, dtype):
+    if args.device != "cuda":
+        raise SystemExit("--mode indexing requires --device cuda")
+    selected = BENCHMARK_CASES if args.benchmark_case == "all" \
+        else {args.benchmark_case: BENCHMARK_CASES[args.benchmark_case]}
+    print("INDEXING MODE: isolated eager PyTorch operators; no grouped GEMM calls and no profiler.",
+          flush=True)
+    print("Each implementation is measured sequentially with device-wide synchronization.", flush=True)
+    for case in selected.values():
+        metadata = _make_indexing_metadata(case)
+        print("=" * 100, flush=True)
+        print(f"case={case['name']} N={metadata['n_tokens']} D={case['dim']} "
+              f"assignments={metadata['assignments']} E={case['num_experts']} "
+              f"k={case['top_k']} counts={metadata['counts_cpu'].tolist()}", flush=True)
+        benchmark_pack_candidates(case, metadata, dtype, args.warmup, args.iterations)
+        benchmark_bias_add_candidates(
+            case, metadata, 4 * case["dim"], dtype, args.warmup, args.iterations)
+        benchmark_bias_add_candidates(
+            case, metadata, case["dim"], dtype, args.warmup, args.iterations)
+        benchmark_unpermute_candidates(case, metadata, dtype, args.warmup, args.iterations)
+        del metadata
         _release_cuda_tensors()
 
 
@@ -1148,8 +1355,9 @@ def run_profiles(args, dtype):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["validate", "benchmark", "profile"], default="validate",
-                    help="benchmark and profile are opt-in; validate preserves the original harness")
+    ap.add_argument("--mode", choices=["validate", "benchmark", "indexing", "profile"],
+                    default="validate",
+                    help="performance modes are opt-in; validate preserves the original harness")
     ap.add_argument("--backend", choices=list(BACKENDS), default="reference")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
@@ -1180,6 +1388,9 @@ def main():
         report_extension_binary_and_build_flags(args.build_log)
     if args.mode == "benchmark":
         run_benchmarks(args, dtype)
+        return
+    if args.mode == "indexing":
+        run_indexing_benchmarks(args, dtype)
         return
     if args.mode == "profile":
         run_profiles(args, dtype)

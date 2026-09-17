@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from train_gpt_simple import MLP, MoE, GPT, eager_prefix, make_head_loss
+from train_gpt_simple import MLP, MoE, GPT, add_bias_by_expert_segments, eager_prefix, make_head_loss
 
 GROUPED_GEMM_AVAILABLE = importlib.util.find_spec("grouped_gemm") is not None
 
@@ -67,6 +67,31 @@ def test_parameter_gradient_equivalence():
     torch.testing.assert_close(expert0.fc.bias.grad, dense.fc.bias.grad)
     torch.testing.assert_close(expert0.proj.weight.grad, dense.proj.weight.grad)
     torch.testing.assert_close(expert0.proj.bias.grad, dense.proj.bias.grad)
+
+
+def test_segmented_expert_bias_matches_indexing_output_and_gradients_with_empty_expert():
+    counts = torch.tensor([3, 0, 2, 1], dtype=torch.int64)
+    expert_ids = torch.repeat_interleave(torch.arange(4), counts)
+    x_base = torch.arange(30, dtype=torch.bfloat16).view(6, 5) / 8
+    bias_base = torch.arange(20, dtype=torch.float32).view(4, 5) / 16
+    grad_out = (torch.arange(30, dtype=torch.bfloat16).view(6, 5) + 1) / 32
+
+    x_index = x_base.clone().requires_grad_(True)
+    bias_index = bias_base.clone().requires_grad_(True)
+    out_index = x_index + bias_index.to(torch.bfloat16)[expert_ids]
+    out_index.backward(grad_out)
+
+    x_segment = x_base.clone().requires_grad_(True)
+    bias_segment = bias_base.clone().requires_grad_(True)
+    out_segment = add_bias_by_expert_segments(
+        x_segment, bias_segment.to(torch.bfloat16), counts)
+    out_segment.backward(grad_out)
+
+    torch.testing.assert_close(out_segment, out_index)
+    torch.testing.assert_close(x_segment.grad, x_index.grad)
+    torch.testing.assert_close(bias_segment.grad, bias_index.grad)
+    assert bias_segment.grad is not None
+    assert torch.count_nonzero(bias_segment.grad[1]) == 0
 
 
 def test_top_k_bounds_are_validated():
