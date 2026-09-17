@@ -1,5 +1,6 @@
 """Active dense/MoE training, validation, compilation, logging, and profiling."""
 
+import json
 import os
 import random
 import sys
@@ -22,14 +23,28 @@ from .checkpoint import (
     restore_training_checkpoint,
     save_repro_diagnostic,
 )
+from .config import parse_train_args
 from .data import distributed_data_generator
-from .model import GPT, eager_prefix, make_head_loss
+from .model import GPT, eager_prefix, make_head_loss, resolve_mlp_hidden_dim
 from .optim import build_optimizers
 
 
 def nsys_range(enabled: bool, name: str):
     """Return an NVTX range only while the opt-in Nsight capture is active."""
     return torch.cuda.nvtx.range(name) if enabled else nullcontext()
+
+
+def tensorboard_run_directory(root, system, run_name):
+    return Path(root) / "modded-nanogpt-moe" / system / str(run_name)
+
+
+def require_unused_tensorboard_run_directory(root, system, run_name):
+    run_directory = tensorboard_run_directory(root, system, run_name)
+    if run_directory.exists():
+        raise FileExistsError(
+            f"TensorBoard run directory already exists: {run_directory}. "
+            "Choose a new run_name or remove the existing directory explicitly.")
+    return run_directory
 
 
 def read_source_snapshot():
@@ -40,6 +55,7 @@ def read_source_snapshot():
         package_dir / "optim.py",
         package_dir / "data.py",
         package_dir / "checkpoint.py",
+        package_dir / "config.py",
         package_dir / "train.py",
         repository_root / "records/track_3_optimization/train_gpt_simple.py",
     ]
@@ -52,9 +68,10 @@ def read_source_snapshot():
 
 def main(argv=None):
     argv = sys.argv if argv is None else argv
+    experiment_config, config_path = parse_train_args(argv[1:])
     code = read_source_snapshot()
-    
-    # torchrun sets these env variables
+
+    # torchrun sets these environment variables.
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     dist.init_process_group(backend="nccl", device_id=device)
@@ -62,7 +79,7 @@ def main(argv=None):
     # this code can be run equivalently with 1, 2, 4, or 8 gpus.
     assert 8 % dist.get_world_size() == 0
     
-    num_trials = int(argv[-1]) if len(argv) > 1 else 1
+    num_trials = experiment_config["num_trials"]
     repro_diagnostics_dir = os.environ.get("REPRO_DIAGNOSTICS_DIR", "")
     if repro_diagnostics_dir:
         if dist.get_world_size() != 1:
@@ -101,19 +118,33 @@ def main(argv=None):
         if resume_checkpoint.get("run", {}).get("trial_idx") != 0:
             raise ValueError("resume currently supports only trial_idx=0")
     
-    seed_value = os.environ.get("SEED_OVERRIDE", "")
-    seed = int(seed_value) if seed_value else None
+    seed = experiment_config["seed"]
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
     
+    tb_root = os.environ.get("TB_ROOT", "")
+    tb_system = os.environ.get("TB_SYSTEM", "unknown")
+    tensorboard_log = bool(tb_root)
+
+    requested_run_name = experiment_config["run_name"]
+    run_id = (resume_checkpoint["run"]["run_id"]
+              if resume_checkpoint is not None
+              else requested_run_name or str(uuid.uuid4()))
+    if (resume_checkpoint is not None and requested_run_name is not None
+            and requested_run_name != run_id):
+        raise ValueError(
+            f"config run_name {requested_run_name!r} does not match checkpoint "
+            f"run identity {run_id!r}")
+    experiment_config["run_name"] = run_id
+    if tensorboard_log and resume_checkpoint is None:
+        require_unused_tensorboard_run_directory(tb_root, tb_system, run_id)
+
     # logging setup
     if dist.get_rank() == 0:
         os.makedirs("logs", exist_ok=True)
-        run_id = (resume_checkpoint["run"]["run_id"]
-                  if resume_checkpoint is not None else str(uuid.uuid4()))
         logfile = f"logs/{run_id}.txt"
         print(logfile)
     def print0(s, console=False, log=True):
@@ -143,35 +174,63 @@ def main(argv=None):
             console=True,
         )
     
-    val_tokens = 20 * 524288
-    batch_size = 8 * 64 * 1024
+    model_config = experiment_config["model"]
+    training_config = experiment_config["training"]
+    optimizer_config = experiment_config["optimizers"]
+    val_tokens = training_config["validation_tokens"]
+    batch_size = training_config["global_batch_tokens"]
+    sequence_length = training_config["sequence_length"]
+    training_shard_pattern = training_config["training_shard_pattern"]
+    validation_shard_pattern = training_config["validation_shard_pattern"]
     data_root = os.environ.get("DATA_ROOT", str(Path.cwd()))
     # (MBS_OVERRIDE: opt-in override for smoke tests; unset -> unchanged default of 64.
     # Global batch is preserved regardless of mbs: the gradient-accumulation loop
     # below runs len(inputs)//mbs microbatches per step, so a smaller mbs means
     # more microbatches accumulated into the same fixed batch_size, not a smaller
     # effective step.)
-    mbs = int(os.environ.get("MBS_OVERRIDE", 64))
-    val_loader = distributed_data_generator(
-        "data/fineweb10B/fineweb_val_*.bin", val_tokens, data_root=data_root)
-    val_inputs, val_targets = next(val_loader)
-    
+    mbs = training_config["microbatch_sequences"]
+
     # MLP architecture: "dense" is the original single MLP; "moe" is a SparseMoE
     # of num_experts experts, routing each token to its top_k experts.
     # (*_OVERRIDE: opt-in overrides for smoke tests; all unset -> unchanged defaults:
     # mlp_type="dense", mlp_ratio=4, num_experts=1, top_k=1, moe_backend="loop")
-    mlp_type = os.environ.get("MLP_TYPE_OVERRIDE", "dense")   # "dense" or "moe"
-    mlp_ratio = float(os.environ.get("MLP_RATIO_OVERRIDE", 4))
-    num_experts = int(os.environ.get("NUM_EXPERTS_OVERRIDE", 1))
-    top_k = int(os.environ.get("TOP_K_OVERRIDE", 1))
-    normalize_topk = True
-    moe_backend = os.environ.get("MOE_BACKEND_OVERRIDE", "loop")   # "loop" or "grouped_gemm"
-    
-    # TensorBoard logging is opt-in via a shared root; rank 0 only.
-    tb_root = os.environ.get("TB_ROOT", "")
-    tb_system = os.environ.get("TB_SYSTEM", "unknown")
-    tensorboard_log = bool(tb_root)
-    
+    mlp_type = model_config["mlp_type"]
+    mlp_ratio = model_config["mlp_ratio"]
+    num_experts = model_config["num_experts"]
+    top_k = model_config["top_k"]
+    normalize_topk = model_config["normalize_topk"]
+    moe_backend = model_config["moe_backend"]
+    model_dim = model_config["model_dim"]
+    hidden_dim = resolve_mlp_hidden_dim(model_dim, mlp_ratio)
+    if batch_size % dist.get_world_size():
+        raise ValueError(
+            "training.global_batch_tokens must be divisible by world size")
+    local_tokens = batch_size // dist.get_world_size()
+    if local_tokens % sequence_length:
+        raise ValueError(
+            "training.global_batch_tokens must be divisible by world size and "
+            "training.sequence_length")
+    local_sequences = local_tokens // sequence_length
+    if local_sequences % mbs:
+        raise ValueError(
+            "local sequences per update must be divisible by "
+            "training.microbatch_sequences")
+    accumulation_count = local_sequences // mbs
+    experiment_config["model"]["hidden_dim"] = hidden_dim
+    experiment_config["training"]["accumulation_count"] = accumulation_count
+    print0(
+        "Resolved experiment config"
+        + (f" ({config_path})" if config_path is not None else " (built-in defaults)")
+        + ":\n"
+        + json.dumps(experiment_config, indent=2, sort_keys=True),
+        console=True,
+    )
+
+    val_loader = distributed_data_generator(
+        validation_shard_pattern, val_tokens, seq_len=sequence_length,
+        data_root=data_root)
+    val_inputs, val_targets = next(val_loader)
+
     nsys_profile_value = os.environ.get("NSYS_PROFILE", "0")
     if nsys_profile_value not in ("0", "1"):
         raise ValueError(f"NSYS_PROFILE must be 0 or 1, got {nsys_profile_value!r}")
@@ -198,13 +257,11 @@ def main(argv=None):
     if nsys_profile and checkpointing_requested:
         raise ValueError(
             "combining NSYS_PROFILE with checkpoint/resume is not yet supported")
-    model_dim = 768
-    model = GPT(vocab_size=50304, num_layers=12, model_dim=model_dim, mlp_type=mlp_type,
+    model = GPT(vocab_size=model_config["vocab_size"],
+                num_layers=model_config["num_layers"], model_dim=model_dim, mlp_type=mlp_type,
                 num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
                 moe_backend=moe_backend, mlp_ratio=mlp_ratio)
-    local_sequences = batch_size // dist.get_world_size() // 1024
-    assert local_sequences % mbs == 0
-    accumulation_count = local_sequences // mbs
+    assert model.hidden_dim == hidden_dim
     print0(
         f"configuration: model_dim={model.model_dim} mlp_ratio={float(model.mlp_ratio):g} "
         f"hidden_dim={model.hidden_dim} model_type={mlp_type} moe_backend={moe_backend} "
@@ -247,8 +304,7 @@ def main(argv=None):
         ########################################
     
         # we want to minimize this while still reaching 3.28 val loss
-        # (TRAIN_STEPS_OVERRIDE: opt-in override for short smoke tests; unset -> unchanged default)
-        train_steps = int(os.environ.get("TRAIN_STEPS_OVERRIDE", 3250))
+        train_steps = training_config["total_steps"]
         if train_steps <= 0:
             raise ValueError("TRAIN_STEPS_OVERRIDE must be positive")
         if stop_after_updates is not None and stop_after_updates > train_steps:
@@ -278,10 +334,10 @@ def main(argv=None):
                 raise Exception(f"Uninitialized parameter: {name}")
     
         # create the optimizer(s)
-        optimizers = build_optimizers(model)
+        optimizers = build_optimizers(model, optimizer_config)
     
         # learning rate schedule: stable then decay
-        def set_hparams(step, cooldown_frac=0.7):
+        def set_hparams(step, cooldown_frac=training_config["cooldown_fraction"]):
             progress = step / train_steps
             assert 0 <= progress < 1
             if progress < 1 - cooldown_frac:
@@ -294,8 +350,8 @@ def main(argv=None):
     
         resolved_config = {
             "model": {
-                "vocab_size": 50304,
-                "num_layers": 12,
+                "vocab_size": model_config["vocab_size"],
+                "num_layers": model_config["num_layers"],
                 "model_dim": model.model_dim,
                 "mlp_type": mlp_type,
                 "mlp_ratio": float(model.mlp_ratio),
@@ -306,26 +362,17 @@ def main(argv=None):
                 "moe_backend": moe_backend,
             },
             "training": {
-                "sequence_length": 1024,
+                "sequence_length": sequence_length,
                 "global_batch_tokens": batch_size,
                 "microbatch_sequences": mbs,
                 "accumulation_count": accumulation_count,
                 "validation_tokens": val_tokens,
                 "total_steps": train_steps,
-                "cooldown_fraction": 0.7,
-                "training_shard_pattern": "data/fineweb10B/fineweb_train_*.bin",
-                "validation_shard_pattern": "data/fineweb10B/fineweb_val_*.bin",
+                "cooldown_fraction": training_config["cooldown_fraction"],
+                "training_shard_pattern": training_shard_pattern,
+                "validation_shard_pattern": validation_shard_pattern,
             },
-            "optimizers": {
-                "adamw": {
-                    "group_lrs": [0.7, 0.004, 0.015],
-                    "betas": [0.8, 0.95],
-                    "eps": 1e-10,
-                    "weight_decay": 0.001,
-                    "fused": True,
-                },
-                "muon": {"lr": 0.025, "weight_decay": 0.05, "mu": 0.95},
-            },
+            "optimizers": optimizer_config,
             "datasets": {
                 "validation_shards": val_loader.shard_identities,
             },
@@ -338,7 +385,8 @@ def main(argv=None):
         ########################################
     
         train_loader = distributed_data_generator(
-            "data/fineweb10B/fineweb_train_*.bin", batch_size, data_root=data_root)
+            training_shard_pattern, batch_size, seq_len=sequence_length,
+            data_root=data_root)
 
         repro_runtime = {
             "seed_override": seed,
@@ -399,10 +447,10 @@ def main(argv=None):
         writer = None
         if tensorboard_log and dist.get_rank() == 0:
             from torch.utils.tensorboard import SummaryWriter
-            tb_dir = os.path.join(
-                tb_root, "modded-nanogpt-moe", tb_system, str(run_id), f"trial_{trial_idx}")
+            tb_dir = tensorboard_run_directory(
+                tb_root, tb_system, run_id) / f"trial_{trial_idx}"
             print0(f"TensorBoard event directory: {tb_dir}", console=True)
-            writer_kwargs = {"log_dir": tb_dir}
+            writer_kwargs = {"log_dir": str(tb_dir)}
             if resume_checkpoint is not None:
                 # Hide any stale events at or after the restored update. This keeps a
                 # reused run directory coherent if work progressed past the checkpoint.

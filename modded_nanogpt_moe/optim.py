@@ -58,13 +58,27 @@ class Muon(torch.optim.Optimizer):
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
 
-def build_optimizers(model):
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
-                        dict(params=[model.proj.weight], lr=0.004),
-                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
+def build_optimizers(model, config=None):
+    config = config or {
+        "adamw": {
+            "group_lrs": [0.7, 0.004, 0.015],
+            "betas": [0.8, 0.95],
+            "eps": 1e-10,
+            "weight_decay": 0.001,
+            "fused": True,
+        },
+        "muon": {"lr": 0.025, "weight_decay": 0.05, "mu": 0.95},
+    }
+    adamw = config["adamw"]
+    muon = config["muon"]
+    embed_lr, head_lr, scalar_lr = adamw["group_lrs"]
+    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=embed_lr),
+                        dict(params=[model.proj.weight], lr=head_lr),
+                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=scalar_lr)],
+                       betas=tuple(adamw["betas"]), eps=adamw["eps"],
+                       weight_decay=adamw["weight_decay"], fused=adamw["fused"])
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.05)
+                      lr=muon["lr"], weight_decay=muon["weight_decay"], mu=muon["mu"])
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())

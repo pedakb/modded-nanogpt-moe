@@ -9,9 +9,15 @@ from torch.optim import AdamW
 
 import train_gpt_simple as compatibility_wrapper
 from modded_nanogpt_moe.checkpoint import restore_training_checkpoint
+from modded_nanogpt_moe.config import load_experiment_config, parse_train_args
 from modded_nanogpt_moe.model import GPT
 from modded_nanogpt_moe.optim import Muon, build_optimizers
-from modded_nanogpt_moe.train import main, read_source_snapshot
+from modded_nanogpt_moe.train import (
+    main,
+    read_source_snapshot,
+    require_unused_tensorboard_run_directory,
+    tensorboard_run_directory,
+)
 
 
 BASELINE_COMMIT = "372221a"
@@ -150,6 +156,23 @@ def test_optimizer_groups_and_order_match_committed_baseline(baseline_module):
         _assert_nested_equal(extracted_groups, baseline_groups)
 
 
+def test_configured_default_optimizers_match_legacy_construction():
+    kwargs = dict(vocab_size=37, num_layers=1, model_dim=128, mlp_ratio=4)
+    legacy_model = GPT(**kwargs)
+    configured_model = GPT(**kwargs)
+    legacy = build_optimizers(legacy_model)
+    configured = build_optimizers(
+        configured_model, load_experiment_config()["optimizers"])
+
+    assert _parameter_names_by_group(legacy_model, legacy) == (
+        _parameter_names_by_group(configured_model, configured))
+    for legacy_optimizer, configured_optimizer in zip(legacy, configured):
+        _assert_nested_equal(
+            configured_optimizer.state_dict()["param_groups"],
+            legacy_optimizer.state_dict()["param_groups"],
+        )
+
+
 class _SerializableLoader:
     def __init__(self, state):
         self.state = state
@@ -226,7 +249,78 @@ def test_wrapper_and_module_entry_points_share_main_and_log_package_sources():
         "modded_nanogpt_moe/optim.py",
         "modded_nanogpt_moe/data.py",
         "modded_nanogpt_moe/checkpoint.py",
+        "modded_nanogpt_moe/config.py",
         "modded_nanogpt_moe/train.py",
         "records/track_3_optimization/train_gpt_simple.py",
     ):
         assert f"# ===== {relative_path} =====" in snapshot
+
+
+def test_dense_example_config_resolves_current_training_defaults():
+    repository_root = Path(__file__).resolve().parents[2]
+    config = load_experiment_config(repository_root / "configs/dense_baseline.toml")
+
+    assert config["run_name"] == "dense-baseline"
+    assert config["num_trials"] == 1
+    assert config["seed"] == 1234
+    assert config["model"] == {
+        "vocab_size": 50304,
+        "num_layers": 12,
+        "model_dim": 768,
+        "mlp_type": "dense",
+        "mlp_ratio": 4,
+        "num_experts": 1,
+        "top_k": 1,
+        "normalize_topk": True,
+        "moe_backend": "loop",
+    }
+    assert config["training"]["global_batch_tokens"] == 524288
+    assert config["training"]["microbatch_sequences"] == 64
+    assert config["training"]["total_steps"] == 3250
+
+
+def test_config_requires_run_name_and_rejects_unknown_fields(tmp_path):
+    missing_name = tmp_path / "missing_name.toml"
+    missing_name.write_text("[model]\nmlp_type = 'dense'\n")
+    with pytest.raises(ValueError, match="run_name is required"):
+        load_experiment_config(missing_name)
+
+    unknown = tmp_path / "unknown.toml"
+    unknown.write_text("run_name = 'bad-key'\n[training]\nsteps = 10\n")
+    with pytest.raises(ValueError, match="training.steps"):
+        load_experiment_config(unknown)
+
+
+def test_existing_environment_overrides_take_precedence(monkeypatch):
+    repository_root = Path(__file__).resolve().parents[2]
+    monkeypatch.setenv("MBS_OVERRIDE", "32")
+    monkeypatch.setenv("TRAIN_STEPS_OVERRIDE", "20")
+    monkeypatch.setenv("MLP_TYPE_OVERRIDE", "moe")
+    monkeypatch.setenv("MLP_RATIO_OVERRIDE", "2")
+    monkeypatch.setenv("NUM_EXPERTS_OVERRIDE", "8")
+    monkeypatch.setenv("TOP_K_OVERRIDE", "2")
+    monkeypatch.setenv("MOE_BACKEND_OVERRIDE", "grouped_gemm")
+    config, path = parse_train_args([
+        "--config", str(repository_root / "configs/dense_baseline.toml")])
+
+    assert path == repository_root / "configs/dense_baseline.toml"
+    assert config["training"]["microbatch_sequences"] == 32
+    assert config["training"]["total_steps"] == 20
+    assert config["model"]["mlp_type"] == "moe"
+    assert config["model"]["mlp_ratio"] == 2
+    assert config["model"]["num_experts"] == 8
+    assert config["model"]["top_k"] == 2
+    assert config["model"]["moe_backend"] == "grouped_gemm"
+
+
+def test_tensorboard_run_name_is_used_and_existing_directory_is_rejected(tmp_path):
+    expected = tmp_path / "modded-nanogpt-moe" / "vista" / "dense-baseline"
+    assert tensorboard_run_directory(
+        tmp_path, "vista", "dense-baseline") == expected
+    assert require_unused_tensorboard_run_directory(
+        tmp_path, "vista", "dense-baseline") == expected
+
+    expected.mkdir(parents=True)
+    with pytest.raises(FileExistsError, match="dense-baseline"):
+        require_unused_tensorboard_run_directory(
+            tmp_path, "vista", "dense-baseline")
