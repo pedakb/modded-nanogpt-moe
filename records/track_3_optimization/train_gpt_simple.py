@@ -89,7 +89,13 @@ class Rotary(nn.Module):
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim=128):
         super().__init__()
+        if head_dim <= 0:
+            raise ValueError(f"head_dim must be positive, got {head_dim}")
         self.num_heads = dim // head_dim
+        if self.num_heads < 1:
+            raise ValueError(
+                f"attention model dimension {dim} must provide at least one "
+                f"head of dimension {head_dim}")
         self.head_dim = head_dim
         hdim = self.num_heads * self.head_dim
         self.q = Linear(dim, hdim)

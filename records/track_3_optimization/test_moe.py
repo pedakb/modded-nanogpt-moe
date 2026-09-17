@@ -12,9 +12,18 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from train_gpt_simple import MLP, MoE, GPT, add_bias_by_expert_segments, eager_prefix, make_head_loss
+from train_gpt_simple import (
+    CausalSelfAttention,
+    MLP,
+    MoE,
+    GPT,
+    add_bias_by_expert_segments,
+    eager_prefix,
+    make_head_loss,
+)
 
 GROUPED_GEMM_AVAILABLE = importlib.util.find_spec("grouped_gemm") is not None
+TEST_MODEL_DIM = 128
 
 
 def _make_dense_and_moe(dim=32):
@@ -34,10 +43,10 @@ def _make_dense_and_moe(dim=32):
 
 
 def test_default_mlp_width_and_checkpoint_keys_remain_compatible():
-    default = GPT(vocab_size=37, num_layers=2, model_dim=16)
-    explicit = GPT(vocab_size=37, num_layers=2, model_dim=16, mlp_ratio=4)
+    default = GPT(vocab_size=37, num_layers=2, model_dim=TEST_MODEL_DIM)
+    explicit = GPT(vocab_size=37, num_layers=2, model_dim=TEST_MODEL_DIM, mlp_ratio=4)
 
-    assert default.hidden_dim == explicit.hidden_dim == 64
+    assert default.hidden_dim == explicit.hidden_dim == 512
     assert list(default.state_dict()) == list(explicit.state_dict())
     assert [name for name in default.state_dict() if ".mlp." in name] == [
         "blocks.0.mlp.fc.weight", "blocks.0.mlp.fc.bias",
@@ -48,34 +57,39 @@ def test_default_mlp_width_and_checkpoint_keys_remain_compatible():
     for name, default_tensor in default.state_dict().items():
         assert default_tensor.shape == explicit.state_dict()[name].shape, name
     for block in default.blocks:
-        assert block.mlp.fc.weight.shape == (64, 16)
-        assert block.mlp.fc.bias.shape == (64,)
-        assert block.mlp.proj.weight.shape == (16, 64)
-        assert block.mlp.proj.bias.shape == (16,)
+        assert block.mlp.fc.weight.shape == (512, TEST_MODEL_DIM)
+        assert block.mlp.fc.bias.shape == (512,)
+        assert block.mlp.proj.weight.shape == (TEST_MODEL_DIM, 512)
+        assert block.mlp.proj.bias.shape == (TEST_MODEL_DIM,)
 
 
 def test_ratio_two_sets_dense_and_expert_width_independently_of_top_k():
-    dense = GPT(vocab_size=37, num_layers=1, model_dim=16, mlp_ratio=2)
-    assert dense.hidden_dim == 32
-    assert dense.blocks[0].mlp.fc.weight.shape == (32, 16)
-    assert dense.blocks[0].mlp.proj.weight.shape == (16, 32)
+    dense = GPT(vocab_size=37, num_layers=1, model_dim=TEST_MODEL_DIM, mlp_ratio=2)
+    assert dense.hidden_dim == 256
+    assert dense.blocks[0].mlp.fc.weight.shape == (256, TEST_MODEL_DIM)
+    assert dense.blocks[0].mlp.proj.weight.shape == (TEST_MODEL_DIM, 256)
 
     for top_k in (1, 2):
-        moe = GPT(vocab_size=37, num_layers=1, model_dim=16, mlp_type="moe",
+        moe = GPT(vocab_size=37, num_layers=1, model_dim=TEST_MODEL_DIM, mlp_type="moe",
                   mlp_ratio=2, num_experts=8, top_k=top_k)
-        assert moe.hidden_dim == 32
+        assert moe.hidden_dim == 256
         assert len(moe.blocks[0].mlp.experts) == 8
         for expert in moe.blocks[0].mlp.experts:
-            assert expert.fc.weight.shape == (32, 16)
-            assert expert.fc.bias.shape == (32,)
-            assert expert.proj.weight.shape == (16, 32)
-            assert expert.proj.bias.shape == (16,)
+            assert expert.fc.weight.shape == (256, TEST_MODEL_DIM)
+            assert expert.fc.bias.shape == (256,)
+            assert expert.proj.weight.shape == (TEST_MODEL_DIM, 256)
+            assert expert.proj.bias.shape == (TEST_MODEL_DIM,)
 
 
 @pytest.mark.parametrize("mlp_ratio", [0, -1, float("nan"), float("inf"), float("-inf"), 0.1])
 def test_invalid_mlp_ratios_are_rejected(mlp_ratio):
     with pytest.raises(ValueError):
-        GPT(vocab_size=37, num_layers=1, model_dim=16, mlp_ratio=mlp_ratio)
+        GPT(vocab_size=37, num_layers=1, model_dim=TEST_MODEL_DIM, mlp_ratio=mlp_ratio)
+
+
+def test_attention_rejects_configuration_with_zero_heads():
+    with pytest.raises(ValueError, match="at least one head"):
+        CausalSelfAttention(dim=16)
 
 
 def test_forward_equivalence():
@@ -208,7 +222,8 @@ def test_topk_multi_selection_matches_manual_softmax_weights():
 
 def _make_small_gpt(mlp_type="dense", **moe_kwargs):
     torch.manual_seed(0)
-    model = GPT(vocab_size=37, num_layers=2, model_dim=16, mlp_type=mlp_type, **moe_kwargs)
+    model = GPT(vocab_size=37, num_layers=2, model_dim=TEST_MODEL_DIM,
+                mlp_type=mlp_type, **moe_kwargs)
     # Explicit nonzero projection weights: the real training init (in
     # train_gpt_simple.py's __main__) zeros proj.weight, which would make an
     # eager-vs-compiled head/loss comparison numerically degenerate (all-zero
@@ -251,7 +266,7 @@ def test_head_loss_eager_vs_compiled_fullgraph_parity():
         compiled_head_loss = torch.compile(head_loss, fullgraph=True, dynamic=False)
 
         torch.manual_seed(3)
-        x_base = torch.randn(2, 6, 16, dtype=torch.bfloat16)
+        x_base = torch.randn(2, 6, TEST_MODEL_DIM, dtype=torch.bfloat16)
         targets = torch.randint(0, 37, (2, 6))
 
         for p in model.parameters():
@@ -290,7 +305,7 @@ def test_moe_backend_defaults_to_loop_and_is_backward_compatible():
 
 
 def test_gpt_threads_moe_backend_to_every_block():
-    model = GPT(vocab_size=37, num_layers=3, model_dim=16, mlp_type="moe",
+    model = GPT(vocab_size=37, num_layers=3, model_dim=TEST_MODEL_DIM, mlp_type="moe",
                 num_experts=4, top_k=2, moe_backend="loop")
     for block in model.blocks:
         assert block.mlp.moe_backend == "loop"
