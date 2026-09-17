@@ -535,8 +535,10 @@ if __name__ == "__main__":
     normalize_topk = True
     moe_backend = os.environ.get("MOE_BACKEND_OVERRIDE", "loop")   # "loop" or "grouped_gemm"
 
-    # tensorboard logging (disabled by default; rank 0 only)
-    tensorboard_log = False
+    # TensorBoard logging is opt-in via a shared root; rank 0 only.
+    tb_root = os.environ.get("TB_ROOT", "")
+    tb_system = os.environ.get("TB_SYSTEM", "unknown")
+    tensorboard_log = bool(tb_root)
 
     num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
     model_dim = 768
@@ -642,7 +644,9 @@ if __name__ == "__main__":
         writer = None
         if tensorboard_log and dist.get_rank() == 0:
             from torch.utils.tensorboard import SummaryWriter
-            tb_dir = os.path.join("logs", str(run_id), "tensorboard", f"trial_{trial_idx}")
+            tb_dir = os.path.join(
+                tb_root, "modded-nanogpt-moe", tb_system, str(run_id), f"trial_{trial_idx}")
+            print0(f"TensorBoard event directory: {tb_dir}", console=True)
             writer = SummaryWriter(log_dir=tb_dir)
 
         for p in model.parameters():
