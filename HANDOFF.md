@@ -4,11 +4,11 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-The repository cleanup and agent guides are committed and pushed on
-`cleanup-active-codebase`; the current base is `ec435b1` (`Add coding agent
-guidance and handoff`). The current task fixes the Vista launcher's incorrect
-data-root default discovered during validation on a GH200 compute node. The
-launcher, tests, README, `AGENTS.md`, and this file are modified but uncommitted.
+The repository cleanup, agent guides, and Vista data-root correction are
+committed and pushed on `cleanup-active-codebase`; the current base is
+`759871e` (`Fix Vista repository-relative data root`). The fix has now passed
+the prescribed tests and two-step training smokes on a Vista GH200. This file
+is modified only to record that result and is not yet committed.
 
 The cleanup makes `modded_nanogpt_moe` the only active trainer implementation
 and removes upstream trainers, historical records, old kernels/evaluation
@@ -54,6 +54,11 @@ available in Git and on the earlier branches.
   FineWeb10B directory on SCRATCH and contains validation and training shards.
 - CPU-safe launcher tests cover repository-root defaulting from an outside
   working directory and preservation of an explicit `DATA_ROOT`.
+- The user confirmed the full post-fix pytest suite passed on a Vista GH200.
+- The user confirmed both prescribed two-step Vista training smokes completed
+  successfully with TensorBoard disabled: dense ratio=4 at microbatch 32 and
+  grouped MoE E=8, k=2, ratio=2 at microbatch 64. Logs are under
+  `$STOCKYARD/logs/modded-nanogpt-moe/vista/cleanup_{dense,grouped}_smoke.log`.
 - The standalone grouped-GEMM BF16 harness previously passed all eight LS6
   A100 cases, including empty experts, with a CUTLASS GemmGrouped kernel.
 - Integrated grouped E=1,k=1 training previously completed six steps on LS6
@@ -64,9 +69,8 @@ available in Git and on the earlier branches.
 
 ## Open issues and cautions
 
-- The full post-fix test suite and two-step dense/grouped smokes remain to be
-  run on Vista. Local macOS tests cannot verify CUDA, compilation, or grouped-
-  GEMM behavior.
+- The cleanup branch still needs a post-cleanup LS6 test/smoke validation. The
+  Vista launcher fix does not change LS6's existing data-root convention.
 - Two fresh Vista dense runs with seed 1234 previously matched exactly at
   initialization, the first batch, and after update 1, but differed in model
   and optimizer state by update 10 while RNG and loader state matched. Update-2
@@ -82,11 +86,12 @@ available in Git and on the earlier branches.
 
 ## Next steps
 
-1. Review this uncommitted diff, then commit and push only after approval.
-2. Pull `cleanup-active-codebase` on Vista and run the full pytest sequence.
-3. Only after pytest succeeds, run the two-step
-   dense and E=8,k=2 grouped smokes with `TB_ROOT=`.
-4. Validate LS6 separately; its data-root convention was not changed here.
-5. Recheck checkpoint creation/resume and comparison from the cleaned paths.
-6. If exact fresh-run repeatability is required, compare the saved update-2
+1. Review, commit, and push this handoff-only update if approved.
+2. Validate the cleanup branch on LS6, including its actual data path, full
+   pytest suite, and short dense/grouped smokes.
+3. Recheck checkpoint creation/resume and comparison from the cleaned paths
+   when checkpoint validation is next in scope.
+4. If exact fresh-run repeatability is required, compare the saved update-2
    diagnostic stages before extending instrumentation further.
+5. After LS6 validation, decide whether to make `cleanup-active-codebase` the
+   repository default branch; retain milestone branches for provenance.
