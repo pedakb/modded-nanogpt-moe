@@ -4,10 +4,10 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-The repository cleanup, agent guides, Vista launch support, and Slurm support
-are committed and pushed on `cleanup-active-codebase`; the current base is
-`6ae0c70` (`Fix Vista Slurm environment handling`). A new OLMoE-style
-experiment config and its tests are currently uncommitted and have not yet
+The repository cleanup and the E64/K8 experiment config are committed and
+pushed on `cleanup-active-codebase`; the current base is `d77b5ab` (`Add
+OLMoE-style E64K8 experiment config`). An actual-pipeline Vista benchmark mode,
+launcher, tests, and documentation are currently uncommitted and have not yet
 been exercised on a GPU.
 
 The cleanup makes `modded_nanogpt_moe` the only active trainer implementation
@@ -47,9 +47,17 @@ available in Git and on the earlier branches.
   as metadata without making absolute paths compatibility requirements.
 - TensorBoard is now declared in `pyproject.toml`/`uv.lock`. The grouped-GEMM
   extension remains external and architecture-specific.
+- `scripts/vista/benchmark.sh` opts the normal trainer into a single-GPU,
+  single-trial benchmark. It uses the existing complete optimizer-update loop,
+  defaults to 10 warmup plus 30 measured updates, synchronizes each measured
+  update, resets peak memory after warmup, and excludes validation and durable
+  run artifacts.
 
 ## Verification and experiments
 
+- For the training benchmark: focused CPU-safe benchmark/launcher tests passed;
+  the full local suite passed with `46 passed, 2 skipped`. The skipped checks
+  require CUDA and `grouped_gemm`; Vista GH200 timing remains pending.
 - For the new E=64, k=8 config: focused config/launcher tests `4 passed`; full
   local suite `44 passed, 2 skipped`. The skipped checks require CUDA and
   `grouped_gemm`. The Vista smoke and full experiment remain pending.
@@ -94,16 +102,19 @@ available in Git and on the earlier branches.
 
 ## Next steps
 
-1. Run a 10--20 update smoke test of `configs/moe_e64k8_r0.5.toml` on an
+1. Benchmark `configs/moe_grouped.toml` and `configs/moe_e64k8_r0.5.toml` on
+   the same Vista GH200 allocation and preserve their console output for a
+   direct comparison.
+2. Run a 10--20 update smoke test of `configs/moe_e64k8_r0.5.toml` on an
    existing Vista idev GH200 node using `TRAIN_STEPS_OVERRIDE`; this preserves
    the config's full-run schedule outside the smoke invocation.
-2. If the smoke succeeds, submit the full experiment through
+3. If the smoke succeeds, submit the full experiment through
    `scripts/vista/submit.sh`.
-3. Validate the cleanup branch on LS6, including its actual data path, full
+4. Validate the cleanup branch on LS6, including its actual data path, full
    pytest suite, and short dense/grouped smokes.
-4. Recheck checkpoint creation/resume and comparison from the cleaned paths
+5. Recheck checkpoint creation/resume and comparison from the cleaned paths
    when checkpoint validation is next in scope.
-5. If exact fresh-run repeatability is required, compare the saved update-2
+6. If exact fresh-run repeatability is required, compare the saved update-2
    diagnostic stages before extending instrumentation further.
-6. After LS6 validation, decide whether to make `cleanup-active-codebase` the
+7. After LS6 validation, decide whether to make `cleanup-active-codebase` the
    repository default branch; retain milestone branches for provenance.

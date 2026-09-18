@@ -13,9 +13,11 @@ from modded_nanogpt_moe.config import load_experiment_config, parse_train_args
 from modded_nanogpt_moe.model import GPT, resolve_mlp_hidden_dim
 from modded_nanogpt_moe.optim import Muon, build_optimizers
 from modded_nanogpt_moe.train import (
+    benchmark_settings_from_environment,
     main,
     read_source_snapshot,
     require_unused_tensorboard_run_directory,
+    summarize_training_benchmark,
     tensorboard_run_directory,
 )
 
@@ -255,6 +257,45 @@ def test_module_entry_point_logs_package_sources():
         assert f"# ===== {relative_path} =====" in snapshot
 
 
+def test_training_benchmark_settings_and_summary_are_cpu_testable():
+    assert benchmark_settings_from_environment({}) == {
+        "enabled": False,
+        "warmup_updates": 10,
+        "measured_updates": 30,
+    }
+    assert benchmark_settings_from_environment({
+        "BENCHMARK_MEASURED_UPDATES": "ignored-while-disabled",
+    })["enabled"] is False
+    assert benchmark_settings_from_environment({
+        "TRAINING_BENCHMARK": "1",
+        "BENCHMARK_WARMUP_UPDATES": "2",
+        "BENCHMARK_MEASURED_UPDATES": "3",
+    }) == {
+        "enabled": True,
+        "warmup_updates": 2,
+        "measured_updates": 3,
+    }
+    with pytest.raises(ValueError, match="must be positive"):
+        benchmark_settings_from_environment({
+            "TRAINING_BENCHMARK": "1",
+            "BENCHMARK_MEASURED_UPDATES": "0",
+        })
+
+    summary = summarize_training_benchmark(
+        [0.1, 0.2, 0.3],
+        tokens_per_update=600,
+        peak_allocated_bytes=2 * 2**30,
+        peak_reserved_bytes=3 * 2**30,
+    )
+    assert summary == {
+        "mean_ms_per_update": pytest.approx(200),
+        "median_ms_per_update": pytest.approx(200),
+        "tokens_per_second": pytest.approx(3000),
+        "peak_allocated_gib": pytest.approx(2),
+        "peak_reserved_gib": pytest.approx(3),
+    }
+
+
 def test_dense_example_config_resolves_current_training_defaults():
     repository_root = Path(__file__).resolve().parents[1]
     config = load_experiment_config(repository_root / "configs/dense_baseline.toml")
@@ -359,6 +400,59 @@ def test_vista_launcher_defaults_data_root_to_repo_and_preserves_override(
         "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
         "--module", "modded_nanogpt_moe.train", "--config",
         "configs/dense_baseline.toml",
+    ]
+
+
+def test_vista_benchmark_launcher_reuses_training_launcher_without_artifacts(
+        tmp_path):
+    repository_root = Path(__file__).resolve().parents[1]
+    launcher = repository_root / "scripts/vista/benchmark.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    module = fake_bin / "module"
+    module.write_text("#!/usr/bin/env bash\nexit 0\n")
+    module.chmod(0o755)
+    uv = fake_bin / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' \"$PWD\" "
+        "\"${TRAINING_BENCHMARK-}\" \"${TB_ROOT+x}\" \"${TB_ROOT-}\" "
+        "\"${BENCHMARK_WARMUP_UPDATES-}\" "
+        "\"${BENCHMARK_MEASURED_UPDATES-}\" > \"$LAUNCH_CAPTURE\"\n"
+        "printf '%s\\n' \"$@\" >> \"$LAUNCH_CAPTURE\"\n"
+    )
+    uv.chmod(0o755)
+    capture = tmp_path / "benchmark-launch.txt"
+    outside_repository = tmp_path / "outside"
+    outside_repository.mkdir()
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    environment["LAUNCH_CAPTURE"] = str(capture)
+    environment["TB_ROOT"] = "/must/not/be/used"
+    environment["BENCHMARK_WARMUP_UPDATES"] = "2"
+    environment["BENCHMARK_MEASURED_UPDATES"] = "3"
+    for name in (
+        "SEED_OVERRIDE", "MBS_OVERRIDE", "TRAIN_STEPS_OVERRIDE",
+        "MLP_TYPE_OVERRIDE", "MLP_RATIO_OVERRIDE", "NUM_EXPERTS_OVERRIDE",
+        "TOP_K_OVERRIDE", "MOE_BACKEND_OVERRIDE", "CHECKPOINT_DIR",
+        "CHECKPOINT_INTERVAL", "RESUME_CHECKPOINT",
+        "STOP_AFTER_COMPLETED_UPDATES", "REPRO_DIAGNOSTICS_DIR", "NSYS_PROFILE",
+    ):
+        environment.pop(name, None)
+
+    subprocess.run(
+        ["bash", str(launcher), "configs/moe_grouped.toml"],
+        cwd=outside_repository,
+        env=environment,
+        check=True,
+    )
+
+    captured = capture.read_text().splitlines()
+    assert captured[:6] == [str(repository_root), "1", "x", "", "2", "3"]
+    assert captured[6:] == [
+        "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
+        "--module", "modded_nanogpt_moe.train", "--config",
+        str(repository_root / "configs/moe_grouped.toml"),
     ]
 
 

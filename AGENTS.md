@@ -21,8 +21,9 @@ before editing; the worktree may contain another agent's changes.
 - `modded_nanogpt_moe/checkpoint.py`: atomic checkpoints and restoration.
 - `modded_nanogpt_moe/config.py`: built-in defaults, TOML loading, validation,
   and compatibility environment overrides.
-- `modded_nanogpt_moe/train.py`: training, validation, compilation, logging,
-  checkpointing, reproducibility diagnostics, and Nsight markers.
+- `modded_nanogpt_moe/train.py`: training, validation, compilation,
+  actual-pipeline benchmarking, logging, checkpointing, reproducibility
+  diagnostics, and Nsight markers.
 - `configs/`: portable experiment definitions. `run_name` identifies a run.
 - `tests/`: package, model/MoE parity, and checkpoint tests.
 - `tools/`: grouped-GEMM validation/profiling and checkpoint comparison.
@@ -133,6 +134,17 @@ Cluster launchers load the established modules and set reusable defaults:
 scripts/ls6/train.sh configs/moe_grouped.toml
 scripts/vista/train.sh configs/moe_grouped.toml
 ```
+
+Vista training-pipeline benchmarks reuse the same launcher and update loop,
+defaulting to 10 warmup plus 30 measured optimizer updates. They disable
+TensorBoard and reject experiment/checkpoint/profiling overrides:
+
+```bash
+scripts/vista/benchmark.sh configs/moe_grouped.toml
+```
+
+Use `BENCHMARK_WARMUP_UPDATES` and `BENCHMARK_MEASURED_UPDATES` only when a
+different benchmark window is intentionally required.
 
 Submit a single-node Vista batch run from a login node with:
 

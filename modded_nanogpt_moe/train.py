@@ -1,8 +1,9 @@
-"""Active dense/MoE training, validation, compilation, logging, and profiling."""
+"""Active dense/MoE training, validation, benchmarking, logging, and profiling."""
 
 import json
 import os
 import random
+import statistics
 import sys
 import time
 import uuid
@@ -32,6 +33,48 @@ from .optim import build_optimizers
 def nsys_range(enabled: bool, name: str):
     """Return an NVTX range only while the opt-in Nsight capture is active."""
     return torch.cuda.nvtx.range(name) if enabled else nullcontext()
+
+
+def benchmark_settings_from_environment(environment=None):
+    """Resolve the opt-in training benchmark controls without touching CUDA."""
+    environment = os.environ if environment is None else environment
+    enabled_value = environment.get("TRAINING_BENCHMARK", "0")
+    if enabled_value not in ("0", "1"):
+        raise ValueError(
+            f"TRAINING_BENCHMARK must be 0 or 1, got {enabled_value!r}")
+    enabled = enabled_value == "1"
+    if not enabled:
+        return {
+            "enabled": False,
+            "warmup_updates": 10,
+            "measured_updates": 30,
+        }
+    warmup_updates = int(environment.get("BENCHMARK_WARMUP_UPDATES", "10"))
+    measured_updates = int(environment.get("BENCHMARK_MEASURED_UPDATES", "30"))
+    if warmup_updates < 0:
+        raise ValueError("BENCHMARK_WARMUP_UPDATES must be nonnegative")
+    if measured_updates <= 0:
+        raise ValueError("BENCHMARK_MEASURED_UPDATES must be positive")
+    return {
+        "enabled": enabled,
+        "warmup_updates": warmup_updates,
+        "measured_updates": measured_updates,
+    }
+
+
+def summarize_training_benchmark(update_seconds, tokens_per_update,
+                                 peak_allocated_bytes, peak_reserved_bytes):
+    """Return complete-update latency, throughput, and memory statistics."""
+    if not update_seconds or any(duration <= 0 for duration in update_seconds):
+        raise ValueError("benchmark update durations must be positive and nonempty")
+    mean_seconds = statistics.fmean(update_seconds)
+    return {
+        "mean_ms_per_update": 1000 * mean_seconds,
+        "median_ms_per_update": 1000 * statistics.median(update_seconds),
+        "tokens_per_second": tokens_per_update / mean_seconds,
+        "peak_allocated_gib": peak_allocated_bytes / 2**30,
+        "peak_reserved_gib": peak_reserved_bytes / 2**30,
+    }
 
 
 def tensorboard_run_directory(root, system, run_name):
@@ -79,6 +122,12 @@ def main(argv=None):
     assert 8 % dist.get_world_size() == 0
     
     num_trials = experiment_config["num_trials"]
+    benchmark = benchmark_settings_from_environment()
+    if benchmark["enabled"]:
+        if dist.get_world_size() != 1:
+            raise ValueError("TRAINING_BENCHMARK=1 currently requires exactly one GPU")
+        if num_trials != 1:
+            raise ValueError("TRAINING_BENCHMARK=1 currently requires exactly one trial")
     repro_diagnostics_dir = os.environ.get("REPRO_DIAGNOSTICS_DIR", "")
     if repro_diagnostics_dir:
         if dist.get_world_size() != 1:
@@ -103,6 +152,12 @@ def main(argv=None):
         if not checkpoint_dir:
             raise ValueError(
                 "CHECKPOINT_DIR is required when checkpointing, resuming, or stopping early")
+    if benchmark["enabled"] and checkpointing_requested:
+        raise ValueError(
+            "TRAINING_BENCHMARK cannot be combined with checkpoint/resume controls")
+    if benchmark["enabled"] and repro_diagnostics_dir:
+        raise ValueError(
+            "TRAINING_BENCHMARK cannot be combined with reproducibility diagnostics")
     if stop_after_updates is not None and stop_after_updates <= 0:
         raise ValueError("STOP_AFTER_COMPLETED_UPDATES must be positive")
     
@@ -127,6 +182,8 @@ def main(argv=None):
     tb_root = os.environ.get("TB_ROOT", "")
     tb_system = os.environ.get("TB_SYSTEM", "unknown")
     tensorboard_log = bool(tb_root)
+    if benchmark["enabled"] and tensorboard_log:
+        raise ValueError("TRAINING_BENCHMARK requires TensorBoard to be disabled")
 
     requested_run_name = experiment_config["run_name"]
     run_id = (resume_checkpoint["run"]["run_id"]
@@ -142,7 +199,8 @@ def main(argv=None):
         require_unused_tensorboard_run_directory(tb_root, tb_system, run_id)
 
     # logging setup
-    if dist.get_rank() == 0:
+    logfile = None
+    if dist.get_rank() == 0 and not benchmark["enabled"]:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{run_id}.txt"
         print(logfile)
@@ -150,7 +208,7 @@ def main(argv=None):
         if dist.get_rank() == 0:
             if console:
                 print(s)
-            if log:
+            if log and logfile is not None:
                 with open(logfile, "a") as f:
                     print(s, file=f)
     
@@ -170,6 +228,13 @@ def main(argv=None):
     if repro_diagnostics_dir:
         print0(
             f"reproducibility diagnostics: directory={repro_diagnostics_dir}",
+            console=True,
+        )
+    if benchmark["enabled"]:
+        print0(
+            "Training benchmark enabled: "
+            f"warmup_updates={benchmark['warmup_updates']} "
+            f"measured_updates={benchmark['measured_updates']}",
             console=True,
         )
     
@@ -225,10 +290,13 @@ def main(argv=None):
         console=True,
     )
 
-    val_loader = distributed_data_generator(
-        validation_shard_pattern, val_tokens, seq_len=sequence_length,
-        data_root=data_root)
-    val_inputs, val_targets = next(val_loader)
+    val_loader = None
+    val_inputs = val_targets = None
+    if not benchmark["enabled"]:
+        val_loader = distributed_data_generator(
+            validation_shard_pattern, val_tokens, seq_len=sequence_length,
+            data_root=data_root)
+        val_inputs, val_targets = next(val_loader)
 
     nsys_profile_value = os.environ.get("NSYS_PROFILE", "0")
     if nsys_profile_value not in ("0", "1"):
@@ -256,6 +324,8 @@ def main(argv=None):
     if nsys_profile and checkpointing_requested:
         raise ValueError(
             "combining NSYS_PROFILE with checkpoint/resume is not yet supported")
+    if benchmark["enabled"] and nsys_profile:
+        raise ValueError("TRAINING_BENCHMARK cannot be combined with NSYS_PROFILE")
 
     data_root_path = Path(data_root).expanduser().resolve()
     runtime_config = {
@@ -309,6 +379,8 @@ def main(argv=None):
             "device": str(device),
         },
     }
+    if benchmark["enabled"]:
+        runtime_config["benchmark"] = benchmark
     startup_environment = collect_environment_metadata()
     print0(
         "Resolved runtime settings:\n"
@@ -379,6 +451,12 @@ def main(argv=None):
                 f"NSYS_PROFILE capture ends after update "
                 f"{nsys_warmup_steps + nsys_active_steps}, but TRAIN_STEPS_OVERRIDE "
                 f"requests only {train_steps} updates")
+        benchmark_total_updates = (
+            benchmark["warmup_updates"] + benchmark["measured_updates"])
+        if benchmark["enabled"] and benchmark_total_updates > train_steps:
+            raise ValueError(
+                "benchmark warmup plus measured updates cannot exceed the config's "
+                "training.total_steps schedule horizon")
     
         # initialize model parameters
         for name, p in model.named_parameters():
@@ -438,7 +516,8 @@ def main(argv=None):
             },
             "optimizers": optimizer_config,
             "datasets": {
-                "validation_shards": val_loader.shard_identities,
+                "validation_shards": (
+                    val_loader.shard_identities if val_loader is not None else []),
             },
             "seed_override": seed,
         }
@@ -548,11 +627,14 @@ def main(argv=None):
         dist.barrier()
         t0 = time.perf_counter() - current_segment_time
         nsys_capture_active = False
-        for step in range(completed_updates, train_steps + 1):
+        benchmark_update_seconds = []
+        final_loop_step = benchmark_total_updates if benchmark["enabled"] else train_steps
+        for step in range(completed_updates, final_loop_step + 1):
     
             # --------------- VALIDATION SECTION -----------------
             val_step_freq = 125 if step / train_steps < 0.9 else 25
-            if step == train_steps or step % val_step_freq == 0:
+            if (not benchmark["enabled"]
+                    and (step == train_steps or step % val_step_freq == 0)):
                 # stop the clock
                 dist.barrier()
                 time_since_last_val = time.perf_counter() - t0
@@ -583,7 +665,7 @@ def main(argv=None):
                 dist.barrier()
                 t0 = time.perf_counter()
     
-            if step == train_steps:
+            if step == final_loop_step:
                 break
     
             # --------------- TRAINING SECTION -----------------
@@ -592,6 +674,18 @@ def main(argv=None):
                 print0(f"Nsight Systems capture starting before update {step + 1}", console=True)
                 torch.cuda.profiler.start()
                 nsys_capture_active = True
+
+            benchmark_step_started = None
+            if benchmark["enabled"] and step == benchmark["warmup_updates"]:
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats(device)
+                print0(
+                    f"Benchmark measurement starting before update {step + 1}",
+                    console=True,
+                )
+            if benchmark["enabled"] and step >= benchmark["warmup_updates"]:
+                torch.cuda.synchronize()
+                benchmark_step_started = time.perf_counter()
     
             with nsys_range(nsys_capture_active, f"optimizer_step.update_{step + 1}"):
                 with nsys_range(nsys_capture_active, "data_preparation"):
@@ -669,6 +763,11 @@ def main(argv=None):
                         losses=diagnostic_losses,
                         gradients=diagnostic_gradients,
                     )
+
+            if benchmark_step_started is not None:
+                torch.cuda.synchronize()
+                benchmark_update_seconds.append(
+                    time.perf_counter() - benchmark_step_started)
     
             if (nsys_capture_active
                     and step + 1 == nsys_warmup_steps + nsys_active_steps):
@@ -677,13 +776,14 @@ def main(argv=None):
                 nsys_capture_active = False
                 print0(f"Nsight Systems capture ended after update {step + 1}", console=True)
             approx_training_time = training_time + (time.perf_counter() - t0)
-            print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-                   + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms"
-                   + f" mem_alloc:{torch.cuda.memory_allocated()/2**30:.3f}GiB"
-                   + f" mem_alloc_peak:{torch.cuda.max_memory_allocated()/2**30:.3f}GiB"
-                   + f" mem_reserved:{torch.cuda.memory_reserved()/2**30:.3f}GiB"
-                   + f" mem_reserved_peak:{torch.cuda.max_memory_reserved()/2**30:.3f}GiB",
-                   console=True, log=False)
+            if not benchmark["enabled"]:
+                print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+                       + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms"
+                       + f" mem_alloc:{torch.cuda.memory_allocated()/2**30:.3f}GiB"
+                       + f" mem_alloc_peak:{torch.cuda.max_memory_allocated()/2**30:.3f}GiB"
+                       + f" mem_reserved:{torch.cuda.memory_reserved()/2**30:.3f}GiB"
+                       + f" mem_reserved_peak:{torch.cuda.max_memory_reserved()/2**30:.3f}GiB",
+                       console=True, log=False)
             if writer is not None:
                 writer.add_scalar("perf/approx_training_time_s", approx_training_time, step + 1)
                 writer.add_scalar("perf/step_avg_ms", 1000 * approx_training_time / (step + 1), step + 1)
@@ -745,6 +845,32 @@ def main(argv=None):
                 )
                 stopped_early = True
                 break
+
+        if benchmark["enabled"]:
+            if len(benchmark_update_seconds) != benchmark["measured_updates"]:
+                raise RuntimeError(
+                    "benchmark measured an unexpected number of optimizer updates: "
+                    f"expected {benchmark['measured_updates']}, "
+                    f"got {len(benchmark_update_seconds)}")
+            summary = summarize_training_benchmark(
+                benchmark_update_seconds,
+                batch_size,
+                torch.cuda.max_memory_allocated(device),
+                torch.cuda.max_memory_reserved(device),
+            )
+            print0(
+                "Training benchmark result:\n"
+                f"  model_dim={model.model_dim} hidden_dim={model.hidden_dim} "
+                f"E={num_experts} k={top_k} backend={moe_backend}\n"
+                f"  warmup_updates={benchmark['warmup_updates']} "
+                f"measured_updates={benchmark['measured_updates']}\n"
+                f"  mean_ms/update={summary['mean_ms_per_update']:.3f}\n"
+                f"  median_ms/update={summary['median_ms_per_update']:.3f}\n"
+                f"  tokens/sec={summary['tokens_per_second']:.3f}\n"
+                f"  peak_allocated_GiB={summary['peak_allocated_gib']:.3f}\n"
+                f"  peak_reserved_GiB={summary['peak_reserved_gib']:.3f}",
+                console=True,
+            )
     
         if writer is not None:
             writer.close()
