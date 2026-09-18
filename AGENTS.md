@@ -134,6 +134,18 @@ scripts/ls6/train.sh configs/moe_grouped.toml
 scripts/vista/train.sh configs/moe_grouped.toml
 ```
 
+Submit a single-node Vista batch run from a login node with:
+
+```bash
+scripts/vista/submit.sh configs/moe_grouped.toml
+```
+
+The submission wrapper exports the current environment, delegates execution to
+`scripts/vista/train.sh`, and writes combined stdout/stderr to
+`$STOCKYARD/logs/modded-nanogpt-moe/vista/slurm/%x-%j.log`. Set
+`SLURM_MAIL_USER` to request Slurm notifications for all job events; leave it
+unset to submit without email notifications.
+
 - LS6: A100, `gcc/11.2.0`, CUDA 12.8; the validated grouped-GEMM build used
   `nv-grouped-gemm==1.1.4.post8` and device capability 80.
 - Vista: GH200, `nvidia/25.3`, CUDA 12.9, `CC=/usr/bin/gcc`,
