@@ -219,6 +219,27 @@ def add_bias_by_expert_segments(x: Tensor, bias: Tensor, batch_sizes: Tensor,
     return _ExpertSegmentBias.apply(x, bias, batch_sizes, sorted_experts)
 
 
+def combine_expert_outputs(out_sorted: Tensor, topk_weights: Tensor, order: Tensor):
+    """Combine a trusted sorted-row -> assignment permutation and routed values.
+
+    CUDA uses a compact assignment -> sorted-row lookup constructed once from
+    order, then reuses it in backward. No routing/sort is recomputed. CPU and
+    double precision retain the exact eager reference for portable checks.
+    """
+    assert out_sorted.ndim == topk_weights.ndim == 2 and order.ndim == 1
+    n, k = topk_weights.shape
+    d = out_sorted.shape[1]
+    assert k > 0 and d > 0 and out_sorted.shape[0] == order.numel() == n * k
+    assert out_sorted.device == topk_weights.device == order.device
+    assert out_sorted.dtype == topk_weights.dtype and order.dtype == torch.int64
+    if out_sorted.is_cuda and out_sorted.dtype in (torch.bfloat16, torch.float16, torch.float32):
+        from ._combine import fused_combine
+        return fused_combine(out_sorted, topk_weights, order)
+    out_flat = torch.empty_like(out_sorted)
+    out_flat[order] = out_sorted
+    return (out_flat.view(n, k, d) * topk_weights.unsqueeze(-1)).sum(dim=1)
+
+
 class MoE(nn.Module):
     """Top-k routed sparse MoE. Each expert is an MLP identical in architecture,
     init, and dtype behavior to the dense MLP above. num_experts=1, top_k=1 reduces
@@ -420,9 +441,7 @@ class MoE(nn.Module):
         # Whether that is benign or causes drift for experts that are
         # repeatedly starved of tokens has not been checked empirically.
         with nsys_range(_moe_nsys_capture_active, "moe.combine"):
-            out_flat = torch.empty_like(out_sorted)
-            out_flat[order] = out_sorted
-            out = (out_flat.view(N, self.top_k, D) * topk_weights.unsqueeze(-1)).sum(dim=1)
+            out = combine_expert_outputs(out_sorted, topk_weights, order)
             out = out.view(B, T, D)
         if _moe_nsys_capture_active:
             _register_moe_backward_ranges(out, out_sorted, h_act, h_pre, x_sorted)

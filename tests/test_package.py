@@ -249,6 +249,7 @@ def test_module_entry_point_logs_package_sources():
     for relative_path in (
         "modded_nanogpt_moe/model.py",
         "modded_nanogpt_moe/_segmented_bias.py",
+        "modded_nanogpt_moe/_combine.py",
         "modded_nanogpt_moe/optim.py",
         "modded_nanogpt_moe/data.py",
         "modded_nanogpt_moe/checkpoint.py",

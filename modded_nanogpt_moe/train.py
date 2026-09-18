@@ -93,6 +93,7 @@ def read_source_snapshot():
     source_files = [
         package_dir / "model.py",
         package_dir / "_segmented_bias.py",
+        package_dir / "_combine.py",
         package_dir / "optim.py",
         package_dir / "data.py",
         package_dir / "checkpoint.py",

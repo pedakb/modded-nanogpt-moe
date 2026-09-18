@@ -408,9 +408,7 @@ class GroupedGemmMoE(nn.Module):
 
         # ---- unpermute + weighted combine (backend-independent) ----
         with self._scope("moe.combine"):
-            out_flat = torch.empty_like(out_sorted)
-            out_flat[order] = out_sorted
-            out = (out_flat.view(N, self.top_k, D) * topk_weights.unsqueeze(-1)).sum(dim=1)
+            out = tgs.combine_expert_outputs(out_sorted, topk_weights, order)
         return out.view(B, T, D)
 
 

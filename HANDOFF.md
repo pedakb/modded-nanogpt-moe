@@ -4,50 +4,54 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-The current base on `cleanup-active-codebase` is `0f9772f` (`Vectorize segmented
-expert bias operations`). The initial worktree was clean. Pending work replaces
-only the CUDA bias-gradient reduction with specialized Triton kernels. New:
-`modded_nanogpt_moe/_segmented_bias.py`, `tests/test_triton_bias.py`. Modified:
-model.py (backward dispatch only), train.py/test_package.py (include new source
-in run snapshots), the diagnostic candidate label, and this handoff. No commits, remote jobs, dependency changes,
-or experiment/config/checkpoint changes were made.
+The current base on `cleanup-active-codebase` is `415a8ab` (`Include segmented
+bias source in training snapshot`). The initial worktree was clean. Pending
+work optimizes only grouped-MoE combine and its backward. New: `_combine.py`
+and `tests/test_combine.py`. Modified: model.py, train.py/test_package.py
+(source snapshots), tools/validate_grouped_gemm.py (reuse production combine),
+and this handoff. The Triton segmented-bias implementation is unchanged.
+No commits, remote jobs, dependencies, configs, or checkpoint formats changed.
 
-## Specialized CUDA bias reduction (current task)
+## Fused combine (current task)
 
-- User-measured vectorized-forward benchmark: 4677.5 -> 4538.9 ms/update.
-  However generic segment_reduce consumed FC2=932.4 ms and FC1=914.7 ms over
-  two updates (~923.5 ms/update total), versus ~196.5 ms/update for the old
-  per-expert reductions. This is the baseline, not a result of this patch.
-- New first kernel tiles (expert, feature tile, row partition). It computes
-  each expert's start from existing device counts in-register, splits its
-  contiguous segment into eight disjoint parts, and accumulates 128x32 tiles
-  in FP32. A second kernel sums the eight partials and casts once on store.
-  No atomics, padding of routed tokens, host count reads, scan launch, sorting,
-  synchronization, or per-expert Python loop. Empty parts explicitly write zero.
-- Expected two launches per FC call: `_expert_bias_partials` and
-  `_expert_bias_finish`, hence 384 per FC / 768 across both FCs for 192 calls.
-  Unlike generic segment_reduce there are no extra dtype-conversion or metadata
-  kernels. Scratch is [E,8,H] FP32 (1.5 MiB for E64/H768), independent of token
-  count. Fixed tiles/splits are an initial design, NOT GH200-tuned measurements.
-- Triton is already locked as a Linux PyTorch dependency; lazily imported on
-  the CUDA backward path only. No dependency edits or Mac installation.
-  CPU, float64, and higher-order autograd use the existing reference reduction.
-  Vectorized forward, NVTX, routing, packing, GEMM, activation, combine,
-  optimizers, and state_dict formats are unchanged. Source logging includes
-  the new kernel file.
-- Validation: full local suite `110 passed, 74 skipped`; `git diff --check`
-  passed. Local tests cover dispatch, bounded workspace/two launch grids, source
-  snapshots, and existing CPU parity. Mac has neither CUDA nor Triton: kernel
-  compilation, correctness, and speed are UNVERIFIED locally. New GPU checks
-  cover E8/E64, H384/H768, BF16/FP16/FP32, random balanced/imbalanced/all-empty
-  counts, tails, strided/expanded inputs, exact sums, repeatability, and FP64
-  error bounds based on the actual reduction depth. A CUDA profiler test checks
-  one launch of each kernel and no generic segment_reduce in bias backward.
-  Existing full-MoE CUDA tests cover both layouts and all gradient types.
-- Numerical expectation: forward/input gradient unchanged; bias sums have a
-  different FP32 tree order, so do not promise bitwise parity for random sums.
-  Existing tolerances are unchanged. No new GPU numerical differences or
-  speedup are claimed until the tests and Nsight capture below run on Vista.
+- User-measured post-bias baseline: E64/K8 packed median 4214.6 ms/update;
+  combine forward ~307.9 ms/update, backward ~275.7 ms/update, total ~583.6.
+  These are baseline measurements, not results from this patch.
+- Existing `order` maps sorted rows to flattened token/slot assignments. There
+  is no existing reverse lookup. `_combine_assignment_rows` constructs one
+  compact inverse from order ONCE inside combine (no argsort or packing change),
+  then forward/backward reuse it. This extra metadata is necessary for the
+  atomics-free gather design: [N*k] int64, 4 MiB for N=65536/K8, rather than a
+  [N*k,D] activation (768 MiB in BF16 at D768). No redundant inversion is done.
+- `_combine_forward` gathers sorted outputs per token/feature tile, multiplies
+  weights and sums k in one kernel. `_combine_backward` handles four assignments
+  per program, writes each grad_out_sorted row once, and reduces D for each
+  routing-weight gradient. No atomics or full unsorted activation/gradient
+  temporary; no host reads/synchronization or Python token/expert loops.
+- Preserve eager numerics: round each BF16/FP16 product to input dtype BEFORE
+  FP32 reduction, both for output and grad_topk_weights. Disable FP fusion so
+  FP32 multiplication/reduction do not become FMA. Final reductions cast once.
+  FP32 reduction order can still differ; do not promise bitwise random-sum
+  parity. CUDA tests use FP64 bounds on rounded products, exact binary sums,
+  and a cancellation case that detects incorrectly unrounded dot products.
+- Expected launches per combine call: two forward (index lookup + fused sum)
+  and one backward (both gradients). Across 192 calls: 384 forward + 192
+  backward, versus the previous separate unsort/multiply/sum and backward
+  gather/multiplies/reduction. Metadata traffic is included, not hidden in pack.
+  Counts and speed remain pending actual GH200 measurement.
+- `combine_expert_outputs` dispatches CUDA BF16/FP16/FP32 to lazy Triton; CPU
+  and float64 use the eager reference. Higher-order backward retains a
+  differentiable PyTorch fallback. Both layouts and moe.combine/moe_bw.combine
+  are preserved. Bias kernels, routing, GEMM, optimizers and state_dict unchanged.
+- Full local suite: `163 passed, 126 skipped`; `git diff --check` passed.
+  CPU reference diagnostic harness passed. CPU checks include exact fallback
+  parity, full MoE/router/expert gradients, rounding regression, source logging,
+  and mocked launch/allocation plumbing. New CUDA checks cover E8/K2, K4,
+  E64/K8, K1/K3, balanced/imbalanced routing, BF16/FP16/FP32, tails, strides,
+  empty inputs, frozen gradients, and actual kernel counts. Mac has no CUDA or
+  Triton; the new GPU kernels have NOT been compiled/executed here. Existing
+  model tolerances are unchanged. The new higher-order fallback test allows
+  only 32 FP64 epsilons for addition-order roundoff (~4e-16 observed locally).
 
 Run on an allocated Vista GH200; tests must pass before timing or profiling:
 
@@ -67,9 +71,9 @@ set -o pipefail
 mkdir -p "$STOCKYARD/logs/modded-nanogpt-moe/vista" "$STOCKYARD/profiles/modded-nanogpt-moe/vista"
 stamp="$(date +%Y%m%d-%H%M%S)-$$"
 scripts/vista/benchmark.sh configs/moe_e64k8_r0.5_packed.toml \
-  2>&1 | tee "$STOCKYARD/logs/modded-nanogpt-moe/vista/triton-bias-$stamp.log"
+  2>&1 | tee "$STOCKYARD/logs/modded-nanogpt-moe/vista/triton-combine-$stamp.log"
 # Separate capture: complete optimizer updates 11 and 12, not benchmark timing.
-report="$STOCKYARD/profiles/modded-nanogpt-moe/vista/triton-bias-$stamp"
+report="$STOCKYARD/profiles/modded-nanogpt-moe/vista/triton-combine-$stamp"
 TRAIN_STEPS_OVERRIDE=14 NSYS_PROFILE=1 NSYS_WARMUP_STEPS=10 NSYS_ACTIVE_STEPS=2 \
 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
   --capture-range=cudaProfilerApi --capture-range-end=stop -o "$report" \
@@ -78,18 +82,14 @@ nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
   2>&1 | tee "$report.log"
 nsys stats --report cuda_gpu_kern_sum,cuda_api_sum,nvtx_kern_sum \
   --format csv "$report.nsys-rep" | tee "$report.stats.csv"
-grep -E 'expert_bias|segment_reduce|moe_bw.fc[12]' "$report.stats.csv"
+grep -E '_combine_|moe.combine|moe_bw.combine' "$report.stats.csv"
 ```
 
-Inspect both kernel counts and summed GPU time in moe_bw.fc1/fc2. Expect 192
-of each kernel per FC, no generic segment_reduce, and compare against the
-~4.6--4.9 ms/call baseline. Scratch allocation, tile occupancy, and imbalance
-remain possible bottlenecks. Do not infer kernel speed from wall-clock alone.
-
-The prior vectorized-bias patch passed `107 passed, 34 skipped` locally. Its
-gather/add forward and custom-autograd boundary are retained. The old per-expert
-split/add/cat implementation remains only in tests/diagnostics. The indexing
-diagnostic's production candidate is now labeled `triton_segmented_bias`.
+Inspect both kernel counts and summed GPU time in moe.combine/moe_bw.combine.
+Expect 192 instances of each of the three combine kernels. Compare against
+the ~583.6 ms/update baseline without adding overlapping operator/kernel times.
+Gather locality, scatter-store efficiency, and register pressure remain possible
+bottlenecks; tiles have not been GH200-tuned. No speedup is claimed yet.
 
 ## Packed-layout experiment
 
