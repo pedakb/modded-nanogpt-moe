@@ -6,11 +6,13 @@ The model package is import-safe and does not initialize CUDA or distributed
 training as a side effect.
 """
 import importlib.util
+from contextlib import contextmanager
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+import modded_nanogpt_moe.model as model_module
 from modded_nanogpt_moe.model import (
     CausalSelfAttention,
     MLP,
@@ -313,6 +315,61 @@ def test_gpt_threads_moe_backend_to_every_block():
 def test_grouped_gemm_backend_rejects_unknown_backend_name():
     with pytest.raises(AssertionError):
         MoE(16, num_experts=2, top_k=1, moe_backend="not_a_real_backend")
+
+
+def test_grouped_moe_nvtx_capture_preserves_outputs_and_gradients(monkeypatch):
+    # Exercise the production grouped forward on CPU with a test-only GEMM stub.
+    # This verifies instrumentation, not the CUDA extension's correctness.
+    torch.manual_seed(42)
+    moe = MoE(8, num_experts=3, top_k=2)
+
+    def gmm(inputs, weights, counts, trans_b):
+        assert trans_b is False
+        return torch.cat([
+            segment @ weight
+            for segment, weight in zip(inputs.split(counts.tolist()), weights)
+        ])
+
+    moe._gmm = gmm
+    events = []
+
+    @contextmanager
+    def record_range(name):
+        events.append(("enter", name))
+        try:
+            yield
+        finally:
+            events.append(("exit", name))
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range", record_range)
+    monkeypatch.setattr(model_module, "_moe_nsys_capture_active", False)
+    inputs = torch.randn(2, 4, 8, requires_grad=True)
+
+    def forward_and_gradients():
+        output = moe._forward_grouped_gemm(inputs)
+        gradients = torch.autograd.grad(
+            output.sum(), (inputs, *moe.parameters()))
+        return output, gradients
+
+    reference, reference_gradients = forward_and_gradients()
+    assert events == []
+    model_module.set_moe_nsys_capture_active(True)
+    actual, actual_gradients = forward_and_gradients()
+    expected_names = (
+        "moe.router_topk", "moe.pack", "moe.stack_params", "moe.fc1",
+        "moe.activation", "moe.fc2", "moe.combine",
+    )
+    assert events == [
+        (phase, name) for name in expected_names for phase in ("enter", "exit")
+    ]
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    for actual_grad, reference_grad in zip(actual_gradients, reference_gradients):
+        torch.testing.assert_close(actual_grad, reference_grad, rtol=0, atol=0)
+
+    model_module.set_moe_nsys_capture_active(False)
+    events.clear()
+    forward_and_gradients()
+    assert events == []
 
 
 @pytest.mark.skipif(GROUPED_GEMM_AVAILABLE, reason="grouped_gemm IS installed; this test "

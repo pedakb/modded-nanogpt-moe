@@ -4,11 +4,10 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-The repository cleanup, E64/K8 experiment config, and training benchmark are
-committed and pushed on `cleanup-active-codebase`; the current base is
-`e40a2ff` (`Add training throughput benchmark`). Shape-batched Muon updates and
-their correctness test are currently uncommitted and have not yet been timed
-or validated on a GPU.
+The current base on `cleanup-active-codebase` is `c87706a` (`Batch Muon updates
+by parameter shape`). Fine-grained grouped-MoE NVTX instrumentation is now
+uncommitted in model.py/train.py with a CPU regression test in tests/test_moe.py.
+Vista profiling and batched-Muon GPU validation remain pending.
 
 The cleanup makes `modded_nanogpt_moe` the only active trainer implementation
 and removes upstream trainers, historical records, old kernels/evaluation
@@ -58,6 +57,12 @@ available in Git and on the earlier branches.
 
 ## Verification and experiments
 
+- Grouped-MoE NVTX ranges cover router/top-k, packing (including CPU counts),
+  parameter stacking, FC1, activation, FC2, and combine, gated by the trainer's
+  existing Nsight capture boundaries. No computations or synchronization were
+  added. A CPU GEMM-stub test verifies exact output/gradient equality with
+  markers on/off and no NVTX calls outside capture. Full suite: `48 passed,
+  2 skipped` (CUDA unavailable). Actual Vista trace inspection remains pending.
 - For shape-batched Muon: focused CPU correctness tests passed; the full local
   suite passed with `47 passed, 2 skipped`. Momentum matched the old update
   exactly; parameters matched within `2e-4`, approximately one BF16 update ULP

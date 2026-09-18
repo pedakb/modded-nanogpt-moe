@@ -1,10 +1,25 @@
 """Active dense and mixture-of-experts model implementation."""
 
 import math
+from contextlib import nullcontext
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+
+_moe_nsys_capture_active = False
+
+
+def set_moe_nsys_capture_active(active: bool):
+    """Called only at the trainer's Nsight capture boundaries."""
+    global _moe_nsys_capture_active
+    _moe_nsys_capture_active = active
+
+
+def nsys_range(enabled: bool, name: str):
+    """Return an NVTX range only while the opt-in Nsight capture is active."""
+    return torch.cuda.nvtx.range(name) if enabled else nullcontext()
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim):
@@ -233,38 +248,44 @@ class MoE(nn.Module):
         N = x.shape[0]
         device = x.device
 
-        router_logits = self.router(x)
-        routing_weights = F.softmax(router_logits.float(), dim=-1)
-        topk_weights, topk_experts = routing_weights.topk(self.top_k, dim=-1)
-        if self.normalize_topk:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights.type_as(x)
+        with nsys_range(_moe_nsys_capture_active, "moe.router_topk"):
+            router_logits = self.router(x)
+            routing_weights = F.softmax(router_logits.float(), dim=-1)
+            topk_weights, topk_experts = routing_weights.topk(self.top_k, dim=-1)
+            if self.normalize_topk:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights = topk_weights.type_as(x)
 
         # ---- pack assignments by expert ----
-        flat_experts = topk_experts.reshape(-1)                                    # [N*k]
-        flat_tokens = torch.arange(N, device=device).repeat_interleave(self.top_k)  # [N*k]
-        order = torch.argsort(flat_experts, stable=True)
-        sorted_experts = flat_experts[order]
-        x_sorted = x[flat_tokens[order]]  # gather of ACTIVATIONS; never a weight copy
+        with nsys_range(_moe_nsys_capture_active, "moe.pack"):
+            flat_experts = topk_experts.reshape(-1)                                    # [N*k]
+            flat_tokens = torch.arange(N, device=device).repeat_interleave(self.top_k)  # [N*k]
+            order = torch.argsort(flat_experts, stable=True)
+            sorted_experts = flat_experts[order]
+            x_sorted = x[flat_tokens[order]]  # gather of ACTIVATIONS; never a weight copy
 
-        # Required CPU int64 token-count metadata -- explicit D2H sync, see docstring.
-        batch_sizes = torch.bincount(sorted_experts, minlength=self.num_experts).to(torch.int64).cpu()
+            # Required CPU int64 token-count metadata -- explicit D2H sync, see docstring.
+            batch_sizes = torch.bincount(sorted_experts, minlength=self.num_experts).to(torch.int64).cpu()
 
         # Differentiable, contiguous transposed weight stacks (trans_b=False):
         # gradients flow back to self.experts[i].fc/proj.weight exactly as
         # under "loop" -- these are views/copies built fresh per call, not
         # new stored Parameters. trans_b=False is the layout validated end
         # to end on an LS6 A100 with a profiler-confirmed CUTLASS kernel.
-        fc_w = torch.stack([e.fc.weight for e in self.experts]).transpose(-2, -1).contiguous().type_as(x_sorted)
-        fc_b = torch.stack([e.fc.bias for e in self.experts]).type_as(x_sorted)
-        proj_w = torch.stack([e.proj.weight for e in self.experts]).transpose(-2, -1).contiguous().type_as(x_sorted)
-        proj_b = torch.stack([e.proj.bias for e in self.experts]).type_as(x_sorted)
+        with nsys_range(_moe_nsys_capture_active, "moe.stack_params"):
+            fc_w = torch.stack([e.fc.weight for e in self.experts]).transpose(-2, -1).contiguous().type_as(x_sorted)
+            fc_b = torch.stack([e.fc.bias for e in self.experts]).type_as(x_sorted)
+            proj_w = torch.stack([e.proj.weight for e in self.experts]).transpose(-2, -1).contiguous().type_as(x_sorted)
+            proj_b = torch.stack([e.proj.bias for e in self.experts]).type_as(x_sorted)
 
-        h = add_bias_by_expert_segments(
-            self._gmm(x_sorted, fc_w, batch_sizes, trans_b=False), fc_b, batch_sizes)
-        h = h.relu().square()
-        out_sorted = add_bias_by_expert_segments(
-            self._gmm(h.type_as(x_sorted), proj_w, batch_sizes, trans_b=False), proj_b, batch_sizes)
+        with nsys_range(_moe_nsys_capture_active, "moe.fc1"):
+            h = add_bias_by_expert_segments(
+                self._gmm(x_sorted, fc_w, batch_sizes, trans_b=False), fc_b, batch_sizes)
+        with nsys_range(_moe_nsys_capture_active, "moe.activation"):
+            h = h.relu().square()
+        with nsys_range(_moe_nsys_capture_active, "moe.fc2"):
+            out_sorted = add_bias_by_expert_segments(
+                self._gmm(h.type_as(x_sorted), proj_w, batch_sizes, trans_b=False), proj_b, batch_sizes)
 
         # ---- unpermute + weighted combine ----
         # NOTE on optimizer semantics, not just numerics: when an expert
@@ -283,10 +304,11 @@ class MoE(nn.Module):
         # produce a NONZERO parameter update from residual momentum alone.
         # Whether that is benign or causes drift for experts that are
         # repeatedly starved of tokens has not been checked empirically.
-        out_flat = torch.empty_like(out_sorted)
-        out_flat[order] = out_sorted
-        out = (out_flat.view(N, self.top_k, D) * topk_weights.unsqueeze(-1)).sum(dim=1)
-        return out.view(B, T, D)
+        with nsys_range(_moe_nsys_capture_active, "moe.combine"):
+            out_flat = torch.empty_like(out_sorted)
+            out_flat[order] = out_sorted
+            out = (out_flat.view(N, self.top_k, D) * topk_weights.unsqueeze(-1)).sum(dim=1)
+            return out.view(B, T, D)
 
 class Block(nn.Module):
     def __init__(self, dim: int, mlp_type: str = "dense", num_experts: int = 1,
