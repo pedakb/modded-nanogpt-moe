@@ -4,11 +4,11 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-The repository cleanup and the E64/K8 experiment config are committed and
-pushed on `cleanup-active-codebase`; the current base is `d77b5ab` (`Add
-OLMoE-style E64K8 experiment config`). An actual-pipeline Vista benchmark mode,
-launcher, tests, and documentation are currently uncommitted and have not yet
-been exercised on a GPU.
+The repository cleanup, E64/K8 experiment config, and training benchmark are
+committed and pushed on `cleanup-active-codebase`; the current base is
+`e40a2ff` (`Add training throughput benchmark`). Shape-batched Muon updates and
+their correctness test are currently uncommitted and have not yet been timed
+or validated on a GPU.
 
 The cleanup makes `modded_nanogpt_moe` the only active trainer implementation
 and removes upstream trainers, historical records, old kernels/evaluation
@@ -52,9 +52,16 @@ available in Git and on the earlier branches.
   defaults to 10 warmup plus 30 measured updates, synchronizes each measured
   update, resets peak memory after warmup, and excludes validation and durable
   run artifacts.
+- Muon now batches the local rank's same-shaped matrices through one batched
+  Newton--Schulz call per shape while keeping momentum state per parameter and
+  retaining the existing distributed ownership and all-gather order.
 
 ## Verification and experiments
 
+- For shape-batched Muon: focused CPU correctness tests passed; the full local
+  suite passed with `47 passed, 2 skipped`. Momentum matched the old update
+  exactly; parameters matched within `2e-4`, approximately one BF16 update ULP
+  at the tested learning rate. Vista correctness and speed remain pending.
 - For the training benchmark: focused CPU-safe benchmark/launcher tests passed;
   the full local suite passed with `46 passed, 2 skipped`. The skipped checks
   require CUDA and `grouped_gemm`; Vista GH200 timing remains pending.
@@ -102,7 +109,8 @@ available in Git and on the earlier branches.
 
 ## Next steps
 
-1. Benchmark `configs/moe_grouped.toml` and `configs/moe_e64k8_r0.5.toml` on
+1. Validate shape-batched Muon on Vista, then benchmark
+   `configs/moe_grouped.toml` and `configs/moe_e64k8_r0.5.toml` on
    the same Vista GH200 allocation and preserve their console output for a
    direct comparison.
 2. Run a 10--20 update smoke test of `configs/moe_e64k8_r0.5.toml` on an

@@ -45,17 +45,47 @@ class Muon(torch.optim.Optimizer):
         rank = dist.get_rank()
         for group in self.param_groups:
             params = group["params"]
-            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            local_params_by_shape = {}
             for base_i in range(0, len(params), world_size):
                 if base_i + rank < len(params):
                     p = params[base_i + rank]
+                    bucket = (p.shape, p.dtype, p.device)
+                    local_params_by_shape.setdefault(bucket, []).append(p)
+
+            for same_shape_params in local_params_by_shape.values():
+                momentums = []
+                for p in same_shape_params:
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                    momentums.append(state["momentum"])
+
+                if len(same_shape_params) == 1:
+                    p = same_shape_params[0]
+                    update = muon_update(p.grad, momentums[0], mu=group["mu"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
-                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+                    continue
+
+                grad_batch = torch.stack([p.grad for p in same_shape_params])
+                momentum_batch = torch.stack(momentums)
+                update_batch = muon_update(
+                    grad_batch, momentum_batch, mu=group["mu"])
+                torch._foreach_copy_(momentums, momentum_batch.unbind())
+                torch._foreach_mul_(
+                    same_shape_params,
+                    1 - group["lr"] * group["weight_decay"],
+                )
+                torch._foreach_add_(
+                    same_shape_params, update_batch.unbind(), alpha=-group["lr"])
+
+            params_pad = params + [torch.empty_like(params[-1])] * (
+                (-len(params)) % world_size)
+            for base_i in range(0, len(params), world_size):
+                dist.all_gather(
+                    params_pad[base_i:base_i + world_size],
+                    params_pad[base_i + rank],
+                )
 
 
 def build_optimizers(model, config=None):
