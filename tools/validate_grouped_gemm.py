@@ -837,7 +837,7 @@ def benchmark_bias_add_candidates(case, metadata, width, dtype, warmup, iteratio
     label = f"{case['name']}:bias_width_{width}"
     results = {}
     for candidate_name in ("advanced_index", "index_select", "repeat_interleave",
-                           "segment_add_cat", "segment_reduce"):
+                           "segment_add_cat", "triton_segmented_bias"):
         torch.manual_seed(case["seed"] + width)
         values = torch.randn(metadata["assignments"], width, device="cuda", dtype=dtype,
                              requires_grad=True)

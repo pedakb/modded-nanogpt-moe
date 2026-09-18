@@ -185,15 +185,19 @@ class _ExpertSegmentBias(torch.autograd.Function):
         grad_bias = None
         if ctx.needs_input_grad[1]:
             (batch_sizes,) = ctx.saved_tensors
-            # segment_reduce accumulates in its input dtype. Match sum's FP32
-            # accumulation for low-precision inputs rather than summing in BF16.
-            values = (grad_output.float() if grad_output.dtype in
-                      (torch.float16, torch.bfloat16) else grad_output)
-            # Counts come directly from bincount of the sorted assignments:
-            # nonnegative, sum == row count. unsafe skips GPU .item() validation.
-            grad_bias = torch.segment_reduce(
-                values, "sum", lengths=batch_sizes, axis=0, unsafe=True,
-            ).to(grad_output.dtype)
+            if (grad_output.is_cuda and not torch.is_grad_enabled()
+                    and grad_output.dtype in (torch.float16, torch.bfloat16, torch.float32)):
+                from ._segmented_bias import segmented_bias_grad
+                grad_bias = segmented_bias_grad(grad_output, batch_sizes)
+            else:
+                # CPU/double/reference higher-order path. segment_reduce sums in
+                # its input dtype, so low-precision gradients need FP32 promotion.
+                values = (grad_output.float() if grad_output.dtype in
+                          (torch.float16, torch.bfloat16) else grad_output)
+                # Trusted bincount output; unsafe skips GPU .item() validation.
+                grad_bias = torch.segment_reduce(
+                    values, "sum", lengths=batch_sizes, axis=0, unsafe=True,
+                ).to(grad_output.dtype)
         return grad_output if ctx.needs_input_grad[0] else None, grad_bias, None, None
 
 
