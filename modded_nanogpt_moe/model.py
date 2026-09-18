@@ -147,7 +147,7 @@ class MoE(nn.Module):
 
     Correctness of "grouped_gemm" against "loop" (identical weights,
     identical inputs, including E=8/k=2 with deliberately empty experts) was
-    validated in records/track_3_optimization/validate_grouped_gemm.py, then
+    validated in tools/validate_grouped_gemm.py, then
     confirmed on an LS6 A100 in BF16 (all 8 cases, both trans_b layouts, a
     profiler-confirmed CUTLASS GemmGrouped kernel). This class's own
     forward-time packing here is written independently of that harness (no
@@ -176,7 +176,7 @@ class MoE(nn.Module):
                     "(PyPI: nv-grouped-gemm) to be importable in this environment. It is "
                     "NOT a project dependency (not in pyproject.toml/uv.lock) and must be "
                     "installed manually -- see the INSTALL section in "
-                    "records/track_3_optimization/validate_grouped_gemm.py for exact, "
+                    "tools/validate_grouped_gemm.py for exact, "
                     "pinned, architecture-specific build commands. It also requires CUDA "
                     "(no CPU fallback exists in that extension)."
                 ) from e

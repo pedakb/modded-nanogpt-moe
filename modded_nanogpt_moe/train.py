@@ -57,7 +57,6 @@ def read_source_snapshot():
         package_dir / "checkpoint.py",
         package_dir / "config.py",
         package_dir / "train.py",
-        repository_root / "records/track_3_optimization/train_gpt_simple.py",
     ]
     sections = []
     for source_file in source_files:
@@ -257,6 +256,69 @@ def main(argv=None):
     if nsys_profile and checkpointing_requested:
         raise ValueError(
             "combining NSYS_PROFILE with checkpoint/resume is not yet supported")
+
+    data_root_path = Path(data_root).expanduser().resolve()
+    runtime_config = {
+        "config_path": (
+            str(Path(config_path).expanduser().resolve())
+            if config_path is not None else None
+        ),
+        "run_name": run_id,
+        "system": tb_system,
+        "data": {
+            "root": str(data_root_path),
+            "training_shards": [
+                str(path.resolve())
+                for path in sorted(data_root_path.glob(training_shard_pattern))
+            ],
+            "validation_shards": [
+                str(path.resolve())
+                for path in sorted(data_root_path.glob(validation_shard_pattern))
+            ],
+        },
+        "tensorboard": {
+            "enabled": tensorboard_log,
+            "root": (
+                str(Path(tb_root).expanduser().resolve()) if tensorboard_log else None
+            ),
+            "run_directory": (
+                str(tensorboard_run_directory(tb_root, tb_system, run_id).resolve())
+                if tensorboard_log else None
+            ),
+        },
+        "checkpoint": {
+            "enabled": checkpointing_requested,
+            "directory": (
+                str(Path(checkpoint_dir).expanduser().resolve())
+                if checkpoint_dir else None
+            ),
+            "interval": checkpoint_interval,
+            "resume": (
+                str(Path(resume_checkpoint_path).expanduser().resolve())
+                if resume_checkpoint_path else None
+            ),
+            "stop_after_completed_updates": stop_after_updates,
+        },
+        "profiling": {
+            "nsys_enabled": nsys_profile,
+            "warmup_steps": nsys_warmup_steps,
+            "active_steps": nsys_active_steps,
+        },
+        "distributed": {
+            "world_size": dist.get_world_size(),
+            "device": str(device),
+        },
+    }
+    startup_environment = collect_environment_metadata()
+    print0(
+        "Resolved runtime settings:\n"
+        + json.dumps(
+            {"runtime": runtime_config, "environment": startup_environment},
+            indent=2,
+            sort_keys=True,
+        ),
+        console=True,
+    )
     model = GPT(vocab_size=model_config["vocab_size"],
                 num_layers=model_config["num_layers"], model_dim=model_dim, mlp_type=mlp_type,
                 num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
@@ -293,8 +355,10 @@ def main(argv=None):
     else:
         raise ValueError(f"unknown mlp_type: {mlp_type!r}")
     
-    environment_metadata = (
-        collect_environment_metadata() if checkpointing_requested else None)
+    environment_metadata = None
+    if checkpointing_requested:
+        environment_metadata = dict(startup_environment)
+        environment_metadata["runtime"] = runtime_config
     stopped_early = False
     for trial_idx in range(num_trials):
     

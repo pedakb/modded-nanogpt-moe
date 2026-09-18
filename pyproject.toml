@@ -13,6 +13,7 @@ dependencies = [
     "typing-extensions==4.15.0",
     "datasets",
     "tiktoken",
+    "tensorboard>=2.21.0",
 ]
 
 [dependency-groups]
