@@ -4,10 +4,13 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-The current base on `cleanup-active-codebase` is `c87706a` (`Batch Muon updates
-by parameter shape`). Fine-grained grouped-MoE NVTX instrumentation is now
-uncommitted in model.py/train.py with a CPU regression test in tests/test_moe.py.
-Vista profiling and batched-Muon GPU validation remain pending.
+The current base on `cleanup-active-codebase` is `568096f` (`Add fine-grained
+MoE NVTX profiling`). That commit omitted the trainer wiring, which remained
+uncommitted locally; Vista therefore never enabled the MoE ranges. The pending
+train.py diff includes the capture-start/stop flag calls and resets both flags
+in finally blocks on both stop paths. tests/test_nsys.py exercises the actual
+trainer boundary blocks with mocked CUDA calls. Include train.py when committing
+this fix; Vista trace verification and batched-Muon GPU validation remain pending.
 
 The cleanup makes `modded_nanogpt_moe` the only active trainer implementation
 and removes upstream trainers, historical records, old kernels/evaluation
@@ -57,6 +60,11 @@ available in Git and on the earlier branches.
 
 ## Verification and experiments
 
+- Trainer NVTX integration fix: `8 passed` focused; full suite `56 passed,
+  2 skipped` (CUDA unavailable); `git diff --check` passed. Tests check updates
+  11/12, disabled profiling, normal/early stops, and flag reset when synchronize
+  or profiler.stop raises. Rerun the Vista capture and inspect all seven moe.*
+  ranges after the complete fix is committed and deployed.
 - Grouped-MoE NVTX ranges cover router/top-k, packing (including CPU counts),
   parameter stacking, FC1, activation, FC2, and combine, gated by the trainer's
   existing Nsight capture boundaries. No computations or synchronization were

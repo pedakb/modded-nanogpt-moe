@@ -7,7 +7,6 @@ import statistics
 import sys
 import time
 import uuid
-from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -26,13 +25,11 @@ from .checkpoint import (
 )
 from .config import parse_train_args
 from .data import distributed_data_generator
-from .model import GPT, eager_prefix, make_head_loss, resolve_mlp_hidden_dim
+from .model import (
+    GPT, eager_prefix, make_head_loss, nsys_range, resolve_mlp_hidden_dim,
+    set_moe_nsys_capture_active,
+)
 from .optim import build_optimizers
-
-
-def nsys_range(enabled: bool, name: str):
-    """Return an NVTX range only while the opt-in Nsight capture is active."""
-    return torch.cuda.nvtx.range(name) if enabled else nullcontext()
 
 
 def benchmark_settings_from_environment(environment=None):
@@ -674,6 +671,7 @@ def main(argv=None):
                 print0(f"Nsight Systems capture starting before update {step + 1}", console=True)
                 torch.cuda.profiler.start()
                 nsys_capture_active = True
+                set_moe_nsys_capture_active(True)
 
             benchmark_step_started = None
             if benchmark["enabled"] and step == benchmark["warmup_updates"]:
@@ -771,9 +769,12 @@ def main(argv=None):
     
             if (nsys_capture_active
                     and step + 1 == nsys_warmup_steps + nsys_active_steps):
-                torch.cuda.synchronize()
-                torch.cuda.profiler.stop()
-                nsys_capture_active = False
+                try:
+                    torch.cuda.synchronize()
+                    torch.cuda.profiler.stop()
+                finally:
+                    nsys_capture_active = False
+                    set_moe_nsys_capture_active(False)
                 print0(f"Nsight Systems capture ended after update {step + 1}", console=True)
             approx_training_time = training_time + (time.perf_counter() - t0)
             if not benchmark["enabled"]:
@@ -831,9 +832,12 @@ def main(argv=None):
     
             if completed_updates == stop_after_updates:
                 if nsys_capture_active:
-                    torch.cuda.synchronize()
-                    torch.cuda.profiler.stop()
-                    nsys_capture_active = False
+                    try:
+                        torch.cuda.synchronize()
+                        torch.cuda.profiler.stop()
+                    finally:
+                        nsys_capture_active = False
+                        set_moe_nsys_capture_active(False)
                     print0(
                         f"Nsight Systems capture ended early after update {completed_updates}",
                         console=True,
