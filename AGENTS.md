@@ -35,21 +35,25 @@ trainer implementation or a legacy wrapper unless compatibility requires it.
 
 ## Scientific and implementation invariants
 
-- Dense and expert feed-forward layers use the same `MLP` implementation,
-  including biases and ReLU-squared. The default expansion ratio is 4.
+- Dense and default expert feed-forward layers use the same `MLP` implementation,
+  including biases and ReLU-squared. Packed experts preserve this computation
+  and initialization with different storage. The default expansion ratio is 4.
 - Resolve `hidden_dim = model_dim * mlp_ratio` exactly. Reject invalid or
   fractional products; never silently truncate or divide width by `top_k`.
 - Keep `mlp_ratio`, `num_experts`, and `top_k` independent.
 - Preserve model parameter names, order, initialization, and checkpoint keys
-  unless a migration is explicitly requested. Experts remain an
-  `nn.ModuleList` for both MoE backends.
+  unless a migration is explicitly requested. Experts default to an
+  `nn.ModuleList` for both MoE backends. Experimental
+  `model.moe_parameter_layout = "packed"` requires grouped GEMM, stores native
+  `[E,D,H]`/`[E,H,D]` weights, and has explicitly incompatible checkpoint keys.
 - Routing uses FP32 softmax followed by top-k selection and optional top-k
   renormalization. Execution is dropless: no capacity limit, padding, or token
   dropping. Preserve router, expert-weight, bias, input-gradient, and empty-
   expert behavior in parity tests.
-- The production grouped backend uses `trans_b=False`, stacks the existing
-  expert parameters differentiably, adds biases by contiguous expert segments,
-  and combines every routed assignment. Do not add an E=1 shortcut.
+- The grouped backend uses `trans_b=False`, stacks ModuleList parameters
+  differentiably (or reads packed parameters), adds biases by contiguous expert
+  segments, and combines every routed assignment. Preserve activation-dtype
+  casts with FP32 master parameters. Do not add an E=1 shortcut.
 - Dense training compiles the complete model. MoE keeps the transformer prefix
   eager and independently compiles the head/loss. This boundary prevents the
   softcap/head-loss OOM and must not be casually changed.
@@ -58,7 +62,11 @@ trainer implementation or a legacy wrapper unless compatibility requires it.
   rate schedule.
 - Preserve optimizer membership and order: AdamW handles embedding, head, and
   parameters with fewer than two dimensions; Muon handles block parameters
-  with at least two dimensions. Muon momentum is persistent checkpoint state.
+  with at least two dimensions. Exception: packed 2D biases stay in AdamW;
+  packed 3D weights are E independent matrices under Muon, in the reference
+  `[out,in]` orientation, including its aspect-ratio scale and 12 Newton--Schulz
+  iterations. Muon momentum is persistent checkpoint state. Reconstruct packed
+  orientation metadata through `build_optimizers` when loading a checkpoint.
 - Attention defaults to `head_dim=128` and must reject configurations that
   produce zero heads before scaled-dot-product attention executes.
 - Checkpoints are written only after completed optimizer updates with cleared

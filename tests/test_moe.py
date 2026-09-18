@@ -6,7 +6,9 @@ The model package is import-safe and does not initialize CUDA or distributed
 training as a side effect.
 """
 import importlib.util
+import sys
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -317,12 +319,11 @@ def test_grouped_gemm_backend_rejects_unknown_backend_name():
         MoE(16, num_experts=2, top_k=1, moe_backend="not_a_real_backend")
 
 
-def test_grouped_moe_nvtx_capture_preserves_outputs_and_gradients(monkeypatch):
+@pytest.mark.parametrize("layout", ["modulelist", "packed"])
+def test_grouped_moe_nvtx_capture_preserves_outputs_and_gradients(monkeypatch, layout):
     # Exercise the production grouped forward on CPU with a test-only GEMM stub.
     # This verifies instrumentation, not the CUDA extension's correctness.
     torch.manual_seed(42)
-    moe = MoE(8, num_experts=3, top_k=2)
-
     def gmm(inputs, weights, counts, trans_b):
         assert trans_b is False
         return torch.cat([
@@ -330,7 +331,9 @@ def test_grouped_moe_nvtx_capture_preserves_outputs_and_gradients(monkeypatch):
             for segment, weight in zip(inputs.split(counts.tolist()), weights)
         ])
 
-    moe._gmm = gmm
+    monkeypatch.setitem(sys.modules, "grouped_gemm", SimpleNamespace(ops=SimpleNamespace(gmm=gmm)))
+    moe = MoE(8, num_experts=3, top_k=2, moe_backend="grouped_gemm",
+              moe_parameter_layout=layout)
     events = []
     backward_events = []
     range_stack = []

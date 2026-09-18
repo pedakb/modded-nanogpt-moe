@@ -197,7 +197,8 @@ class MoE(nn.Module):
     exactly to a single MLP: softmax over one logit is always 1, so expert 0 receives
     every token with routing weight 1.
 
-    moe_backend selects HOW self.experts is executed, not how it is stored:
+    With the default moe_parameter_layout="modulelist", moe_backend selects
+    HOW self.experts is executed, not how it is stored:
       "loop" (default): the original Python loop over experts, unchanged.
       "grouped_gemm": packs tokens by expert and calls the fanshiqing/
         grouped_gemm CUDA extension (package `grouped_gemm`, PyPI
@@ -207,8 +208,13 @@ class MoE(nn.Module):
         p.ndim/p.shape. grouped_gemm only changes how those Parameters are
         *read* at forward time (stacked into one tensor per matmul, freshly
         every call -- see _forward_grouped_gemm's docstring for the two
-        costs specific to this that are not present in "loop", neither
-        benchmarked yet).
+        costs specific to this that are not present in "loop").
+
+    Experimental moe_parameter_layout="packed" requires grouped_gemm and stores
+    FC/projection weights directly as [E,D,H]/[E,H,D], with [E,H]/[E,D] biases.
+    It preserves expert initialization and computation but has different state
+    keys. Optimizer construction explicitly assigns packed biases to AdamW and
+    interprets packed weights as independent transposed expert matrices in Muon.
 
     Correctness of "grouped_gemm" against "loop" (identical weights,
     identical inputs, including E=8/k=2 with deliberately empty experts) was
@@ -219,16 +225,40 @@ class MoE(nn.Module):
     import from it) but implements the same validated pipeline against the
     production nn.ModuleList instead of a separate ParameterList."""
     def __init__(self, dim: int, num_experts: int, top_k: int, normalize_topk: bool = True,
-                 moe_backend: str = "loop", hidden_dim: int | None = None):
+                 moe_backend: str = "loop", hidden_dim: int | None = None,
+                 moe_parameter_layout: str = "modulelist"):
         super().__init__()
         assert 1 <= top_k <= num_experts
         assert moe_backend in ("loop", "grouped_gemm"), f"unknown moe_backend: {moe_backend!r}"
+        if moe_parameter_layout not in ("modulelist", "packed"):
+            raise ValueError(f"unknown moe_parameter_layout: {moe_parameter_layout!r}")
+        if moe_parameter_layout == "packed" and moe_backend != "grouped_gemm":
+            raise ValueError("packed parameters require moe_backend='grouped_gemm'")
         self.num_experts = num_experts
         self.top_k = top_k
         self.normalize_topk = normalize_topk
         self.moe_backend = moe_backend
+        self.moe_parameter_layout = moe_parameter_layout
         self.router = Linear(dim, num_experts)
-        self.experts = nn.ModuleList(MLP(dim, hidden_dim) for _ in range(num_experts))
+        if moe_parameter_layout == "modulelist":
+            self.experts = nn.ModuleList(MLP(dim, hidden_dim) for _ in range(num_experts))
+        else:
+            hidden_dim = 4 * dim if hidden_dim is None else hidden_dim
+            if isinstance(hidden_dim, bool) or not isinstance(hidden_dim, int) or hidden_dim <= 0:
+                raise ValueError(f"hidden_dim must be a positive integer, got {hidden_dim!r}")
+            self.fc_weight = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
+            self.fc_bias = nn.Parameter(torch.empty(num_experts, hidden_dim))
+            self.proj_weight = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
+            self.proj_bias = nn.Parameter(torch.empty(num_experts, dim))
+            # Preserve nn.Linear constructor initialization and RNG order exactly.
+            # Temporary experts are discarded; none are stored or built in forward.
+            with torch.no_grad():
+                for index in range(num_experts):
+                    expert = MLP(dim, hidden_dim)
+                    self.fc_weight[index].copy_(expert.fc.weight.mT)
+                    self.fc_bias[index].copy_(expert.fc.bias)
+                    self.proj_weight[index].copy_(expert.proj.weight.mT)
+                    self.proj_bias[index].copy_(expert.proj.bias)
         if moe_backend == "grouped_gemm":
             # Imported only when this backend is selected -- "loop" (the
             # default) never touches this import, and dense models never
@@ -279,19 +309,18 @@ class MoE(nn.Module):
         execution differs. Dropless: every one of the N*top_k assignments is
         computed, no capacity limit, no token dropping, no padding.
 
-        Two costs specific to this backend that _forward_loop does not have,
-        NEITHER benchmarked yet (no speedup or memory-feasibility claim is
-        made anywhere in this module):
+        Backend-specific costs (no speedup claim is made here):
           - batch_sizes.cpu() below is a required device-to-host
             synchronization -- grouped_gemm's C++ extension asserts its
             token-count tensor is CPU-resident int64. This happens once per
             MoE layer per forward call (so once per layer per microbatch,
             i.e. num_layers times per training step).
-          - the four torch.stack(...) calls (two of which also
+          - in the default ModuleList layout, four torch.stack(...) calls (two also
             .transpose(-2,-1).contiguous()) rebuild the [E, ...] weight
             tensors from self.experts fresh on every call rather than
             caching them across calls -- O(num_experts) extra allocation
-            and copy per matmul per layer per call.
+            and copy per matmul per layer per call. Packed layout avoids these
+            reconstructions, but retains master-parameter-to-activation dtype casts.
         """
         B, T, D = x.shape
         x = x.view(-1, D)
@@ -317,16 +346,21 @@ class MoE(nn.Module):
             # Required CPU int64 token-count metadata -- explicit D2H sync, see docstring.
             batch_sizes = torch.bincount(sorted_experts, minlength=self.num_experts).to(torch.int64).cpu()
 
-        # Differentiable, contiguous transposed weight stacks (trans_b=False):
-        # gradients flow back to self.experts[i].fc/proj.weight exactly as
-        # under "loop" -- these are views/copies built fresh per call, not
-        # new stored Parameters. trans_b=False is the layout validated end
-        # to end on an LS6 A100 with a profiler-confirmed CUTLASS kernel.
+        # Both layouts supply contiguous [E,in,out] weights for trans_b=False.
+        # Keep the existing range name for comparison; packed only casts dtype.
         with nsys_range(_moe_nsys_capture_active, "moe.stack_params"):
-            fc_w = torch.stack([e.fc.weight for e in self.experts]).transpose(-2, -1).contiguous().type_as(x_sorted)
-            fc_b = torch.stack([e.fc.bias for e in self.experts]).type_as(x_sorted)
-            proj_w = torch.stack([e.proj.weight for e in self.experts]).transpose(-2, -1).contiguous().type_as(x_sorted)
-            proj_b = torch.stack([e.proj.bias for e in self.experts]).type_as(x_sorted)
+            if self.moe_parameter_layout == "packed":
+                # Preserve FP32 master parameters and the existing activation-dtype
+                # conversion, without stack/transpose/contiguous reconstruction.
+                fc_w = self.fc_weight.type_as(x_sorted)
+                fc_b = self.fc_bias.type_as(x_sorted)
+                proj_w = self.proj_weight.type_as(x_sorted)
+                proj_b = self.proj_bias.type_as(x_sorted)
+            else:
+                fc_w = torch.stack([e.fc.weight for e in self.experts]).transpose(-2, -1).contiguous().type_as(x_sorted)
+                fc_b = torch.stack([e.fc.bias for e in self.experts]).type_as(x_sorted)
+                proj_w = torch.stack([e.proj.weight for e in self.experts]).transpose(-2, -1).contiguous().type_as(x_sorted)
+                proj_b = torch.stack([e.proj.bias for e in self.experts]).type_as(x_sorted)
 
         with nsys_range(_moe_nsys_capture_active, "moe.fc1"):
             h_pre = add_bias_by_expert_segments(
@@ -366,14 +400,15 @@ class MoE(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, mlp_type: str = "dense", num_experts: int = 1,
                  top_k: int = 1, normalize_topk: bool = True, moe_backend: str = "loop",
-                 hidden_dim: int | None = None):
+                 hidden_dim: int | None = None, moe_parameter_layout: str = "modulelist"):
         super().__init__()
         self.attn = CausalSelfAttention(dim)
         if mlp_type == "dense":
             self.mlp = MLP(dim, hidden_dim)
         elif mlp_type == "moe":
             self.mlp = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
-                            moe_backend=moe_backend, hidden_dim=hidden_dim)
+                            moe_backend=moe_backend, hidden_dim=hidden_dim,
+                            moe_parameter_layout=moe_parameter_layout)
         else:
             raise ValueError(f"unknown mlp_type: {mlp_type!r}")
         self.norm1 = RMSNorm(dim)
@@ -387,17 +422,23 @@ class Block(nn.Module):
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, mlp_type: str = "dense",
                  num_experts: int = 1, top_k: int = 1, normalize_topk: bool = True,
-                 moe_backend: str = "loop", mlp_ratio: float = 4):
+                 moe_backend: str = "loop", mlp_ratio: float = 4,
+                 moe_parameter_layout: str = "modulelist"):
         super().__init__()
+        if moe_parameter_layout not in ("modulelist", "packed"):
+            raise ValueError(f"unknown moe_parameter_layout: {moe_parameter_layout!r}")
+        if moe_parameter_layout == "packed" and (mlp_type != "moe" or moe_backend != "grouped_gemm"):
+            raise ValueError("packed parameters require grouped_gemm MoE")
         hidden_dim = resolve_mlp_hidden_dim(model_dim, mlp_ratio)
         self.model_dim = model_dim
         self.mlp_ratio = mlp_ratio
         self.hidden_dim = hidden_dim
+        self.moe_parameter_layout = moe_parameter_layout
         self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
         self.blocks = nn.ModuleList([
             Block(model_dim, mlp_type=mlp_type, num_experts=num_experts, top_k=top_k,
                   normalize_topk=normalize_topk, moe_backend=moe_backend,
-                  hidden_dim=hidden_dim)
+                  hidden_dim=hidden_dim, moe_parameter_layout=moe_parameter_layout)
             for _ in range(num_layers)
         ])
         self.proj = Linear(model_dim, vocab_size)
@@ -411,6 +452,48 @@ class GPT(nn.Module):
         logits = self.proj(self.norm2(x)).float()
         logits = 15 * logits * (logits.square() + 15**2).rsqrt()
         return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+
+
+@torch.no_grad()
+def initialize_model_parameters(model):
+    """Trainer initialization, preserving the reference expert RNG draw order."""
+    packed = {
+        module.router.bias: module for module in model.modules()
+        if isinstance(module, MoE) and module.moe_parameter_layout == "packed"
+    }
+    packed_parameters = {
+        p for module in packed.values()
+        for p in (module.fc_weight, module.fc_bias, module.proj_weight, module.proj_bias)
+    }
+    for name, p in model.named_parameters():
+        if p in packed_parameters:
+            continue
+        w = p.data
+        if name.endswith("weight"):
+            if "proj" in name:
+                w.zero_()
+            elif "embed" in name:
+                w.normal_()
+            else:
+                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)
+        elif name.endswith("bias"):
+            w.zero_()
+        elif name.endswith("gains"):
+            w.normal_(mean=1, std=0)
+        else:
+            raise Exception(f"Uninitialized parameter: {name}")
+        if p in packed:
+            module = packed[p]
+            # Draw each FC weight in its original contiguous [H,D] order, after
+            # router initialization, exactly where ModuleList traversal drew it.
+            for index in range(module.num_experts):
+                weight = torch.empty_like(module.fc_weight[index].mT,
+                                          memory_format=torch.contiguous_format)
+                weight.normal_(std=0.33**0.5 / weight.size(-1)**0.5)
+                module.fc_weight[index].copy_(weight.mT)
+                module.fc_bias[index].zero_()
+                module.proj_weight[index].zero_()
+                module.proj_bias[index].zero_()
 
 
 def eager_prefix(model: "GPT", inputs: Tensor) -> Tensor:

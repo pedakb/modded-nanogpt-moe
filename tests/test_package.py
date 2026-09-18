@@ -10,7 +10,7 @@ from torch.optim import AdamW
 
 from modded_nanogpt_moe.checkpoint import restore_training_checkpoint
 from modded_nanogpt_moe.config import load_experiment_config, parse_train_args
-from modded_nanogpt_moe.model import GPT, resolve_mlp_hidden_dim
+from modded_nanogpt_moe.model import GPT, initialize_model_parameters, resolve_mlp_hidden_dim
 from modded_nanogpt_moe.optim import Muon, build_optimizers
 from modded_nanogpt_moe.train import (
     benchmark_settings_from_environment,
@@ -134,7 +134,7 @@ def test_extracted_models_match_committed_baseline_exactly(baseline_module, mode
     torch.manual_seed(17)
     _initialize_like_trainer(baseline)
     torch.manual_seed(17)
-    _initialize_like_trainer(extracted)
+    initialize_model_parameters(extracted)
     for name, value in baseline.state_dict().items():
         torch.testing.assert_close(value, extracted.state_dict()[name], rtol=0, atol=0)
 
@@ -315,6 +315,7 @@ def test_dense_example_config_resolves_current_training_defaults():
         "top_k": 1,
         "normalize_topk": True,
         "moe_backend": "loop",
+        "moe_parameter_layout": "modulelist",
     }
     assert config["training"]["global_batch_tokens"] == 524288
     assert config["training"]["microbatch_sequences"] == 64

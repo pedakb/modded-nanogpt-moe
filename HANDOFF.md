@@ -4,11 +4,60 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-The current base on `cleanup-active-codebase` is `3c02a77` (`Wire MoE NVTX ranges
-into Nsight capture`). The trainer capture-gate fix is committed. Pending changes
-add grouped-MoE backward boundary hooks in model.py, tests in tests/test_moe.py,
-and this handoff update. Vista backward trace verification and batched-Muon GPU
-validation remain pending.
+The current base on `cleanup-active-codebase` is `02706ae` (`Instrument MoE
+backward for Nsight`). Pending, uncommitted work adds opt-in packed expert
+parameters; no training or remote jobs were launched. Modified: model, config,
+optimizers, trainer, existing package/MoE tests, AGENTS.md, and this handoff.
+New: `tests/test_packed_experts.py` and `configs/moe_e64k8_r0.5_packed.toml`.
+Dependencies and existing experiment configs are unchanged. GPU correctness,
+packed resume in a real training job, and performance remain pending.
+
+## Packed-layout experiment
+
+- `model.moe_parameter_layout` defaults to `"modulelist"`; `"packed"` requires
+  grouped-GEMM MoE. Packed weights are `[E,D,H]` / `[E,H,D]`, biases `[E,H]` /
+  `[E,D]`. Forward reads these directly (retaining FP32-master to activation-
+  dtype casts); it does not stack or transpose/contiguous-reconstruct weights.
+  Routing, segmented bias addition, ReLU², compilation and both sets of NVTX
+  ranges are unchanged. The existing `moe.stack_params` range covers dtype
+  preparation in the packed path for comparison.
+- Constructor and training initialization preserve the original expert-wise
+  random draws, scales, zero projections/biases, and RNG order. Trainer
+  initialization is now shared in `initialize_model_parameters`.
+- Packed biases stay in AdamW despite being 2D. Packed weights use Muon as E
+  independent matrices, including independent momentum slices, unchanged
+  hyperparameters and 12 NS iterations. Muon must use the original `[out,in]`
+  orientation: applying its aspect-ratio scale to native packed axes is wrong.
+  It uses contiguous transposed gradient/momentum workspaces per packed
+  parameter and copies momentum back. This avoids cross-layer stacking but
+  retains optimizer copies deliberately; initial strided-view tests showed a
+  maximum parameter discrepancy of 4.8831e-5 in the first failing tensor.
+  Canonical workspaces made the two-update CPU comparisons exact, without
+  loosening tolerances. Benchmark the net effect; no speedup is established.
+- Default model keys, optimizer ordering, and checkpoint format/config remain
+  unchanged. Only packed checkpoint configs add the layout key, so cross-layout
+  resume fails compatibility checks. Rebuild optimizers with `build_optimizers`
+  to restore packed orientation metadata; there is no checkpoint converter.
+- The packed E64/K8 config differs from `moe_e64k8_r0.5.toml` only in run name
+  and layout. D=768, H=384, global batch=524288, microbatch=64, horizon=3500.
+
+Pending Vista validation, from the repository root on an allocated GH200:
+
+```bash
+cd "$WORK/projects/modded-nanogpt-moe"
+module load nvidia/25.3 cuda/12.9
+export CC=/usr/bin/gcc CXX=/usr/bin/g++
+uv run --no-sync python -m pytest -q -rs tests
+# Only after correctness passes; run sequentially on the same allocation.
+scripts/vista/benchmark.sh configs/moe_e64k8_r0.5.toml
+scripts/vista/benchmark.sh configs/moe_e64k8_r0.5_packed.toml
+```
+
+The benchmark wrapper uses the real trainer, 10 warmup + 30 measured updates,
+and disables TensorBoard/artifacts. Unset experiment/checkpoint/Nsight overrides
+that the wrapper rejects. Profile separately to compare fc1/fc2 backward and
+optimizer work; the reported 0.54 s vs 3.04 s FC backward figures came from the
+user's prior E8/K2 versus E64/K8 ModuleList traces, not this patch.
 
 The cleanup makes `modded_nanogpt_moe` the only active trainer implementation
 and removes upstream trainers, historical records, old kernels/evaluation
@@ -29,7 +78,7 @@ available in Git and on the earlier branches.
   checked-in `configs/moe_grouped.toml` remains unchanged at 3250 steps.
 - Dense uses whole-model compilation. MoE uses an eager transformer prefix and
   independently compiled head/loss to avoid the prior softcap OOM.
-- Grouped MoE preserves the expert `ModuleList`, dropless routing,
+- Default grouped MoE preserves the expert `ModuleList`, dropless routing,
   `trans_b=False`, and segmented bias addition that avoids indexing backward.
 - Checkpoint/resume includes model, both optimizers, loader cursor, schedule,
   counters, RNG, timing, identity, and metadata with atomic latest/previous
@@ -58,6 +107,17 @@ available in Git and on the earlier branches.
 
 ## Verification and experiments
 
+- Packed layout: local full suite `79 passed, 12 skipped`; CUDA is unavailable
+  on this Mac. `git diff --check` passed. CPU checks cover E8/K2 and E64/K8:
+  exact constructor/training initialization and RNG, outputs, input/router/all
+  expert gradients (including BF16 activations and empty-expert zeros), two
+  AdamW/Muon steps with slice-wise state checks, packed checkpoint restoration,
+  old baseline checkpoints/grouping, and balanced capture on/off NVTX ranges.
+  A CPU simulation covers two-rank ownership/gather ordering, not real NCCL.
+  Skipped tests cover real CUDA grouped GEMM at D=768/H=1536 or H=384 with
+  FP32/BF16 masters, CUDA initialization, and CUDA optimizer parity. Existing
+  CUDA tolerance/dtype checks are unchanged; CPU and optimizer assertions are
+  exact. No GH200 speedup or end-to-end packed resume claim is made.
 - Backward instrumentation: full local suite `60 passed, 2 skipped` (CUDA
   unavailable); `git diff --check` passed. Tests verify exact outputs and all
   gradients with capture on/off, no inactive/no-grad hook installation, reverse
@@ -131,10 +191,10 @@ available in Git and on the earlier branches.
 
 ## Next steps
 
-1. Validate shape-batched Muon on Vista, then benchmark
-   `configs/moe_grouped.toml` and `configs/moe_e64k8_r0.5.toml` on
-   the same Vista GH200 allocation and preserve their console output for a
-   direct comparison.
+1. Review the packed-layout diff, then run the Vista correctness/benchmark
+   commands above. Verify actual multi-rank behavior separately if needed.
+   Compare the two E64/K8 layouts before drawing conclusions about the original
+   E8/K2 versus E64/K8 bottleneck. Preserve console output and profile separately.
 2. Run a 10--20 update smoke test of `configs/moe_e64k8_r0.5.toml` on an
    existing Vista idev GH200 node using `TRAIN_STEPS_OVERRIDE`; this preserves
    the config's full-run schedule outside the smoke invocation.

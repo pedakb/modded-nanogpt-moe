@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 from torch.optim import AdamW
+from .model import MoE
 
 def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     assert G.ndim >= 2
@@ -33,11 +34,13 @@ def muon_update(grad, momentum, mu=0.95, nesterov=True):
     return update
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, transposed_params=()):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
         super().__init__(params, defaults)
+        # Layout metadata comes from model construction, not optimizer state.
+        self.transposed_params = set(transposed_params)
 
     @torch.no_grad()
     def step(self):
@@ -59,6 +62,23 @@ class Muon(torch.optim.Optimizer):
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
                     momentums.append(state["momentum"])
+
+                if same_shape_params[0].ndim == 3:
+                    # Each packed parameter already batches E independent matrices.
+                    # No restacking across layers. Use the reference contiguous
+                    # [out,in] orientation for Muon's asymmetric aspect-ratio
+                    # scale and BF16 reduction order. These optimizer workspaces
+                    # also keep muon_update's in-place lerp off packed gradients.
+                    for p, momentum in zip(same_shape_params, momentums):
+                        transposed = p in self.transposed_params
+                        grad = p.grad.mT.contiguous() if transposed else p.grad
+                        momentum_batch = momentum.mT.contiguous() if transposed else momentum
+                        update = muon_update(grad, momentum_batch, mu=group["mu"])
+                        if transposed:
+                            momentum.copy_(momentum_batch.mT)
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                        p.add_(update.mT if transposed else update, alpha=-group["lr"])
+                    continue
 
                 if len(same_shape_params) == 1:
                     p = same_shape_params[0]
@@ -102,13 +122,22 @@ def build_optimizers(model, config=None):
     adamw = config["adamw"]
     muon = config["muon"]
     embed_lr, head_lr, scalar_lr = adamw["group_lrs"]
+    packed_experts = [module for module in model.modules()
+                      if isinstance(module, MoE) and module.moe_parameter_layout == "packed"]
+    packed_biases = {p for module in packed_experts
+                     for p in (module.fc_bias, module.proj_bias)}
+    packed_weights = {p for module in packed_experts
+                      for p in (module.fc_weight, module.proj_weight)}
     optimizer1 = AdamW([dict(params=[model.embed.weight], lr=embed_lr),
                         dict(params=[model.proj.weight], lr=head_lr),
-                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=scalar_lr)],
+                        dict(params=[p for p in model.parameters()
+                                     if p.ndim < 2 or p in packed_biases], lr=scalar_lr)],
                        betas=tuple(adamw["betas"]), eps=adamw["eps"],
                        weight_decay=adamw["weight_decay"], fused=adamw["fused"])
-    optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=muon["lr"], weight_decay=muon["weight_decay"], mu=muon["mu"])
+    optimizer2 = Muon([p for p in model.blocks.parameters()
+                       if p.ndim >= 2 and p not in packed_biases],
+                      lr=muon["lr"], weight_decay=muon["weight_decay"], mu=muon["mu"],
+                      transposed_params=packed_weights)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())

@@ -26,7 +26,7 @@ from .checkpoint import (
 from .config import parse_train_args
 from .data import distributed_data_generator
 from .model import (
-    GPT, eager_prefix, make_head_loss, nsys_range, resolve_mlp_hidden_dim,
+    GPT, eager_prefix, initialize_model_parameters, make_head_loss, nsys_range, resolve_mlp_hidden_dim,
     set_moe_nsys_capture_active,
 )
 from .optim import build_optimizers
@@ -391,11 +391,13 @@ def main(argv=None):
     model = GPT(vocab_size=model_config["vocab_size"],
                 num_layers=model_config["num_layers"], model_dim=model_dim, mlp_type=mlp_type,
                 num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
-                moe_backend=moe_backend, mlp_ratio=mlp_ratio)
+                moe_backend=moe_backend, mlp_ratio=mlp_ratio,
+                moe_parameter_layout=model_config["moe_parameter_layout"])
     assert model.hidden_dim == hidden_dim
     print0(
         f"configuration: model_dim={model.model_dim} mlp_ratio={float(model.mlp_ratio):g} "
         f"hidden_dim={model.hidden_dim} model_type={mlp_type} moe_backend={moe_backend} "
+        f"moe_parameter_layout={model.moe_parameter_layout} "
         f"E={num_experts} k={top_k} microbatch={mbs} "
         f"global_batch={batch_size} accumulation_count={accumulation_count} "
         f"trial_count={num_trials}",
@@ -456,21 +458,7 @@ def main(argv=None):
                 "training.total_steps schedule horizon")
     
         # initialize model parameters
-        for name, p in model.named_parameters():
-            w = p.data
-            if name.endswith("weight"):
-                if "proj" in name:
-                    w.zero_()
-                elif "embed" in name:
-                    w.normal_()  # default torch init
-                else:
-                    w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
-            elif name.endswith("bias"):
-                w.zero_()
-            elif name.endswith("gains"):
-                w.normal_(mean=1, std=0)
-            else:
-                raise Exception(f"Uninitialized parameter: {name}")
+        initialize_model_parameters(model)
     
         # create the optimizer(s)
         optimizers = build_optimizers(model, optimizer_config)
@@ -518,6 +506,10 @@ def main(argv=None):
             },
             "seed_override": seed,
         }
+        # Keep default checkpoint config/state formats identical to older runs.
+        # Packed checkpoints explicitly record their incompatible storage layout.
+        if model.moe_parameter_layout != "modulelist":
+            resolved_config["model"]["moe_parameter_layout"] = model.moe_parameter_layout
     
     
         ########################################
@@ -866,6 +858,7 @@ def main(argv=None):
                 "Training benchmark result:\n"
                 f"  model_dim={model.model_dim} hidden_dim={model.hidden_dim} "
                 f"E={num_experts} k={top_k} backend={moe_backend}\n"
+                f"  moe_parameter_layout={model.moe_parameter_layout}\n"
                 f"  warmup_updates={benchmark['warmup_updates']} "
                 f"measured_updates={benchmark['measured_updates']}\n"
                 f"  mean_ms/update={summary['mean_ms_per_update']:.3f}\n"

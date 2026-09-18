@@ -22,6 +22,7 @@ DEFAULT_CONFIG = {
         "top_k": 1,
         "normalize_topk": True,
         "moe_backend": "loop",
+        "moe_parameter_layout": "modulelist",
     },
     "training": {
         "sequence_length": 1024,
@@ -105,6 +106,13 @@ def validate_experiment_config(config, require_run_name=False):
         raise ValueError("model.mlp_type must be 'dense' or 'moe'")
     if config["model"]["moe_backend"] not in ("loop", "grouped_gemm"):
         raise ValueError("model.moe_backend must be 'loop' or 'grouped_gemm'")
+    layout = config["model"]["moe_parameter_layout"]
+    if layout not in ("modulelist", "packed"):
+        raise ValueError("model.moe_parameter_layout must be 'modulelist' or 'packed'")
+    if layout == "packed" and (
+            config["model"]["mlp_type"] != "moe"
+            or config["model"]["moe_backend"] != "grouped_gemm"):
+        raise ValueError("packed parameters require grouped_gemm MoE")
     if not isinstance(config["model"]["normalize_topk"], bool):
         raise ValueError("model.normalize_topk must be a boolean")
     ratio = config["model"]["mlp_ratio"]
