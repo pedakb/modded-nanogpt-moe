@@ -251,6 +251,7 @@ def test_module_entry_point_logs_package_sources():
         "modded_nanogpt_moe/_segmented_bias.py",
         "modded_nanogpt_moe/_combine.py",
         "modded_nanogpt_moe/_grouped_gemm.py",
+        "modded_nanogpt_moe/diagnostics.py",
         "modded_nanogpt_moe/optim.py",
         "modded_nanogpt_moe/data.py",
         "modded_nanogpt_moe/checkpoint.py",

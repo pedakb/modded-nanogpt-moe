@@ -7,6 +7,7 @@ import statistics
 import sys
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,7 @@ from .checkpoint import (
 )
 from .config import parse_train_args
 from .data import distributed_data_generator
+from .diagnostics import make_diagnostics
 from .model import (
     GPT, eager_prefix, initialize_model_parameters, make_head_loss, nsys_range, resolve_mlp_hidden_dim,
     set_moe_nsys_capture_active,
@@ -95,6 +97,7 @@ def read_source_snapshot():
         package_dir / "_segmented_bias.py",
         package_dir / "_combine.py",
         package_dir / "_grouped_gemm.py",
+        package_dir / "diagnostics.py",
         package_dir / "optim.py",
         package_dir / "data.py",
         package_dir / "checkpoint.py",
@@ -604,6 +607,10 @@ def main(argv=None):
                 )
                 writer.flush()
     
+        tb_diagnostics = make_diagnostics(
+            model, writer, experiment_config["diagnostics"],
+            benchmark=benchmark["enabled"], nsys_profile=nsys_profile, rank=dist.get_rank())
+
         for p in model.parameters():
             dist.broadcast(p.detach(), 0)
         if resume_checkpoint is not None:
@@ -652,6 +659,7 @@ def main(argv=None):
                        console=True)
                 if writer is not None:
                     writer.add_scalar("eval/val_loss", float(val_loss), step)
+                    writer.add_scalar("val/loss", float(val_loss), step)
                     writer.add_scalar("perf/step_avg_ms", 1000 * step_avg, step)
                     writer.flush()
                 model.train()
@@ -707,15 +715,19 @@ def main(argv=None):
                 diagnostic_update = (
                     step + 1 if repro_diagnostics_dir and step in (0, 1) else None)
                 diagnostic_losses = [] if diagnostic_update is not None else None
-                for i in range(len(inputs) // mbs):
-                    with nsys_range(nsys_capture_active, f"forward.microbatch_{i}"):
-                        loss = run_forward(
-                            inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
-                        if diagnostic_losses is not None:
-                            diagnostic_losses.append(loss.detach())
-                    with nsys_range(nsys_capture_active, f"backward.microbatch_{i}"):
-                        loss.backward()
-                    del loss
+                collect_tb = tb_diagnostics is not None and tb_diagnostics.due(step + 1)
+                with tb_diagnostics.capture_routing() if collect_tb else nullcontext():
+                    for i in range(len(inputs) // mbs):
+                        with nsys_range(nsys_capture_active, f"forward.microbatch_{i}"):
+                            loss = run_forward(
+                                inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+                            if diagnostic_losses is not None:
+                                diagnostic_losses.append(loss.detach())
+                            if collect_tb:
+                                tb_diagnostics.observe_loss(loss)
+                        with nsys_range(nsys_capture_active, f"backward.microbatch_{i}"):
+                            loss.backward()
+                        del loss
                 for name, p in model.named_parameters():
                     assert p.grad is not None, name
                     dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
@@ -733,12 +745,16 @@ def main(argv=None):
                         for grp_idx, group in enumerate(opt.param_groups):
                             writer.add_scalar(
                                 f"optim/lr_opt{opt_idx}_group{grp_idx}", group["lr"], step)
+                if collect_tb:
+                    tb_diagnostics.before_optimizers()
                 for opt_idx, opt in enumerate(optimizers):
                     optimizer_name = type(opt).__name__
                     with nsys_range(
                             nsys_capture_active,
                             f"optimizer_update.index_{opt_idx}.{optimizer_name}"):
                         opt.step()
+                if collect_tb:
+                    tb_diagnostics.after_optimizers(writer, step + 1, inputs.numel())
                 model.zero_grad(set_to_none=True)
                 if diagnostic_gradients is not None:
                     stage = (

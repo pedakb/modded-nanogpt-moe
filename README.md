@@ -98,6 +98,11 @@ TensorBoard events are written under:
 
 A fresh run refuses to reuse an existing TensorBoard run directory.
 
+TensorBoard training diagnostics default to every 10 optimizer updates, with
+histograms off. See [diagnostic metrics and overhead](docs/diagnostics.md) for
+the optional `[diagnostics]` TOML settings. Benchmarks always bypass diagnostics;
+Nsight bypasses them unless explicitly enabled.
+
 ## Validation
 
 Run local tests with:

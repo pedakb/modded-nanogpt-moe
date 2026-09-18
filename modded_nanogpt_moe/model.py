@@ -290,6 +290,7 @@ class MoE(nn.Module):
         self.normalize_topk = normalize_topk
         self.moe_backend = moe_backend
         self.moe_parameter_layout = moe_parameter_layout
+        self._routing_diagnostics = None  # Transient observer, never checkpointed.
         self.router = Linear(dim, num_experts)
         if moe_parameter_layout == "modulelist":
             self.experts = nn.ModuleList(MLP(dim, hidden_dim) for _ in range(num_experts))
@@ -342,6 +343,8 @@ class MoE(nn.Module):
         router_logits = self.router(x)
         routing_weights = F.softmax(router_logits.float(), dim=-1)
         topk_weights, topk_experts = routing_weights.topk(self.top_k, dim=-1)
+        if self._routing_diagnostics is not None:
+            self._routing_diagnostics(router_logits.detach(), routing_weights.detach(), topk_experts.detach())
         if self.normalize_topk:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         topk_weights = topk_weights.type_as(x)
@@ -384,6 +387,8 @@ class MoE(nn.Module):
             router_logits = self.router(x)
             routing_weights = F.softmax(router_logits.float(), dim=-1)
             topk_weights, topk_experts = routing_weights.topk(self.top_k, dim=-1)
+            if self._routing_diagnostics is not None:
+                self._routing_diagnostics(router_logits.detach(), routing_weights.detach(), topk_experts.detach())
             if self.normalize_topk:
                 topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
             topk_weights = topk_weights.type_as(x)

@@ -4,15 +4,85 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-Current base on `cleanup-active-codebase`: `955479b` (`Fuse MoE combine forward
-and backward`), initially clean. Current task: investigate and reduce grouped
-GEMM fragmentation on GH200, without changing bias/combine, routing, packed
-parameters, Muon, geometry or checkpoints. User's post-combine E64/K8 packed
-baseline: median 4178.9 ms/update, ~11,190/~11,179 nvjet-family launches per
-FC2/FC1 backward over two captured updates. No commits, remote jobs, dependency
-installs, extension rebuilds or config changes performed.
+Current base on `cleanup-active-codebase`: `68325ff` (`Add native grouped GEMM
+implementation`), initially clean. Current task: sampled TensorBoard diagnostics
+for router/expert/optimizer dynamics. The prior GEMM candidate is committed;
+its CUDA correctness/performance remain pending as recorded below. No commits,
+remote jobs, dependency installs or extension rebuilds performed this task.
 
-## Native grouped GEMM candidate (current work)
+## TensorBoard diagnostics (current work)
+
+- New `diagnostics.py` owns aggregation/snapshot/emission logic. TOML defaults:
+  `[diagnostics] scalar_interval=10, histogram_interval=0, during_nsys=false`.
+  Interval 0 disables diagnostics; histograms must be a scalar-interval multiple.
+  Existing configs need no edits; settings print with resolved config and do
+  not enter checkpoint compatibility state.
+- Only rank-zero with an existing writer constructs the observer. Benchmark
+  always bypasses it; Nsight bypasses it for the whole run unless explicitly
+  enabled. Non-sampled updates do no diagnostic tensor work/copies/transfers.
+- Two model observation sites (loop/grouped routing) supply detached existing
+  full softmax/logits/actual top-k IDs. Capture is enabled only across accumulated
+  training microbatches of a sampled update, cleared in finally. Model math,
+  routing choices, grouped GEMM, bias/combine, optimizer code and compile
+  boundaries are unchanged.
+- Per-layer router norms (weight+bias), independent expert FC1/FC2 weight norms
+  summarized min/median/mean/max/population-std; aggregate attention/embedding/
+  head weight norms. Log pre-update parameter and accumulated all-reduced
+  gradient norms/ratio, actual stored update norm/ratio, and router-versus-median-
+  expert gradient and update-ratio comparisons. Denominator zero => NaN.
+- Follow-up adds parameter/gradient/actual-update RMS using each expert's own
+  element count before summarizing. Expert RMS tags use p10/median/p90; existing
+  norm/ratio summaries remain and gain p10/p90. Median is the typical-expert
+  statistic; percentiles use linear interpolation via kthvalue selection.
+- Router `logit_rms` pools token-wise centered variance over all sampled
+  microbatches, so common logit shifts do not change it. `dL_dlogits_rms` uses
+  temporary router-forward/tensor-gradient hooks only inside sampled capture;
+  hooks retain scalar sums/counts, not logits, full gradients or graphs, and
+  are removed in finally. No normal-update hooks, extra backward, synchronization
+  or device-to-host transfer. Gradient RMS reflects actual dtype and existing
+  summed-loss scaling; omitted when no logit gradient is observed. Model,
+  trainer, optimizer and kernels needed no additional edits for this follow-up.
+- Exact actual update norm requires detached independent parameter snapshots,
+  only at sampled updates. Includes AdamW/Muon momentum, weight decay and dtype
+  rounding without touching optimizer internals. FP32 snapshots reused as
+  subtraction scratch; BF16 promotes before subtracting. Roughly 2 GiB extra
+  snapshots for standard E64 packed, plus routing temporaries; not memory-free.
+- Routing covers full entropy/normalized entropy, top1/max probability, top1-
+  top2 gap, k/k+1 logit margin mean/midpoint median/threshold fractions, and
+  actual assignment utilization including empty experts. Extra topk(k+1), no
+  expert sort; median via kthvalue selection. Counts/sums aggregate over the
+  entire sampled update. Margins retained as detached per-token FP32 values
+  (~24 MiB for 12 layers/524288 rank-local tokens). No graphs retained.
+- `train/loss` is sampled rank-local cross entropy per token; `val/loss` aliases
+  existing `eval/val_loss`. Existing scalar tags/cleanup/purge unchanged. Scalars
+  use one batched host transfer per sample; optional histograms use a second.
+  Routing/loss are rank-local; gradients follow the existing SUM all-reduce.
+  No new distributed reductions or checkpoint payload state.
+- Documentation: `docs/diagnostics.md` details all tags, definitions, gating,
+  memory cost and caveats; linked from README. Diagnostics source is included
+  in complete training source snapshots.
+- Tests: deterministic entropy/margins/loads/zero experts, exact observer-on/off
+  model/input/router/expert-gradient parity in both layouts, real AdamW/Muon
+  update/state parity, actual BF16 rounding, config validation, callback cleanup,
+  trainer optimizer boundaries, and factory/benchmark/Nsight/rank gating.
+  Follow-up covers centered-shift invariance, unequal-microbatch pooling,
+  per-expert RMS/percentiles, FP32/BF16 logit-gradient RMS, weak-reference graph
+  release, and hook cleanup on exceptions. Targeted diagnostics/package/Nsight
+  checks: 54 passed. Full local suite: 212 passed, 143 CUDA-dependent checks
+  skipped. `git diff --check` passed.
+- Pending: Vista/LS6 CUDA event-file inspection, peak-memory and runtime overhead
+  with TB enabled. Lower frequency reduces average overhead, not snapshot peak
+  memory; disable diagnostics for tight memory budgets. Do not infer GPU overhead
+  from CPU tests. Existing end-to-end benchmark remains diagnostic-free.
+- Dirty task files: diagnostics.py (new), config.py, model.py, train.py,
+  tests/test_diagnostics.py (new), tests/test_package.py, docs/diagnostics.md
+  (new), README.md, HANDOFF.md. Prior GEMM files and optimizers untouched.
+  Follow-up edits are limited to diagnostics.py, tests/test_diagnostics.py,
+  docs/diagnostics.md and HANDOFF.md; earlier uncommitted diagnostics work is
+  preserved. Next: inspect these new tags and sampled overhead on Vista with
+  TensorBoard enabled; CPU tests cannot establish CUDA correctness/performance.
+
+## Native grouped GEMM candidate (committed; GPU validation pending)
 
 - Source traced to `grouped_gemm.ops.gmm` / `GroupedGemm` autograd, pinned
   nv-grouped-gemm 1.1.4.post8 (15721c6). On SM90 all forward/dX/dW paths loop

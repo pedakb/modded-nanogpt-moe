@@ -12,6 +12,11 @@ DEFAULT_CONFIG = {
     "run_name": None,
     "num_trials": 1,
     "seed": None,
+    "diagnostics": {
+        "scalar_interval": 10,
+        "histogram_interval": 0,
+        "during_nsys": False,
+    },
     "model": {
         "vocab_size": 50304,
         "num_layers": 12,
@@ -78,6 +83,17 @@ def _positive_int(config, section, key):
 
 
 def validate_experiment_config(config, require_run_name=False):
+    diagnostics = config["diagnostics"]
+    for key in ("scalar_interval", "histogram_interval"):
+        value = diagnostics[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"diagnostics.{key} must be a nonnegative integer")
+    if not isinstance(diagnostics["during_nsys"], bool):
+        raise ValueError("diagnostics.during_nsys must be a boolean")
+    if diagnostics["histogram_interval"] and (
+            not diagnostics["scalar_interval"]
+            or diagnostics["histogram_interval"] % diagnostics["scalar_interval"]):
+        raise ValueError("diagnostics.histogram_interval must be a multiple of scalar_interval")
     run_name = config["run_name"]
     if require_run_name and not run_name:
         raise ValueError("run_name is required in an experiment config")
