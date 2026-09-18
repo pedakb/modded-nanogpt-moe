@@ -11,8 +11,8 @@ export CXX=/usr/bin/g++
 
 config_path="${1:-configs/dense_baseline.toml}"
 export TB_SYSTEM="${TB_SYSTEM:-vista}"
-if [[ -z "${DATA_ROOT+x}" && -n "${SCRATCH:-}" ]]; then
-    export DATA_ROOT="$SCRATCH/modded-nanogpt-moe"
+if [[ -z "${DATA_ROOT+x}" ]]; then
+    export DATA_ROOT="$repo_root"
 fi
 if [[ -z "${TB_ROOT+x}" && -n "${STOCKYARD:-}" ]]; then
     export TB_ROOT="$STOCKYARD/tensorboard"

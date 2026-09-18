@@ -36,6 +36,10 @@ On LS6 and Vista, keep the shared source dataset on Stockyard and place or
 link the active copy at `<DATA_ROOT>/data/fineweb10B` on the system's scratch
 filesystem.
 
+On the current Vista checkout, `data/fineweb10B` is a repository-local symlink
+to the active FineWeb10B copy on SCRATCH. The config paths remain repository-
+relative; the application does not depend on the symlink's physical target.
+
 ## Training
 
 Run from the repository root. A single-GPU dense baseline is:
@@ -65,19 +69,21 @@ scripts/ls6/train.sh configs/moe_grouped.toml
 scripts/vista/train.sh configs/moe_grouped.toml
 ```
 
-Each launcher supplies reusable machine defaults when the corresponding TACC
-variables are available:
+Each launcher supplies reusable machine defaults:
 
 ```text
-DATA_ROOT=$SCRATCH/modded-nanogpt-moe
+Vista DATA_ROOT=<repository root>
+LS6   DATA_ROOT=$SCRATCH/modded-nanogpt-moe (when SCRATCH is available)
 TB_ROOT=$STOCKYARD/tensorboard
 TB_SYSTEM=ls6 or vista
 ```
 
-An already-set value takes precedence. Set `TB_ROOT=` explicitly to disable
-TensorBoard for an individual run. The trainer prints the resolved runtime
-paths, matched data shards, Git/environment metadata, and output destinations
-at startup; checkpoints retain that information as non-compatibility metadata.
+The Vista launcher derives the repository root from its own location, so it
+works from any current directory. An already-set value takes precedence. Set
+`TB_ROOT=` explicitly to disable TensorBoard for an individual run. The trainer
+prints the resolved runtime paths, matched data shards, Git/environment
+metadata, and output destinations at startup; checkpoints retain that
+information as non-compatibility metadata.
 
 Existing operational environment controls remain available, including
 `DATA_ROOT`, `TB_ROOT`, `TB_SYSTEM`, checkpoint/resume variables, Nsight

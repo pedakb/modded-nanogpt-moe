@@ -80,7 +80,10 @@ Experiment TOMLs describe scientific settings. Machine-specific roots remain
 environment settings so the same config moves between systems. Existing
 environment overrides take precedence over TOML values; keep them compatible.
 
-- `DATA_ROOT` contains `data/fineweb10B/...` and may differ by system.
+- Shard patterns are a logical repository-relative interface:
+  `data/fineweb10B/fineweb_train_*.bin` and
+  `data/fineweb10B/fineweb_val_*.bin`. `DATA_ROOT` is the base prepended to
+  those patterns, not the physical dataset directory itself.
 - In the trainer, an empty/unset `TB_ROOT` disables TensorBoard and `TB_SYSTEM`
   labels the system. The cluster launchers provide a Stockyard default when
   `TB_ROOT` is unset; pass `TB_ROOT=` explicitly to disable it through them.
@@ -92,9 +95,14 @@ environment overrides take precedence over TOML values; keep them compatible.
   `TRAIN_STEPS_OVERRIDE`, `MLP_TYPE_OVERRIDE`, `MLP_RATIO_OVERRIDE`,
   `NUM_EXPERTS_OVERRIDE`, `TOP_K_OVERRIDE`, and `MOE_BACKEND_OVERRIDE`.
 
-Keep the shared source dataset and durable TensorBoard/checkpoint outputs on
-Stockyard; active data copies or links live on each system's scratch. Never
-commit user-specific absolute paths, datasets, checkpoints, logs, or profiles.
+Keep durable TensorBoard/checkpoint outputs on Stockyard and active data on
+system scratch. On the current Vista setup, repository-local
+`data/fineweb10B` is a symlink to the physical FineWeb10B directory on SCRATCH,
+and the Vista launcher defaults `DATA_ROOT` to its robustly derived repository
+root. Other checkouts may provide their own directory/symlink or explicitly set
+`DATA_ROOT`. Application code and committed configs must remain agnostic to the
+physical target. Never commit user-specific absolute paths, datasets,
+checkpoints, logs, or profiles.
 
 ## Environments and commands
 
@@ -130,7 +138,9 @@ scripts/vista/train.sh configs/moe_grouped.toml
   `nv-grouped-gemm==1.1.4.post8` and device capability 80.
 - Vista: GH200, `nvidia/25.3`, CUDA 12.9, `CC=/usr/bin/gcc`,
   `CXX=/usr/bin/g++`. The pinned extension has used its cuBLAS fallback here;
-  do not infer CUTLASS portability or performance without profiling.
+  do not infer CUTLASS portability or performance without profiling. Ordinary
+  tests use `uv run --no-sync python -m pytest -q -rs tests`; do not re-sync an
+  already provisioned environment during routine validation.
 
 Run cluster commands from the repository root because data patterns are
 relative. Use `grep`, not `rg`, in TACC-facing commands. When piping a run to

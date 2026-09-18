@@ -1,4 +1,5 @@
 import io
+import os
 import subprocess
 import types
 from pathlib import Path
@@ -257,6 +258,8 @@ def test_module_entry_point_logs_package_sources():
 def test_dense_example_config_resolves_current_training_defaults():
     repository_root = Path(__file__).resolve().parents[1]
     config = load_experiment_config(repository_root / "configs/dense_baseline.toml")
+    grouped_config = load_experiment_config(
+        repository_root / "configs/moe_grouped.toml")
 
     assert config["run_name"] == "dense-baseline"
     assert config["num_trials"] == 1
@@ -275,6 +278,63 @@ def test_dense_example_config_resolves_current_training_defaults():
     assert config["training"]["global_batch_tokens"] == 524288
     assert config["training"]["microbatch_sequences"] == 64
     assert config["training"]["total_steps"] == 3250
+    assert config["training"]["training_shard_pattern"] == (
+        "data/fineweb10B/fineweb_train_*.bin")
+    assert config["training"]["validation_shard_pattern"] == (
+        "data/fineweb10B/fineweb_val_*.bin")
+
+    defaults = load_experiment_config()
+    for candidate in (defaults, grouped_config):
+        assert candidate["training"]["training_shard_pattern"] == (
+            config["training"]["training_shard_pattern"])
+        assert candidate["training"]["validation_shard_pattern"] == (
+            config["training"]["validation_shard_pattern"])
+
+
+@pytest.mark.parametrize("explicit_data_root", [None, "/custom/data-root"])
+def test_vista_launcher_defaults_data_root_to_repo_and_preserves_override(
+        tmp_path, explicit_data_root):
+    repository_root = Path(__file__).resolve().parents[1]
+    launcher = repository_root / "scripts/vista/train.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    module = fake_bin / "module"
+    module.write_text("#!/usr/bin/env bash\nexit 0\n")
+    module.chmod(0o755)
+    uv = fake_bin / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n%s\\n' \"$PWD\" \"${DATA_ROOT-}\" > \"$LAUNCH_CAPTURE\"\n"
+        "printf '%s\\n' \"$@\" >> \"$LAUNCH_CAPTURE\"\n"
+    )
+    uv.chmod(0o755)
+    capture = tmp_path / "launch.txt"
+    outside_repository = tmp_path / "outside"
+    outside_repository.mkdir()
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    environment["LAUNCH_CAPTURE"] = str(capture)
+    if explicit_data_root is None:
+        environment.pop("DATA_ROOT", None)
+        expected_data_root = str(repository_root)
+    else:
+        environment["DATA_ROOT"] = explicit_data_root
+        expected_data_root = explicit_data_root
+
+    subprocess.run(
+        ["bash", str(launcher), "configs/dense_baseline.toml"],
+        cwd=outside_repository,
+        env=environment,
+        check=True,
+    )
+
+    captured = capture.read_text().splitlines()
+    assert captured[:2] == [str(repository_root), expected_data_root]
+    assert captured[2:] == [
+        "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
+        "--module", "modded_nanogpt_moe.train", "--config",
+        "configs/dense_baseline.toml",
+    ]
 
 
 def test_config_requires_run_name_and_rejects_unknown_fields(tmp_path):
