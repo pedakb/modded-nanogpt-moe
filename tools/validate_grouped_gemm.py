@@ -381,7 +381,8 @@ class GroupedGemmMoE(nn.Module):
         # only the resulting length-E tensor is synced to host, not the
         # (potentially large) activations.
         with self._scope("moe.count_and_cpu_transfer"):
-            batch_sizes = torch.bincount(sorted_experts, minlength=self.num_experts).to(torch.int64).cpu()
+            batch_sizes_device = torch.bincount(sorted_experts, minlength=self.num_experts).to(torch.int64)
+            batch_sizes = batch_sizes_device.cpu()
 
         with self._scope("moe.fc1_weight_stack_and_layout"):
             fc_w = self._stacked_weight(self.fc_weight).type_as(x_sorted)
@@ -394,7 +395,7 @@ class GroupedGemmMoE(nn.Module):
             h = self.gmm_fn(x_sorted, fc_w, batch_sizes, trans_b=self.forward_trans_b)
         with self._scope("moe.fc1_segmented_bias"):
             h = tgs.add_bias_by_expert_segments(
-                h, fc_b, batch_sizes)
+                h, fc_b, batch_sizes_device, sorted_experts)
         with self._scope("moe.activation"):
             h = h.relu().square()
         with self._scope("moe.fc2_grouped_gemm"):
@@ -403,7 +404,7 @@ class GroupedGemmMoE(nn.Module):
                 trans_b=self.forward_trans_b)
         with self._scope("moe.fc2_segmented_bias"):
             out_sorted = tgs.add_bias_by_expert_segments(
-                out_sorted, proj_b, batch_sizes)
+                out_sorted, proj_b, batch_sizes_device, sorted_experts)
 
         # ---- unpermute + weighted combine (backend-independent) ----
         with self._scope("moe.combine"):
@@ -835,7 +836,8 @@ def _make_indexing_metadata(case):
 def benchmark_bias_add_candidates(case, metadata, width, dtype, warmup, iterations):
     label = f"{case['name']}:bias_width_{width}"
     results = {}
-    for candidate_name in ("advanced_index", "index_select", "repeat_interleave", "segment_add_cat"):
+    for candidate_name in ("advanced_index", "index_select", "repeat_interleave",
+                           "segment_add_cat", "segment_reduce"):
         torch.manual_seed(case["seed"] + width)
         values = torch.randn(metadata["assignments"], width, device="cuda", dtype=dtype,
                              requires_grad=True)
@@ -854,7 +856,14 @@ def benchmark_bias_add_candidates(case, metadata, width, dtype, warmup, iteratio
                     bias, metadata["counts_cuda"], dim=0,
                     output_size=metadata["assignments"])
                 return values + expanded
-            return tgs.add_bias_by_expert_segments(values, bias, metadata["counts_cpu"])
+            if candidate_name == "segment_add_cat":
+                # Retain the old implementation only as a benchmark reference.
+                return torch.cat([
+                    segment + row for segment, row in zip(
+                        values.split(metadata["counts_cpu"].tolist()), bias.unbind(0))
+                ])
+            return tgs.add_bias_by_expert_segments(
+                values, bias, metadata["counts_cuda"], metadata["sorted_experts"])
 
         def clear_gradients():
             values.grad = None

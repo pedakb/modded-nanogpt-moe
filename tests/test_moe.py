@@ -146,7 +146,7 @@ def test_segmented_expert_bias_matches_indexing_output_and_gradients_with_empty_
     x_segment = x_base.clone().requires_grad_(True)
     bias_segment = bias_base.clone().requires_grad_(True)
     out_segment = add_bias_by_expert_segments(
-        x_segment, bias_segment.to(torch.bfloat16), counts)
+        x_segment, bias_segment.to(torch.bfloat16), counts, expert_ids)
     out_segment.backward(grad_out)
 
     torch.testing.assert_close(out_segment, out_index)

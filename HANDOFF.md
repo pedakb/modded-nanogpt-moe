@@ -4,13 +4,84 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-The current base on `cleanup-active-codebase` is `02706ae` (`Instrument MoE
-backward for Nsight`). Pending, uncommitted work adds opt-in packed expert
-parameters; no training or remote jobs were launched. Modified: model, config,
-optimizers, trainer, existing package/MoE tests, AGENTS.md, and this handoff.
-New: `tests/test_packed_experts.py` and `configs/moe_e64k8_r0.5_packed.toml`.
-Dependencies and existing experiment configs are unchanged. GPU correctness,
-packed resume in a real training job, and performance remain pending.
+The current base on `cleanup-active-codebase` is `39cd9e7` (`Add packed expert
+parameter layout`). The initial worktree was clean. Pending work optimizes only
+the grouped-MoE bias add/reduction: model.py, test_moe.py, the grouped diagnostic
+harness, new tests/test_segmented_bias.py, and this handoff. No commits, remote
+jobs, dependency changes, or experiment/config/checkpoint changes were made.
+
+## Segmented bias optimization (current task)
+
+- User-supplied E64/K8 packed GH200 trace: 192 MoE calls over two updates,
+  64 experts, hence 12,288 per-expert bias add/reduction launches per FC stage.
+  FC2/FC1 elementwise totals ~227.7/129.2 ms and backward reductions
+  ~205.5/187.5 ms. These are baseline observations, not results of this patch.
+- `add_bias_by_expert_segments` now wraps a custom autograd Function. Forward
+  gathers biases using existing sorted_experts and adds in bulk. Backward
+  passes the activation gradient through unchanged and uses one
+  `torch.segment_reduce(..., "sum")` for all bias gradients. The indexing
+  backward graph is not built, avoiding the earlier scatter bottleneck.
+- Retain the existing device-side bincount before the already-required CPU
+  copy for grouped GEMM. Both FCs reuse that device metadata. No new sorting,
+  CPU transfer, .item(), synchronization, or compilation boundary. Internal
+  helper callers now supply counts and sorted IDs on the activation device.
+  `unsafe=True` skips segment_reduce's synchronizing value validation; counts
+  are trusted bincount output, nonnegative and summing to the assignment count.
+- BF16/FP16 gradients are summed in FP32 then cast back. Direct BF16
+  segment_reduce was checked locally and lost contributions (700 ones summed
+  to 256); it is not used. See PyTorch's implementation:
+  https://github.com/pytorch/pytorch/blob/v2.11.0/aten/src/ATen/native/cuda/SegmentReduce.cu
+- Both parameter layouts and existing moe.*/moe_bw.* ranges are preserved.
+  The per-expert loop/split/unbind/cat bias path is absent from production.
+  The old implementation remains only as a test/diagnostic benchmark reference;
+  `tools.validate_grouped_gemm --mode indexing` compares it with the new
+  `segment_reduce` candidate, and the layer diagnostic uses the new helper.
+- Expected, NOT GPU-measured: per FC over 192 calls, ~192 gathers + 192 adds
+  instead of 12,288 adds; ~192 segment-reduction kernels instead of 12,288
+  per-expert reductions. PyTorch adds a constant number of small metadata and
+  dtype-conversion kernels, so total launches are not just these main kernels.
+  ModuleList stacking and combine are unchanged. Gather/FP32 temporary memory
+  and long/imbalanced segment throughput may offset launch savings.
+- Validation: full local suite `107 passed, 34 skipped` (CUDA unavailable),
+  `git diff --check` passed. New checks include E8/K2, E64/K8, both layouts,
+  empty/all-empty and highly imbalanced counts, forward/input/router/all expert
+  gradients, finite differences, BF16 accumulation, and constant CPU operator
+  counts without indexing backward. CUDA tests use the real extension and are
+  pending; CPU model tests use a GEMM stub. Existing tolerances are unchanged.
+  Exact representable sums and tested BF16 model gradients match exactly.
+  Random long FP32 bias sums differ in reduction order: local max abs 2.0218e-4,
+  relative L2 1.3573e-6; tests bound error against FP64 using gamma_n*sum(abs(x))
+  plus final BF16 rounding, rather than relaxing model parity tolerances.
+  The standalone harness also passed with `--backend reference --device cpu
+  --dtype float32`; this checks its updated helper calls, not CUDA kernels.
+
+Next: run the full suite on a Vista GH200, then capture the actual pipeline
+separately from wall-clock benchmarking. From the repository root, with normal
+checkpoint/diagnostic/benchmark overrides unset:
+
+```bash
+cd "$WORK/projects/modded-nanogpt-moe"
+module load nvidia/25.3 cuda/12.9
+export CC=/usr/bin/gcc CXX=/usr/bin/g++
+uv run --no-sync python -m pytest -q -rs tests
+# Continue only after tests pass.
+mkdir -p "$STOCKYARD/profiles/modded-nanogpt-moe/vista"
+report="$STOCKYARD/profiles/modded-nanogpt-moe/vista/segmented-bias-$(date +%Y%m%d-%H%M%S)-$$"
+set -o pipefail
+TB_ROOT= TRAIN_STEPS_OVERRIDE=14 NSYS_PROFILE=1 NSYS_WARMUP_STEPS=10 NSYS_ACTIVE_STEPS=2 \
+nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --capture-range=cudaProfilerApi --capture-range-end=stop -o "$report" \
+  uv run --no-sync torchrun --standalone --nproc_per_node=1 \
+  --module modded_nanogpt_moe.train --config configs/moe_e64k8_r0.5_packed.toml \
+  2>&1 | tee "$report.log"
+nsys stats --report cuda_gpu_kern_sum,cuda_api_sum,nvtx_kern_sum \
+  --format csv "$report.nsys-rep" | tee "$report.stats.csv"
+```
+
+Inspect Instances per kernel within moe.fc1/fc2 and moe_bw.fc1/fc2, including
+segment_reduce, indexing, elementwise, and metadata kernels. Compare to the
+supplied baseline counts, not overlapping operator/kernel time totals.
+No Nsight kernel-count reduction or speedup has yet been measured for this patch.
 
 ## Packed-layout experiment
 

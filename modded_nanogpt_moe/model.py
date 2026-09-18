@@ -172,23 +172,47 @@ class MLP(nn.Module):
         return x
 
 
-def add_bias_by_expert_segments(x: Tensor, bias: Tensor, batch_sizes: Tensor):
-    """Add one expert bias to each contiguous packed-token segment.
+class _ExpertSegmentBias(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, bias, batch_sizes, sorted_experts):
+        ctx.save_for_backward(batch_sizes)
+        # index_select is inside a custom forward: its scatter/indexing backward
+        # is never built. Save counts only, not the expanded bias or activations.
+        return x + bias.index_select(0, sorted_experts)
 
-    `batch_sizes` is the CPU int64 metadata already required by grouped_gemm.
-    Splitting by those counts and broadcasting each row avoids the repeated
-    advanced-index backward in `bias[sorted_experts]`. Empty experts still
-    participate through a zero-length chunk, so their bias gradient is a
-    present, exactly-zero tensor rather than None. This is deliberately
-    generic for every expert count; there is no E=1 special case.
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_bias = None
+        if ctx.needs_input_grad[1]:
+            (batch_sizes,) = ctx.saved_tensors
+            # segment_reduce accumulates in its input dtype. Match sum's FP32
+            # accumulation for low-precision inputs rather than summing in BF16.
+            values = (grad_output.float() if grad_output.dtype in
+                      (torch.float16, torch.bfloat16) else grad_output)
+            # Counts come directly from bincount of the sorted assignments:
+            # nonnegative, sum == row count. unsafe skips GPU .item() validation.
+            grad_bias = torch.segment_reduce(
+                values, "sum", lengths=batch_sizes, axis=0, unsafe=True,
+            ).to(grad_output.dtype)
+        return grad_output if ctx.needs_input_grad[0] else None, grad_bias, None, None
+
+
+def add_bias_by_expert_segments(x: Tensor, bias: Tensor, batch_sizes: Tensor,
+                                sorted_experts: Tensor):
+    """Vectorized bias add and contiguous-segment bias-gradient sum.
+
+    Metadata must be the existing sorted assignment IDs and their bincount,
+    both on x.device. Zero counts produce present, exactly-zero bias gradients.
+    Callers guarantee count/assignment consistency; do not synchronize to check
+    GPU tensor values here. All tensor work is independent of the expert count
+    in launch count (not in work), with no per-expert Python loop.
     """
-    assert batch_sizes.device.type == "cpu" and batch_sizes.dtype == torch.int64
-    counts = batch_sizes.tolist()
-    assert len(counts) == bias.shape[0] and sum(counts) == x.shape[0]
-    return torch.cat([
-        x_segment + bias_row
-        for x_segment, bias_row in zip(x.split(counts, dim=0), bias.unbind(0), strict=True)
-    ], dim=0)
+    assert x.ndim == bias.ndim == 2 and x.shape[1] == bias.shape[1]
+    assert x.dtype == bias.dtype and x.device == bias.device
+    assert batch_sizes.shape == (bias.shape[0],) and batch_sizes.dtype == torch.int64
+    assert sorted_experts.shape == (x.shape[0],) and sorted_experts.dtype == torch.int64
+    assert batch_sizes.device == sorted_experts.device == x.device
+    return _ExpertSegmentBias.apply(x, bias, batch_sizes, sorted_experts)
 
 
 class MoE(nn.Module):
@@ -344,7 +368,8 @@ class MoE(nn.Module):
             x_sorted = x[flat_tokens[order]]  # gather of ACTIVATIONS; never a weight copy
 
             # Required CPU int64 token-count metadata -- explicit D2H sync, see docstring.
-            batch_sizes = torch.bincount(sorted_experts, minlength=self.num_experts).to(torch.int64).cpu()
+            batch_sizes_device = torch.bincount(sorted_experts, minlength=self.num_experts).to(torch.int64)
+            batch_sizes = batch_sizes_device.cpu()
 
         # Both layouts supply contiguous [E,in,out] weights for trans_b=False.
         # Keep the existing range name for comparison; packed only casts dtype.
@@ -364,12 +389,14 @@ class MoE(nn.Module):
 
         with nsys_range(_moe_nsys_capture_active, "moe.fc1"):
             h_pre = add_bias_by_expert_segments(
-                self._gmm(x_sorted, fc_w, batch_sizes, trans_b=False), fc_b, batch_sizes)
+                self._gmm(x_sorted, fc_w, batch_sizes, trans_b=False),
+                fc_b, batch_sizes_device, sorted_experts)
         with nsys_range(_moe_nsys_capture_active, "moe.activation"):
             h_act = h_pre.relu().square()
         with nsys_range(_moe_nsys_capture_active, "moe.fc2"):
             out_sorted = add_bias_by_expert_segments(
-                self._gmm(h_act.type_as(x_sorted), proj_w, batch_sizes, trans_b=False), proj_b, batch_sizes)
+                self._gmm(h_act.type_as(x_sorted), proj_w, batch_sizes, trans_b=False),
+                proj_b, batch_sizes_device, sorted_experts)
 
         # ---- unpermute + weighted combine ----
         # NOTE on optimizer semantics, not just numerics: when an expert
