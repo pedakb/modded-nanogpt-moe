@@ -140,7 +140,7 @@ Submit a single-node Vista batch run from a login node with:
 scripts/vista/submit.sh configs/moe_grouped.toml
 ```
 
-The submission wrapper exports the current environment, delegates execution to
+The submission inherits the current environment and delegates execution to
 `scripts/vista/train.sh`, and writes combined stdout/stderr to
 `$STOCKYARD/logs/modded-nanogpt-moe/vista/slurm/%x-%j.log`. Set
 `SLURM_MAIL_USER` to request Slurm notifications for all job events; leave it

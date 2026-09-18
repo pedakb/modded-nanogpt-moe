@@ -34,7 +34,6 @@ fi
 
 cd "$repo_root"
 exec sbatch \
-    --export=ALL \
     --job-name="$job_name" \
     --output="$log_dir/%x-%j.log" \
     --error="$log_dir/%x-%j.log" \
