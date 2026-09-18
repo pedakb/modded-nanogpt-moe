@@ -10,7 +10,7 @@ from torch.optim import AdamW
 
 from modded_nanogpt_moe.checkpoint import restore_training_checkpoint
 from modded_nanogpt_moe.config import load_experiment_config, parse_train_args
-from modded_nanogpt_moe.model import GPT
+from modded_nanogpt_moe.model import GPT, resolve_mlp_hidden_dim
 from modded_nanogpt_moe.optim import Muon, build_optimizers
 from modded_nanogpt_moe.train import (
     main,
@@ -291,6 +291,29 @@ def test_dense_example_config_resolves_current_training_defaults():
             config["training"]["validation_shard_pattern"])
 
 
+def test_olmoe_style_config_changes_only_controlled_model_geometry():
+    repository_root = Path(__file__).resolve().parents[1]
+    intended_reference = load_experiment_config(
+        repository_root / "configs/moe_grouped.toml")
+    experiment = load_experiment_config(
+        repository_root / "configs/moe_e64k8_r0.5.toml")
+
+    # The completed E8/K2 reference checkpoint used this schedule horizon.
+    intended_reference["training"]["total_steps"] = 3500
+    intended_reference["run_name"] = "moe-e64-k8-ratio0.5"
+    intended_reference["model"] = {
+        **intended_reference["model"],
+        "mlp_ratio": 0.5,
+        "num_experts": 64,
+        "top_k": 8,
+    }
+    assert experiment == intended_reference
+    assert resolve_mlp_hidden_dim(
+        experiment["model"]["model_dim"],
+        experiment["model"]["mlp_ratio"],
+    ) == 384
+
+
 @pytest.mark.parametrize("explicit_data_root", [None, "/custom/data-root"])
 def test_vista_launcher_defaults_data_root_to_repo_and_preserves_override(
         tmp_path, explicit_data_root):
@@ -304,7 +327,8 @@ def test_vista_launcher_defaults_data_root_to_repo_and_preserves_override(
     uv = fake_bin / "uv"
     uv.write_text(
         "#!/usr/bin/env bash\n"
-        "printf '%s\\n%s\\n' \"$PWD\" \"${DATA_ROOT-}\" > \"$LAUNCH_CAPTURE\"\n"
+        "printf '%s\\n%s\\n%s\\n' \"$PWD\" \"${DATA_ROOT-}\" "
+        "\"${TRAIN_STEPS_OVERRIDE-}\" > \"$LAUNCH_CAPTURE\"\n"
         "printf '%s\\n' \"$@\" >> \"$LAUNCH_CAPTURE\"\n"
     )
     uv.chmod(0o755)
@@ -314,6 +338,7 @@ def test_vista_launcher_defaults_data_root_to_repo_and_preserves_override(
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
     environment["LAUNCH_CAPTURE"] = str(capture)
+    environment["TRAIN_STEPS_OVERRIDE"] = "17"
     if explicit_data_root is None:
         environment.pop("DATA_ROOT", None)
         expected_data_root = str(repository_root)
@@ -329,8 +354,8 @@ def test_vista_launcher_defaults_data_root_to_repo_and_preserves_override(
     )
 
     captured = capture.read_text().splitlines()
-    assert captured[:2] == [str(repository_root), expected_data_root]
-    assert captured[2:] == [
+    assert captured[:3] == [str(repository_root), expected_data_root, "17"]
+    assert captured[3:] == [
         "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
         "--module", "modded_nanogpt_moe.train", "--config",
         "configs/dense_baseline.toml",

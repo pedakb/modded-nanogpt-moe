@@ -4,11 +4,11 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-The repository cleanup, agent guides, and Vista data-root correction are
-committed and pushed on `cleanup-active-codebase`; the current base is
-`759871e` (`Fix Vista repository-relative data root`). The fix has now passed
-the prescribed tests and two-step training smokes on a Vista GH200. This file
-is modified only to record that result and is not yet committed.
+The repository cleanup, agent guides, Vista launch support, and Slurm support
+are committed and pushed on `cleanup-active-codebase`; the current base is
+`6ae0c70` (`Fix Vista Slurm environment handling`). A new OLMoE-style
+experiment config and its tests are currently uncommitted and have not yet
+been exercised on a GPU.
 
 The cleanup makes `modded_nanogpt_moe` the only active trainer implementation
 and removes upstream trainers, historical records, old kernels/evaluation
@@ -22,6 +22,11 @@ available in Git and on the earlier branches.
 - `configs/dense_baseline.toml` defines D=768, ratio=4 dense training;
   `configs/moe_grouped.toml` defines E=8, k=2, ratio=2 grouped MoE. Both keep
   the 524288-token global batch.
+- `configs/moe_e64k8_r0.5.toml` adds a controlled OLMoE-style geometry:
+  D=768, E=64, k=8, and a 384-wide expert FFN (`mlp_ratio=0.5`). It retains
+  selected-probability normalization, grouped GEMM, and the checkpoint-confirmed
+  E8/K2 reference settings, including its 3500-step schedule horizon. The older
+  checked-in `configs/moe_grouped.toml` remains unchanged at 3250 steps.
 - Dense uses whole-model compilation. MoE uses an eager transformer prefix and
   independently compiled head/loss to avoid the prior softcap OOM.
 - Grouped MoE preserves the expert `ModuleList`, dropless routing,
@@ -45,6 +50,9 @@ available in Git and on the earlier branches.
 
 ## Verification and experiments
 
+- For the new E=64, k=8 config: focused config/launcher tests `4 passed`; full
+  local suite `44 passed, 2 skipped`. The skipped checks require CUDA and
+  `grouped_gemm`. The Vista smoke and full experiment remain pending.
 - After this fix: focused config/launcher tests `3 passed`; full local suite
   `43 passed, 2 skipped`. The skipped tests require CUDA and `grouped_gemm`.
 - `bash -n scripts/ls6/train.sh scripts/vista/train.sh`: passed after the fix.
@@ -86,12 +94,16 @@ available in Git and on the earlier branches.
 
 ## Next steps
 
-1. Review, commit, and push this handoff-only update if approved.
-2. Validate the cleanup branch on LS6, including its actual data path, full
+1. Run a 10--20 update smoke test of `configs/moe_e64k8_r0.5.toml` on an
+   existing Vista idev GH200 node using `TRAIN_STEPS_OVERRIDE`; this preserves
+   the config's full-run schedule outside the smoke invocation.
+2. If the smoke succeeds, submit the full experiment through
+   `scripts/vista/submit.sh`.
+3. Validate the cleanup branch on LS6, including its actual data path, full
    pytest suite, and short dense/grouped smokes.
-3. Recheck checkpoint creation/resume and comparison from the cleaned paths
+4. Recheck checkpoint creation/resume and comparison from the cleaned paths
    when checkpoint validation is next in scope.
-4. If exact fresh-run repeatability is required, compare the saved update-2
+5. If exact fresh-run repeatability is required, compare the saved update-2
    diagnostic stages before extending instrumentation further.
-5. After LS6 validation, decide whether to make `cleanup-active-codebase` the
+6. After LS6 validation, decide whether to make `cleanup-active-codebase` the
    repository default branch; retain milestone branches for provenance.
