@@ -7,6 +7,8 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from ._grouped_gemm import expert_gmm, implementation_from_environment
+
 _moe_nsys_capture_active = False
 
 
@@ -308,7 +310,9 @@ class MoE(nn.Module):
                     self.fc_bias[index].copy_(expert.fc.bias)
                     self.proj_weight[index].copy_(expert.proj.weight.mT)
                     self.proj_bias[index].copy_(expert.proj.bias)
-        if moe_backend == "grouped_gemm":
+        self.gmm_implementation = implementation_from_environment() if moe_backend == "grouped_gemm" else "extension"
+        self._gmm = None
+        if moe_backend == "grouped_gemm" and self.gmm_implementation == "extension":
             # Imported only when this backend is selected -- "loop" (the
             # default) never touches this import, and dense models never
             # construct a MoE at all.
@@ -395,6 +399,9 @@ class MoE(nn.Module):
             # Required CPU int64 token-count metadata -- explicit D2H sync, see docstring.
             batch_sizes_device = torch.bincount(sorted_experts, minlength=self.num_experts).to(torch.int64)
             batch_sizes = batch_sizes_device.cpu()
+            # Reuse counts for native grouped GEMM; no new host transfer or sort.
+            offsets = (batch_sizes_device.cumsum(0, dtype=torch.int32)
+                       if self.gmm_implementation == "torch" else None)
 
         # Both layouts supply contiguous [E,in,out] weights for trans_b=False.
         # Keep the existing range name for comparison; packed only casts dtype.
@@ -414,13 +421,15 @@ class MoE(nn.Module):
 
         with nsys_range(_moe_nsys_capture_active, "moe.fc1"):
             h_pre = add_bias_by_expert_segments(
-                self._gmm(x_sorted, fc_w, batch_sizes, trans_b=False),
+                expert_gmm(x_sorted, fc_w, batch_sizes, offsets, self.gmm_implementation,
+                           self._gmm, "fc1", _moe_nsys_capture_active),
                 fc_b, batch_sizes_device, sorted_experts)
         with nsys_range(_moe_nsys_capture_active, "moe.activation"):
             h_act = h_pre.relu().square()
         with nsys_range(_moe_nsys_capture_active, "moe.fc2"):
             out_sorted = add_bias_by_expert_segments(
-                self._gmm(h_act.type_as(x_sorted), proj_w, batch_sizes, trans_b=False),
+                expert_gmm(h_act.type_as(x_sorted), proj_w, batch_sizes, offsets, self.gmm_implementation,
+                           self._gmm, "fc2", _moe_nsys_capture_active),
                 proj_b, batch_sizes_device, sorted_experts)
 
         # ---- unpermute + weighted combine ----

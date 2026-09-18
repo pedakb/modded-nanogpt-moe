@@ -4,15 +4,83 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-The current base on `cleanup-active-codebase` is `415a8ab` (`Include segmented
-bias source in training snapshot`). The initial worktree was clean. Pending
-work optimizes only grouped-MoE combine and its backward. New: `_combine.py`
-and `tests/test_combine.py`. Modified: model.py, train.py/test_package.py
-(source snapshots), tools/validate_grouped_gemm.py (reuse production combine),
-and this handoff. The Triton segmented-bias implementation is unchanged.
-No commits, remote jobs, dependencies, configs, or checkpoint formats changed.
+Current base on `cleanup-active-codebase`: `955479b` (`Fuse MoE combine forward
+and backward`), initially clean. Current task: investigate and reduce grouped
+GEMM fragmentation on GH200, without changing bias/combine, routing, packed
+parameters, Muon, geometry or checkpoints. User's post-combine E64/K8 packed
+baseline: median 4178.9 ms/update, ~11,190/~11,179 nvjet-family launches per
+FC2/FC1 backward over two captured updates. No commits, remote jobs, dependency
+installs, extension rebuilds or config changes performed.
 
-## Fused combine (current task)
+## Native grouped GEMM candidate (current work)
+
+- Source traced to `grouped_gemm.ops.gmm` / `GroupedGemm` autograd, pinned
+  nv-grouped-gemm 1.1.4.post8 (15721c6). On SM90 all forward/dX/dW paths loop
+  experts with cublasGemmEx on four streams. CUTLASS is SM80 forward-only with
+  trans_b=False; variable-K dW is always cuBLAS. No exposed persistent mode,
+  split-K override or workspace/algorithm selector. Not a per-tile launch loop.
+  Counts of one nvjet family cannot conclusively identify dX/dW without traces.
+- Lowest-risk option found in the existing torch 2.11 installation: native
+  `F.grouped_mm` SM90 BF16 CUTLASS grouped kernel, also supporting variable-K dW.
+  New `_grouped_gemm.py` implements opt-in `MOE_GMM_IMPLEMENTATION=torch`;
+  default/unset/`extension` preserves the original extension path. Explicitly
+  reject non-SM90, non-BF16 or unsupported widths rather than use torch's hidden
+  slow fallback. Widths must be divisible by 8, E < 1024, rows fit int32.
+- Forward consumes packed weights directly; dX uses W.mT and dW A.mT as views.
+  These orientations support odd/empty/imbalanced segments with aligned row
+  pointers, without padding. One device counts cumsum supplies offsets to both
+  FCs and backward. Existing CPU counts transfer is deliberately retained for a
+  controlled GEMM-only change. Both parameter layouts remain supported.
+- New NVTX ranges `grouped_gemm.fc{1,2}.{forward,dx,dw}` use the existing capture
+  flag. Extension profiling reproduces its raw backend calls; uncaptured
+  extension execution uses original ops.gmm. No added phase synchronization.
+- New `tools/benchmark_expert_gemm.py` fingerprints installed modules/binary,
+  prints actual autograd source, and separately times/profiles forward/dX/dW
+  at actual balanced geometry or a valid maximally imbalanced routing. Timings
+  use device-wide boundaries including auxiliary streams. The existing training
+  benchmark is still the end-to-end measure. Trainer prints implementation and
+  includes the new source in snapshots; checkpoint structure is unchanged.
+- Expected native launches per phase/FC for 192 layer calls: 192 grouped GEMMs
+  + 192 descriptor kernels + any constant initialization work, versus 12,288
+  per-expert cuBLAS calls. NOT YET MEASURED. Geometry/tuning/reduction-order
+  differences may affect both performance and numerics. E8 regression testing
+  is required. Do not enable the candidate by default before Vista validation.
+- Local full suite: 181 passed, 143 skipped (CUDA unavailable); targeted CUDA
+  checks skipped rather than executed. CPU tests exercise torch's real grouped-mm
+  CPU fallback for the offset/transpose contract, and cover expressions/gradients,
+  integration, unchanged state keys, phase ranges, frozen inputs and selection.
+  CUDA tests cover actual D768 E8/H1536 and E64/H384, odd balanced/imbalanced/
+  empty counts, FP32-reference outputs/dX/dW, full packed MoE/router/all expert
+  gradients with FP32/BF16 masters, and exact binary-product sums. Existing
+  BF16 tolerances/dtype checks retained. Mac has torch2.11 CPU and no extension.
+  `git diff --check` passed. Installed Vista binary/build flags, CUDA parity,
+  counts and speed are pending.
+- Changed: `_grouped_gemm.py` (new), model.py, train.py, test_package.py,
+  tests/test_native_grouped_gemm.py (new), tools/benchmark_expert_gemm.py (new),
+  docs/grouped_gemm.md and this handoff. Bias/combine/optim/config/dependency
+  files untouched. Keep the same implementation for resume comparisons; this
+  runtime execution selector is not a new checkpoint compatibility field.
+
+Next: follow the complete validation/benchmark/Nsight sequence in
+`docs/grouped_gemm.md`. On allocated Vista GH200, after modules/compiler setup:
+
+```bash
+cd "$WORK/projects/modded-nanogpt-moe"
+module load nvidia/25.3 cuda/12.9
+export CC=/usr/bin/gcc CXX=/usr/bin/g++ TB_ROOT=
+unset MOE_GMM_IMPLEMENTATION
+uv run --no-sync python -m pytest -q -rs tests
+# Continue only after correctness passes; unset stale overrides per docs.
+MOE_GMM_IMPLEMENTATION=extension scripts/vista/benchmark.sh configs/moe_e64k8_r0.5_packed.toml
+MOE_GMM_IMPLEMENTATION=torch scripts/vista/benchmark.sh configs/moe_e64k8_r0.5_packed.toml
+MOE_GMM_IMPLEMENTATION=extension scripts/vista/benchmark.sh configs/moe_grouped.toml
+MOE_GMM_IMPLEMENTATION=torch scripts/vista/benchmark.sh configs/moe_grouped.toml
+```
+
+The sections below retain earlier implementation notes; historical pending
+measurements are not claims about the newly reported user baseline.
+
+## Fused combine (committed baseline)
 
 - User-measured post-bias baseline: E64/K8 packed median 4214.6 ms/update;
   combine forward ~307.9 ms/update, backward ~275.7 ms/update, total ~583.6.

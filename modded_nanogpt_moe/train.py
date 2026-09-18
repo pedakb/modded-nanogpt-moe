@@ -94,6 +94,7 @@ def read_source_snapshot():
         package_dir / "model.py",
         package_dir / "_segmented_bias.py",
         package_dir / "_combine.py",
+        package_dir / "_grouped_gemm.py",
         package_dir / "optim.py",
         package_dir / "data.py",
         package_dir / "checkpoint.py",
@@ -396,10 +397,12 @@ def main(argv=None):
                 moe_backend=moe_backend, mlp_ratio=mlp_ratio,
                 moe_parameter_layout=model_config["moe_parameter_layout"])
     assert model.hidden_dim == hidden_dim
+    gmm_implementation = (model.blocks[0].mlp.gmm_implementation if mlp_type == "moe" else "n/a")
     print0(
         f"configuration: model_dim={model.model_dim} mlp_ratio={float(model.mlp_ratio):g} "
         f"hidden_dim={model.hidden_dim} model_type={mlp_type} moe_backend={moe_backend} "
         f"moe_parameter_layout={model.moe_parameter_layout} "
+        f"gmm_implementation={gmm_implementation} "
         f"E={num_experts} k={top_k} microbatch={mbs} "
         f"global_batch={batch_size} accumulation_count={accumulation_count} "
         f"trial_count={num_trials}",
@@ -861,6 +864,7 @@ def main(argv=None):
                 f"  model_dim={model.model_dim} hidden_dim={model.hidden_dim} "
                 f"E={num_experts} k={top_k} backend={moe_backend}\n"
                 f"  moe_parameter_layout={model.moe_parameter_layout}\n"
+                f"  gmm_implementation={gmm_implementation}\n"
                 f"  warmup_updates={benchmark['warmup_updates']} "
                 f"measured_updates={benchmark['measured_updates']}\n"
                 f"  mean_ms/update={summary['mean_ms_per_update']:.3f}\n"
