@@ -4,13 +4,11 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-The current base on `cleanup-active-codebase` is `568096f` (`Add fine-grained
-MoE NVTX profiling`). That commit omitted the trainer wiring, which remained
-uncommitted locally; Vista therefore never enabled the MoE ranges. The pending
-train.py diff includes the capture-start/stop flag calls and resets both flags
-in finally blocks on both stop paths. tests/test_nsys.py exercises the actual
-trainer boundary blocks with mocked CUDA calls. Include train.py when committing
-this fix; Vista trace verification and batched-Muon GPU validation remain pending.
+The current base on `cleanup-active-codebase` is `3c02a77` (`Wire MoE NVTX ranges
+into Nsight capture`). The trainer capture-gate fix is committed. Pending changes
+add grouped-MoE backward boundary hooks in model.py, tests in tests/test_moe.py,
+and this handoff update. Vista backward trace verification and batched-Muon GPU
+validation remain pending.
 
 The cleanup makes `modded_nanogpt_moe` the only active trainer implementation
 and removes upstream trainers, historical records, old kernels/evaluation
@@ -60,6 +58,17 @@ available in Git and on the earlier branches.
 
 ## Verification and experiments
 
+- Backward instrumentation: full local suite `60 passed, 2 skipped` (CUDA
+  unavailable); `git diff --check` passed. Tests verify exact outputs and all
+  gradients with capture on/off, no inactive/no-grad hook installation, reverse
+  boundary order, and balanced ranges on full, repeated, partial, and frozen-input
+  traversals. Hooks bracket `out -> out_sorted -> h_act -> h_pre -> x_sorted`
+  with `moe_bw.combine`, `moe_bw.fc2`, `moe_bw.activation`, `moe_bw.fc1`.
+  A queued autograd completion callback closes a range if a partial grad()
+  traversal omits the last hook. This uses the existing single-device backward
+  worker; no added synchronization, transfers, or changed math. These are host
+  enqueue intervals, potentially including interleaved router/parameter-gradient
+  work, not exclusive GPU kernel durations. Inspect them in a fresh Vista trace.
 - Trainer NVTX integration fix: `8 passed` focused; full suite `56 passed,
   2 skipped` (CUDA unavailable); `git diff --check` passed. Tests check updates
   11/12, disabled profiling, normal/early stops, and flag reset when synchronize

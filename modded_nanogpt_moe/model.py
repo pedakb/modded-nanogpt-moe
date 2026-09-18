@@ -21,6 +21,56 @@ def nsys_range(enabled: bool, name: str):
     return torch.cuda.nvtx.range(name) if enabled else nullcontext()
 
 
+def _register_moe_backward_ranges(out, out_sorted, h_act, h_pre, x_sorted):
+    """Bracket enqueue intervals on the single-device autograd worker thread.
+
+    Tensor hooks do not change gradients. Ranges delimit activation-gradient
+    boundaries, not exclusive kernel time: autograd can interleave parameter
+    and router branches. No tensors are retained by the hook closures.
+    """
+    if not _moe_nsys_capture_active or not torch.is_grad_enabled():
+        return
+    boundaries = (out, out_sorted, h_act, h_pre, x_sorted)
+    names = ("moe_bw.combine", "moe_bw.fc2", "moe_bw.activation", "moe_bw.fc1")
+    range_open = False
+    cleanup_queued = False
+
+    def close_range():
+        nonlocal range_open
+        if range_open:
+            torch.cuda.nvtx.range_pop()
+            range_open = False
+
+    def finish_backward():
+        nonlocal cleanup_queued
+        try:
+            close_range()
+        finally:
+            cleanup_queued = False
+
+    def boundary_hook(next_name):
+        def hook(gradient):
+            nonlocal range_open, cleanup_queued
+            close_range()
+            if not _moe_nsys_capture_active or next_name is None:
+                return
+            # Run on the autograd worker after this backward finishes, including
+            # partial grad() traversals which may omit the final boundary hook.
+            if not cleanup_queued:
+                torch.autograd.Variable._execution_engine.queue_callback(finish_backward)
+                cleanup_queued = True
+            torch.cuda.nvtx.range_push(next_name)
+            range_open = True
+        return hook
+
+    for index, tensor in enumerate(boundaries):
+        if tensor.requires_grad:
+            next_name = (
+                names[index] if index < len(names)
+                and boundaries[index + 1].requires_grad else None)
+            tensor.register_hook(boundary_hook(next_name))
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -279,13 +329,13 @@ class MoE(nn.Module):
             proj_b = torch.stack([e.proj.bias for e in self.experts]).type_as(x_sorted)
 
         with nsys_range(_moe_nsys_capture_active, "moe.fc1"):
-            h = add_bias_by_expert_segments(
+            h_pre = add_bias_by_expert_segments(
                 self._gmm(x_sorted, fc_w, batch_sizes, trans_b=False), fc_b, batch_sizes)
         with nsys_range(_moe_nsys_capture_active, "moe.activation"):
-            h = h.relu().square()
+            h_act = h_pre.relu().square()
         with nsys_range(_moe_nsys_capture_active, "moe.fc2"):
             out_sorted = add_bias_by_expert_segments(
-                self._gmm(h.type_as(x_sorted), proj_w, batch_sizes, trans_b=False), proj_b, batch_sizes)
+                self._gmm(h_act.type_as(x_sorted), proj_w, batch_sizes, trans_b=False), proj_b, batch_sizes)
 
         # ---- unpermute + weighted combine ----
         # NOTE on optimizer semantics, not just numerics: when an expert
@@ -308,7 +358,10 @@ class MoE(nn.Module):
             out_flat = torch.empty_like(out_sorted)
             out_flat[order] = out_sorted
             out = (out_flat.view(N, self.top_k, D) * topk_weights.unsqueeze(-1)).sum(dim=1)
-            return out.view(B, T, D)
+            out = out.view(B, T, D)
+        if _moe_nsys_capture_active:
+            _register_moe_backward_ranges(out, out_sorted, h_act, h_pre, x_sorted)
+        return out
 
 class Block(nn.Module):
     def __init__(self, dim: int, mlp_type: str = "dense", num_experts: int = 1,

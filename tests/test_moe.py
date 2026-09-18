@@ -332,6 +332,22 @@ def test_grouped_moe_nvtx_capture_preserves_outputs_and_gradients(monkeypatch):
 
     moe._gmm = gmm
     events = []
+    backward_events = []
+    range_stack = []
+    installed_hooks = []
+    register_hook = torch.Tensor.register_hook
+
+    def record_hook(tensor, hook):
+        installed_hooks.append(tuple(tensor.shape))
+        return register_hook(tensor, hook)
+
+    def push(name):
+        range_stack.append(name)
+        backward_events.append(("push", name))
+
+    def pop():
+        assert range_stack, "NVTX pop without a matching push"
+        backward_events.append(("pop", range_stack.pop()))
 
     @contextmanager
     def record_range(name):
@@ -342,6 +358,9 @@ def test_grouped_moe_nvtx_capture_preserves_outputs_and_gradients(monkeypatch):
             events.append(("exit", name))
 
     monkeypatch.setattr(torch.cuda.nvtx, "range", record_range)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", push)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", pop)
+    monkeypatch.setattr(torch.Tensor, "register_hook", record_hook)
     monkeypatch.setattr(model_module, "_moe_nsys_capture_active", False)
     inputs = torch.randn(2, 4, 8, requires_grad=True)
 
@@ -353,6 +372,8 @@ def test_grouped_moe_nvtx_capture_preserves_outputs_and_gradients(monkeypatch):
 
     reference, reference_gradients = forward_and_gradients()
     assert events == []
+    assert installed_hooks == []
+    assert backward_events == []
     model_module.set_moe_nsys_capture_active(True)
     actual, actual_gradients = forward_and_gradients()
     expected_names = (
@@ -362,14 +383,99 @@ def test_grouped_moe_nvtx_capture_preserves_outputs_and_gradients(monkeypatch):
     assert events == [
         (phase, name) for name in expected_names for phase in ("enter", "exit")
     ]
+    assert len(installed_hooks) == 5
+    assert backward_events == [
+        (phase, name)
+        for name in ("moe_bw.combine", "moe_bw.fc2", "moe_bw.activation", "moe_bw.fc1")
+        for phase in ("push", "pop")
+    ]
+    assert range_stack == []
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
     for actual_grad, reference_grad in zip(actual_gradients, reference_gradients):
         torch.testing.assert_close(actual_grad, reference_grad, rtol=0, atol=0)
 
     model_module.set_moe_nsys_capture_active(False)
     events.clear()
+    installed_hooks.clear()
+    backward_events.clear()
     forward_and_gradients()
     assert events == []
+    assert installed_hooks == []
+    assert backward_events == []
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_moe_backward_ranges_balance_repeated_and_partial_backward(monkeypatch, partial):
+    monkeypatch.setattr(model_module, "_moe_nsys_capture_active", True)
+    stack = []
+    pushes = []
+
+    def push(name):
+        stack.append(name)
+        pushes.append(name)
+
+    def pop():
+        assert stack
+        stack.pop()
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", push)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", pop)
+    x_sorted = torch.ones(2, 3, requires_grad=True)
+    h_pre = x_sorted * 2
+    h_act = h_pre.relu().square()
+    out_sorted = h_act * 3
+    out = out_sorted * 4
+    model_module._register_moe_backward_ranges(out, out_sorted, h_act, h_pre, x_sorted)
+    for _ in range(2):
+        torch.autograd.grad(out.sum(), h_act if partial else x_sorted, retain_graph=True)
+        assert stack == []
+    assert pushes
+    pushes.clear()
+    model_module.set_moe_nsys_capture_active(False)
+    torch.autograd.grad(out.sum(), x_sorted)
+    assert pushes == []
+    assert stack == []
+
+
+def test_moe_backward_hooks_not_installed_without_grad_or_capture(monkeypatch):
+    def fail(*args):
+        pytest.fail("unexpected hook registration")
+
+    monkeypatch.setattr(torch.Tensor, "register_hook", fail)
+    tensor = torch.ones(2, 3, requires_grad=True)
+    monkeypatch.setattr(model_module, "_moe_nsys_capture_active", False)
+    model_module._register_moe_backward_ranges(*([tensor] * 5))
+    model_module.set_moe_nsys_capture_active(True)
+    with torch.no_grad():
+        model_module._register_moe_backward_ranges(*([tensor] * 5))
+
+
+def test_moe_backward_ranges_with_nondifferentiable_input(monkeypatch):
+    monkeypatch.setattr(model_module, "_moe_nsys_capture_active", True)
+    stack = []
+    names = []
+
+    def push(name):
+        stack.append(name)
+        names.append(name)
+
+    def pop():
+        assert stack
+        stack.pop()
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", push)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", pop)
+    x_sorted = torch.ones(2, 3)
+    weight = torch.ones(2, 3, requires_grad=True)
+    h_pre = x_sorted * weight
+    h_act = h_pre.relu().square()
+    out_sorted = h_act * 3
+    out = out_sorted * 4
+    model_module._register_moe_backward_ranges(out, out_sorted, h_act, h_pre, x_sorted)
+    out.sum().backward()
+    # Do not open FC1 when no input-gradient endpoint exists to close it.
+    assert names == ["moe_bw.combine", "moe_bw.fc2", "moe_bw.activation"]
+    assert stack == []
 
 
 @pytest.mark.skipif(GROUPED_GEMM_AVAILABLE, reason="grouped_gemm IS installed; this test "
