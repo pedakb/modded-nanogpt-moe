@@ -182,32 +182,32 @@ def test_actual_adamw_muon_updates_gradients_and_no_state_changes(monkeypatch, l
         optimizer.step()
     observer.after_optimizers(writer, 10, 1)
     assert not observer.before and not observer.metrics
-    assert writer.scalars["train/loss"] == (2., 10)
-    assert "routing/layer_00/load_fraction" in writer.histograms
-    assert writer.scalars["routing/layer_00/zero_experts"] == (2., 10)
+    assert writer.scalars["metric/loss/train"] == (2., 10)
+    assert "router/l00/load/fraction" in writer.histograms
+    assert writer.scalars["router/l00/load/zero"] == (2., 10)
     torch.testing.assert_close(torch.get_rng_state(), saved_rng, atol=0, rtol=0)
     for (name, p), ref in zip(model.named_parameters(), reference.parameters()):
         torch.testing.assert_close(p, ref, atol=0, rtol=0)
     p = model.embed.weight
     delta = (old["embed.weight"].float() - p.detach().float()).norm().item()
-    assert writer.scalars["optimization/embedding/update_norm"] == pytest.approx((delta, 10))
-    assert writer.scalars["optimization/embedding/grad_norm"][0] == pytest.approx(2.)
-    assert writer.scalars["optimization/embedding/param_rms"][0] == pytest.approx(0.125)
-    assert writer.scalars["optimization/embedding/grad_rms"][0] == pytest.approx(0.25)
-    assert writer.scalars["optimization/embedding/update_rms"][0] == pytest.approx(delta / 8)
+    assert writer.scalars["opt/embed/update_norm"] == pytest.approx((delta, 10))
+    assert writer.scalars["opt/embed/grad_norm"][0] == pytest.approx(2.)
+    assert writer.scalars["opt/embed/param_rms"][0] == pytest.approx(0.125)
+    assert writer.scalars["opt/embed/grad_rms"][0] == pytest.approx(0.25)
+    assert writer.scalars["opt/embed/update_rms"][0] == pytest.approx(delta / 8)
     fc = model.blocks[0].mlp.fc_weight[0] if layout == "packed" else model.blocks[0].mlp.experts[0].fc.weight
     delta = (torch.full_like(fc, 0.125).float() - fc.detach().float()).norm().item()
-    assert writer.scalars["optimization/experts/layer_00/fc1/update_norm_median"][0] == pytest.approx(delta)
-    for stat in ("p10", "median", "p90"):
-        assert writer.scalars[f"optimization/experts/layer_00/fc1/update_rms_{stat}"][0] == pytest.approx(delta / 8)
-        assert writer.scalars[f"optimization/experts/layer_00/fc1/param_rms_{stat}"][0] == pytest.approx(0.125)
-        assert writer.scalars[f"optimization/experts/layer_00/fc1/grad_rms_{stat}"][0] == pytest.approx(0.25)
-        assert writer.scalars[f"optimization/experts/layer_00/fc1/update_ratio_{stat}"][0] == pytest.approx(delta)
-    assert writer.scalars["optimization/router/layer_00/param_rms"][0] == pytest.approx(0.125)
-    assert writer.scalars["optimization/router/layer_00/grad_rms"][0] == pytest.approx(0.25)
-    assert "optimization/experts/layer_00/fc1/grad_rms_min" not in writer.scalars
-    assert "optimization/experts/layer_00/fc1/grad_rms" not in writer.histograms
-    assert "optimization/experts/layer_00/fc1/update_norm" in writer.histograms
+    assert writer.scalars["opt/expert/l00/fc1/update_norm_med"][0] == pytest.approx(delta)
+    for stat in ("p10", "med", "p90"):
+        assert writer.scalars[f"opt/expert/l00/fc1/update_rms_{stat}"][0] == pytest.approx(delta / 8)
+        assert writer.scalars[f"opt/expert/l00/fc1/param_rms_{stat}"][0] == pytest.approx(0.125)
+        assert writer.scalars[f"opt/expert/l00/fc1/grad_rms_{stat}"][0] == pytest.approx(0.25)
+        assert writer.scalars[f"opt/expert/l00/fc1/update_ratio_{stat}"][0] == pytest.approx(delta)
+    assert writer.scalars["opt/router/l00/param_rms"][0] == pytest.approx(0.125)
+    assert writer.scalars["opt/router/l00/grad_rms"][0] == pytest.approx(0.25)
+    assert "opt/expert/l00/fc1/grad_rms_min" not in writer.scalars
+    assert "opt/expert/l00/fc1/grad_rms" not in writer.histograms
+    assert "opt/expert/l00/fc1/update_norm" in writer.histograms
     for actual, expected in zip(actual_opts, expected_opts):
         for p, ref in zip([p for g in actual.param_groups for p in g["params"]],
                           [p for g in expected.param_groups for p in g["params"]]):
@@ -225,7 +225,7 @@ def test_bf16_actual_delta_uses_stored_values(monkeypatch):
         model.embed.weight.add_(0.0001)  # Rounds away at 0.125 in BF16.
     writer = Writer()
     observer.after_optimizers(writer, 10, 1)
-    assert writer.scalars["optimization/embedding/update_norm"] == (0., 10)
+    assert writer.scalars["opt/embed/update_norm"] == (0., 10)
     assert not writer.histograms
 
 
@@ -298,7 +298,7 @@ def test_sampled_logit_gradient_rms_no_retention_and_no_normal_hooks(monkeypatch
     observer.before_optimizers()
     writer = Writer()
     observer.after_optimizers(writer, 10, 4)
-    assert writer.scalars["routing/layer_00/dL_dlogits_rms"] == pytest.approx((value.item(), 10))
+    assert writer.scalars["opt/router/l00/dlogit_rms"] == pytest.approx((value.item(), 10))
     # Detached/no-grad router output cannot carry a gradient hook.
     with observer.capture_routing(), torch.no_grad():
         moe(torch.ones(1, 2, 8, dtype=dtype))
@@ -307,7 +307,7 @@ def test_sampled_logit_gradient_rms_no_retention_and_no_normal_hooks(monkeypatch
     observer.before_optimizers()
     writer = Writer()
     observer.after_optimizers(writer, 10, 1)
-    assert "routing/layer_00/logit_rms" in writer.scalars
+    assert "router/l00/logit_rms" in writer.scalars
 
 
 def test_expert_rms_percentile_series_are_per_expert(monkeypatch):
@@ -325,11 +325,122 @@ def test_expert_rms_percentile_series_are_per_expert(monkeypatch):
             expert.fc.weight.add_(0.25 * (index + 1.))
     writer = Writer()
     observer.after_optimizers(writer, 10, 1)
-    for suffix, quantile in (("p10", 1.3), ("median", 2.5), ("p90", 3.7)):
+    for suffix, quantile in (("p10", 1.3), ("med", 2.5), ("p90", 3.7)):
         for metric, value in (("param_rms", quantile), ("grad_rms", 2 * quantile),
                               ("update_rms", 0.25 * quantile), ("update_ratio", 0.25)):
-            tag = f"optimization/experts/layer_00/fc1/{metric}_{suffix}"
+            tag = f"opt/expert/l00/fc1/{metric}_{suffix}"
             assert writer.scalars[tag] == pytest.approx((value, 10))
+
+
+@pytest.mark.parametrize("layout", ["modulelist", "packed"])
+def test_canonical_diagnostic_tags_and_values(monkeypatch, layout):
+    model = toy_model(monkeypatch, layout)
+    model.blocks.append(copy.deepcopy(model.blocks[0]))
+    observer = diag.TrainingDiagnostics(model, dict(SETTINGS, histogram_interval=10))
+    with observer.capture_routing():
+        for block in model.blocks:
+            block.mlp(torch.ones(1, 3, 8)).sum().backward()
+        observer.observe_loss(torch.tensor(6.))
+    routing = {layer: stats.finish()[0] for layer, stats in observer.routing.items()}
+    observer.before_optimizers()
+    writer = Writer()
+    observer.after_optimizers(writer, 10, 3)
+    expected = {"metric/loss/train"}
+    norms = ("param_norm", "grad_norm", "grad_ratio", "update_norm", "update_ratio")
+    rms = ("param_rms", "grad_rms", "update_rms")
+    for group in ("attn", "embed", "head"):
+        expected.update(f"opt/{group}/{metric}" for metric in norms + rms)
+    # Explicit expected names, independent of the implementation's tag mapping.
+    router_names = {
+        "entropy": "entropy", "normalized_entropy": "entropy_norm",
+        "top1_prob": "top1_prob", "top1_top2_gap": "top1_top2_gap",
+        "logit_rms": "logit_rms", "topk_margin": "topk_margin",
+        "topk_margin_median": "topk_margin_med",
+        "min_load_fraction": "load/min", "max_load_fraction": "load/max",
+        "mean_load_fraction": "load/mean", "std_load_fraction": "load/std",
+        "load_cv": "load/cv", "load_entropy": "load/entropy",
+        "normalized_load_entropy": "load/entropy_norm",
+        "zero_experts": "load/zero", "max_over_mean_load": "load/max_mean",
+        "topk_margin_below_0.01": "margin/lt_001",
+        "topk_margin_below_0.05": "margin/lt_005",
+        "topk_margin_below_0.1": "margin/lt_01",
+    }
+    expected_histograms = set()
+    for index in range(2):
+        layer = f"l{index:02d}"
+        expected.update(f"opt/router/{layer}/{metric}" for metric in norms + rms + ("dlogit_rms",))
+        for old, new in router_names.items():
+            tag = f"router/{layer}/{new}"
+            expected.add(tag)
+            assert writer.scalars[tag] == pytest.approx((routing[f"layer_{index:02d}"][old].item(), 10))
+        for fc in ("fc1", "fc2"):
+            for metric in norms + rms:
+                suffixes = ("p10", "med", "p90") if metric in rms else (
+                    "min", "med", "mean", "max", "std", "p10", "p90")
+                expected.update(f"opt/expert/{layer}/{fc}/{metric}_{suffix}" for suffix in suffixes)
+            expected.update(f"opt/compare/{layer}/{fc}/router_over_expert_{metric}"
+                            for metric in ("grad_norm", "update_ratio"))
+            expected_histograms.update(f"opt/expert/{layer}/{fc}/{metric}"
+                                       for metric in ("param_norm", "grad_norm", "update_norm"))
+        expected_histograms.add(f"router/{layer}/load/fraction")
+    assert set(writer.scalars) == expected  # No legacy aliases or other namespaces.
+    assert set(writer.histograms) == expected_histograms
+    assert writer.scalars["metric/loss/train"] == (2., 10)
+
+
+@pytest.mark.parametrize("index", range(12))
+def test_layer_tag_zero_padding(index):
+    assert diag._compact_group(f"experts/layer_{index:02d}/fc1") == f"expert/l{index:02d}/fc1"
+
+
+@pytest.mark.parametrize("adamw_groups,muon_groups", [(3, 1), (1, 1), (4, 2)])
+def test_trainer_learning_rate_tags_generalize_group_counts(adamw_groups, muon_groups):
+    adamw = torch.optim.AdamW([
+        dict(params=[nn.Parameter(torch.ones(2, 2))], lr=0.01 * (i + 1))
+        for i in range(adamw_groups)])
+    muon = optim.Muon([nn.Parameter(torch.ones(2, 2))], lr=0.025)
+    for i in range(1, muon_groups):
+        muon.add_param_group(dict(params=[nn.Parameter(torch.ones(2, 2))], lr=0.025 * (i + 1)))
+    tree = ast.parse(inspect.getsource(train.main))
+    lr_loop = next(node for node in ast.walk(tree) if isinstance(node, ast.For)
+                   and "learning_rate_tag(opt, grp_idx)" in ast.unparse(node)
+                   and ast.unparse(node.target) == "(opt_idx, opt)")
+    writer = Writer()
+    namespace = dict(writer=writer, optimizers=[adamw, muon], step=7,
+                     learning_rate_tag=train.learning_rate_tag)
+    exec(compile(ast.Module(body=[lr_loop], type_ignores=[]), train.__file__, "exec"), namespace)
+    expected = {f"opt/lr/adamw/g{i}": (0.01 * (i + 1), 7) for i in range(adamw_groups)}
+    expected.update({"opt/lr/muon" if muon_groups == 1 else f"opt/lr/muon/g{i}":
+                     (0.025 * (i + 1), 7) for i in range(muon_groups)})
+    assert writer.scalars == expected
+
+
+@pytest.mark.parametrize("seconds_per_update", [0., 2.])
+def test_trainer_loss_and_performance_tags(seconds_per_update):
+    tree = ast.parse(inspect.getsource(train.main))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and ast.unparse(node.func) == "writer.add_scalar"
+             and isinstance(node.args[0], ast.Constant)]
+    namespace = dict(batch_size=1024, completed_updates=3, step=3, val_loss=2.5,
+                     restored_elapsed=3 * seconds_per_update, step_avg=seconds_per_update,
+                     approx_training_time=4 * seconds_per_update)
+    emitted = []
+    for call in calls:
+        tag, value, step = [eval(compile(ast.Expression(arg), train.__file__, "eval"), namespace)
+                            for arg in call.args]
+        emitted.append(tag)
+        if tag == "metric/loss/val":
+            assert (value, step) == (2.5, 3)
+        elif tag == "perf/step_ms":
+            assert value == 1000 * seconds_per_update
+        elif tag == "perf/train_s":
+            assert value == step * seconds_per_update
+        elif tag == "perf/tok_s":
+            assert value == 512 if seconds_per_update else math.isnan(value)
+        else:
+            pytest.fail(f"Noncanonical trainer tag: {tag}")
+    assert sorted(emitted) == sorted(["metric/loss/val"] + ["perf/train_s"] * 2
+                                     + ["perf/step_ms"] * 3 + ["perf/tok_s"] * 3)
 
 
 @pytest.mark.parametrize("override", [dict(writer=None), dict(rank=1), dict(benchmark=True),

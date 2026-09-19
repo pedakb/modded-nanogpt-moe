@@ -20,20 +20,33 @@ opt-in. Nonzero ranks and runs without a writer never instantiate the observer.
 
 ## Metrics and meanings
 
-All new training events use the number of **completed optimizer updates** (10,
-20, ... by default); resuming preserves that cadence. Existing tags remain.
+Sampled training diagnostics use the number of **completed optimizer updates**
+(10, 20, ... by default); resuming preserves that cadence. All TensorBoard tags
+use only `metric/`, `opt/`, `router/`, and `perf/`. Layer names are zero-padded
+`l00`, `l01`, ..., `l11`. Historical event files are not migrated and no legacy
+aliases are emitted; resuming an older run retains its historical old tags.
 
 | Prefix | Metrics |
 | --- | --- |
-| `optimization/router/layer_00/` | `param_norm`, `grad_norm`, `grad_ratio`, `update_norm`, `update_ratio`, plus `param_rms`, `grad_rms`, `update_rms` |
-| `optimization/experts/layer_00/fc1/` (also `fc2`) | Existing five L2/relative metrics keep `_min`, `_median`, `_mean`, `_max`, `_std` and add `_p10`, `_p90`. New `param_rms`, `grad_rms`, `update_rms` log only `_p10`, `_median`, `_p90` |
-| `optimization/attention/`, `optimization/embedding/`, `optimization/head/` | Same norms/ratios and RMS metrics as routers, aggregated per category |
-| `optimization/comparison/layer_00/fc1/` (also `fc2`) | `router_over_expert_grad_norm`, `router_over_expert_update_ratio` |
-| `routing/layer_00/` | `entropy`, `normalized_entropy`, `top1_prob`, `max_prob`, `top1_top2_gap`, `topk_margin`, `topk_margin_median`, `topk_margin_below_0.01`, `topk_margin_below_0.05`, `topk_margin_below_0.1` |
-| `routing/layer_00/` loads | `min_load_fraction`, `max_load_fraction`, `mean_load_fraction`, `std_load_fraction`, `load_cv`, `load_entropy`, `normalized_load_entropy`, `zero_experts`, `max_over_mean_load` |
-| `routing/layer_00/` scale/pressure | `logit_rms` (per-token centered logits), `dL_dlogits_rms` (actual local logit gradients, when backward traverses the router) |
-| `train/loss` | Rank-local summed training cross-entropy divided by rank-local tokens, on sampled updates |
-| `val/loss` | Alias of existing `eval/val_loss`, at the existing validation cadence |
+| `opt/router/l00/` | `param_norm`, `grad_norm`, `grad_ratio`, `update_norm`, `update_ratio`, plus `param_rms`, `grad_rms`, `update_rms`, `dlogit_rms` (actual local logit gradients, when backward traverses the router) |
+| `opt/expert/l00/fc1/` (also `fc2`) | Five L2/relative metrics with `_min`, `_med`, `_mean`, `_max`, `_std`, `_p10`, `_p90`. `param_rms`, `grad_rms`, `update_rms` log only `_p10`, `_med`, `_p90` |
+| `opt/attn/`, `opt/embed/`, `opt/head/` | Same parameter norms/ratios and RMS metrics as routers, aggregated per category |
+| `opt/compare/l00/fc1/` (also `fc2`) | `router_over_expert_grad_norm`, `router_over_expert_update_ratio` |
+| `router/l00/` | `entropy`, `entropy_norm`, `logit_rms`, `top1_prob`, `top1_top2_gap`, `topk_margin`, `topk_margin_med` |
+| `router/l00/load/` | `min`, `max`, `mean`, `std` (assignment fractions), `cv`, `entropy`, `entropy_norm`, `zero`, `max_mean`; optional `fraction` histogram |
+| `router/l00/margin/` | `lt_001`, `lt_005`, `lt_01`: fractions with margin below 0.01, 0.05, 0.1, respectively |
+| `metric/loss/train` | Rank-local summed training cross-entropy divided by rank-local tokens, on sampled updates |
+| `metric/loss/val` | Validation loss at the existing validation cadence; no duplicate aliases |
+| `opt/lr/adamw/` | `g0`, `g1`, `g2`, generalized to actual group count |
+| `opt/lr/muon` | Single-group Muon LR; multiple groups use `opt/lr/muon/g0`, `g1`, ... without an aggregate alias |
+| `perf/` | `step_ms`, `train_s`, `tok_s`, from existing training-time accounting |
+
+LR values retain their existing zero-based update index and cadence. Performance
+tags retain their existing write points: `train_s` is cumulative training time;
+`step_ms` is the cumulative average at updates/resume, and the interval average
+at validation. `tok_s` is global batch tokens divided by that same average step
+duration (NaN when unavailable). No extra timers or synchronization are added;
+these ordinary-training timings are not the synchronized benchmark measurement.
 
 Router norms include weight and bias together. Expert FC1/FC2 norms are weights
 only, one norm per independent expert matrix (both ModuleList and packed
@@ -77,7 +90,8 @@ separately for FC1 and FC2.
 Routing observes **existing** full FP32 probabilities and actual selected IDs,
 before optional selected-probability renormalization. Observations are detached,
 do not replace routing tensors, and retain no autograd graphs. Full entropy uses
-safe clamped logs. `top1_prob` and `max_prob` intentionally report the same mean.
+safe clamped logs. `top1_prob` reports the mean maximum probability, without a
+duplicate maximum-probability alias.
 An additional `topk(k+1)` (at least 2, capped at E) on detached logits supplies
 the boundary margin, never a full expert sort. For k=E the boundary does not
 exist, so margin tags are omitted; for E=1 the top1-top2 gap is omitted and
@@ -90,7 +104,7 @@ Population variance computes the centering without retaining a centered logit
 matrix. Pool variances first and take the square root once: do not average
 microbatch RMS values. E=1 gives zero. No raw-logit L2 scale metric is added.
 
-`dL_dlogits_rms` uses temporary router forward hooks to attach tensor gradient
+`opt/router/l00/dlogit_rms` uses temporary router forward hooks to attach tensor gradient
 hooks only during sampled capture. Each backward hook reduces the incoming
 gradient to an FP32 sum of squares and increments a Python element count; emission
 takes `sqrt(total_squares/total_elements)`. No `retain_grad`, saved logits/full
@@ -141,7 +155,7 @@ per-token logits or full parameter tensors.
   per-microbatch `.item()`/CPU transfers are added. Transfers necessarily wait
   for their results. Routine training timing includes diagnostic overhead;
   benchmark timing code and regions are unchanged and bypass all diagnostics.
-- Rank 0 alone collects/writes. Routing, logit-gradient RMS and `train/loss` are **rank-local**;
+- Rank 0 alone collects/writes. Routing, logit-gradient RMS and `metric/loss/train` are **rank-local**;
   gradient norms are after the pre-existing all-rank SUM, parameters/updates
   reflect the synchronized model. No new collectives. Do not interpret local
   utilization as whole-world utilization in distributed runs.

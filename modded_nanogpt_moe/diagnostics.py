@@ -10,6 +10,30 @@ import math
 import torch
 
 
+def _compact_group(name):
+    parts = {"experts": "expert", "attention": "attn", "embedding": "embed"}
+    return "/".join("l" + part[6:] if part.startswith("layer_") else parts.get(part, part)
+                    for part in name.split("/"))
+
+
+_ROUTER_TAG_NAMES = {
+    "normalized_entropy": "entropy_norm",
+    "min_load_fraction": "load/min",
+    "max_load_fraction": "load/max",
+    "mean_load_fraction": "load/mean",
+    "std_load_fraction": "load/std",
+    "load_cv": "load/cv",
+    "load_entropy": "load/entropy",
+    "normalized_load_entropy": "load/entropy_norm",
+    "zero_experts": "load/zero",
+    "max_over_mean_load": "load/max_mean",
+    "topk_margin_median": "topk_margin_med",
+    "topk_margin_below_0.01": "margin/lt_001",
+    "topk_margin_below_0.05": "margin/lt_005",
+    "topk_margin_below_0.1": "margin/lt_01",
+}
+
+
 def ratio(numerator, denominator):
     # Zero-initialized projections are common. Do not hide undefined ratios with
     # a small epsilon or infinity; TensorBoard receives NaN until well-defined.
@@ -238,14 +262,15 @@ class TrainingDiagnostics:
             for quantity in ("param", "grad", "update"):
                 metrics[f"{quantity}_rms"] = group.rms(metrics[f"{quantity}_norm"])
             for metric, value in metrics.items():
-                tag = f"optimization/{name}/{metric}"
+                tag = f"opt/{_compact_group(name)}/{metric}"
                 if group.experts:
                     # Keep old series; new RMS metrics need only the percentile
                     # band with median as the typical expert. No duplicate histograms.
                     stats = ({"median": midpoint_median(value)} if metric.endswith("_rms")
                              else summary(value))
                     stats.update(p10=percentile(value, 0.1), p90=percentile(value, 0.9))
-                    scalars.update({f"{tag}_{stat}": result for stat, result in stats.items()})
+                    scalars.update({f"{tag}_{'med' if stat == 'median' else stat}": result
+                                    for stat, result in stats.items()})
                     if histogram_due and metric.endswith("_norm"):
                         histograms[tag] = value
                 else:
@@ -255,15 +280,22 @@ class TrainingDiagnostics:
             router = self.metrics[f"router/{layer}"]
             for fc in ("fc1", "fc2"):
                 expert = self.metrics[f"experts/{layer}/{fc}"]
-                prefix = f"optimization/comparison/{layer}/{fc}"
+                prefix = f"opt/compare/{_compact_group(layer)}/{fc}"
                 scalars[f"{prefix}/router_over_expert_grad_norm"] = ratio(router["grad_norm"].squeeze(), midpoint_median(expert["grad_norm"]))
                 scalars[f"{prefix}/router_over_expert_update_ratio"] = ratio(router["update_ratio"].squeeze(), midpoint_median(expert["update_ratio"]))
             routing, q = self.routing[layer].finish()
-            scalars.update({f"routing/{layer}/{key}": value for key, value in routing.items()})
+            for key, value in routing.items():
+                if key == "max_prob":  # Duplicate of top1_prob; emit only the canonical tag.
+                    continue
+                if key == "dL_dlogits_rms":
+                    tag = f"opt/router/{_compact_group(layer)}/dlogit_rms"
+                else:
+                    tag = f"router/{_compact_group(layer)}/{_ROUTER_TAG_NAMES.get(key, key)}"
+                scalars[tag] = value
             if histogram_due and q is not None:
-                histograms[f"routing/{layer}/load_fraction"] = q
+                histograms[f"router/{_compact_group(layer)}/load/fraction"] = q
         if self.losses:
-            scalars["train/loss"] = torch.stack(self.losses).sum() / local_tokens
+            scalars["metric/loss/train"] = torch.stack(self.losses).sum() / local_tokens
         # One batched device->host scalar transfer per sampled update. Histogram
         # vectors use a second batched transfer only at their optional cadence.
         values = torch.stack([value.float() for value in scalars.values()]).cpu().tolist()

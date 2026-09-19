@@ -80,6 +80,12 @@ def tensorboard_run_directory(root, system, run_name):
     return Path(root) / "modded-nanogpt-moe" / system / str(run_name)
 
 
+def learning_rate_tag(optimizer, group_index):
+    name = type(optimizer).__name__.lower()
+    suffix = "" if name == "muon" and len(optimizer.param_groups) == 1 else f"/g{group_index}"
+    return f"opt/lr/{name}{suffix}"
+
+
 def require_unused_tensorboard_run_directory(root, system, run_name):
     run_directory = tensorboard_run_directory(root, system, run_name)
     if run_directory.exists():
@@ -599,12 +605,15 @@ def main(argv=None):
             if resume_checkpoint is not None and completed_updates > 0:
                 restored_elapsed = training_time + current_segment_time
                 writer.add_scalar(
-                    "perf/approx_training_time_s", restored_elapsed, completed_updates)
+                    "perf/train_s", restored_elapsed, completed_updates)
                 writer.add_scalar(
-                    "perf/step_avg_ms",
+                    "perf/step_ms",
                     1000 * restored_elapsed / completed_updates,
                     completed_updates,
                 )
+                writer.add_scalar(
+                    "perf/tok_s", batch_size * completed_updates / restored_elapsed
+                    if restored_elapsed > 0 else float("nan"), completed_updates)
                 writer.flush()
     
         tb_diagnostics = make_diagnostics(
@@ -658,9 +667,10 @@ def main(argv=None):
                        + f" mem_reserved_peak:{torch.cuda.max_memory_reserved()/2**30:.3f}GiB",
                        console=True)
                 if writer is not None:
-                    writer.add_scalar("eval/val_loss", float(val_loss), step)
-                    writer.add_scalar("val/loss", float(val_loss), step)
-                    writer.add_scalar("perf/step_avg_ms", 1000 * step_avg, step)
+                    writer.add_scalar("metric/loss/val", float(val_loss), step)
+                    writer.add_scalar("perf/step_ms", 1000 * step_avg, step)
+                    writer.add_scalar("perf/tok_s", batch_size / step_avg
+                                      if step_avg > 0 else float("nan"), step)
                     writer.flush()
                 model.train()
                 # start the clock again
@@ -744,7 +754,7 @@ def main(argv=None):
                     for opt_idx, opt in enumerate(optimizers):
                         for grp_idx, group in enumerate(opt.param_groups):
                             writer.add_scalar(
-                                f"optim/lr_opt{opt_idx}_group{grp_idx}", group["lr"], step)
+                                learning_rate_tag(opt, grp_idx), group["lr"], step)
                 if collect_tb:
                     tb_diagnostics.before_optimizers()
                 for opt_idx, opt in enumerate(optimizers):
@@ -799,8 +809,10 @@ def main(argv=None):
                        + f" mem_reserved_peak:{torch.cuda.max_memory_reserved()/2**30:.3f}GiB",
                        console=True, log=False)
             if writer is not None:
-                writer.add_scalar("perf/approx_training_time_s", approx_training_time, step + 1)
-                writer.add_scalar("perf/step_avg_ms", 1000 * approx_training_time / (step + 1), step + 1)
+                writer.add_scalar("perf/train_s", approx_training_time, step + 1)
+                writer.add_scalar("perf/step_ms", 1000 * approx_training_time / (step + 1), step + 1)
+                writer.add_scalar("perf/tok_s", batch_size * (step + 1) / approx_training_time
+                                  if approx_training_time > 0 else float("nan"), step + 1)
                 writer.flush()
     
             completed_updates = step + 1

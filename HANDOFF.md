@@ -4,13 +4,34 @@ Updated: 2026-09-18
 
 ## Current goal and state
 
-Current base on `cleanup-active-codebase`: `68325ff` (`Add native grouped GEMM
-implementation`), initially clean. Current task: sampled TensorBoard diagnostics
-for router/expert/optimizer dynamics. The prior GEMM candidate is committed;
+Current base on `cleanup-active-codebase`: `0fba645` (`Add sampled MoE training
+diagnostics`), initially clean. Current task: TensorBoard tag hierarchy cleanup
+only. Diagnostics and the prior GEMM candidate are committed;
 its CUDA correctness/performance remain pending as recorded below. No commits,
 remote jobs, dependency installs or extension rebuilds performed this task.
 
-## TensorBoard diagnostics (current work)
+## TensorBoard tag cleanup (current work)
+
+- Emit only `metric/`, `opt/`, `router/`, `perf/`; compact layer names `l00`,
+  expert summaries `_med`, and groups `expert`, `attn`, `embed`, `head`.
+  Losses are exclusively `metric/loss/train` and `metric/loss/val`. Router
+  logit-gradient RMS moves to `opt/router/l00/dlogit_rms`; behavioral metrics
+  remain under `router/l00/`, with `load/` and `margin/` subgroups. Remove the
+  duplicate max-probability alias (keep `top1_prob`). No metric math changes.
+- LR tags use `opt/lr/adamw/gN`, `opt/lr/muon` (or `/gN` for multiple Muon
+  groups). Performance tags are `perf/train_s`, `perf/step_ms`, `perf/tok_s`;
+  throughput is a host-side division using the same existing average duration
+  and global batch size. No extra clock reads, synchronization or GPU work.
+- Sampling, actual-update snapshots, benchmark/Nsight gating, optimizer/model
+  behavior, event steps and checkpoint/purge semantics unchanged. No historical
+  event migration or legacy aliases; resumed old runs retain old historical tags.
+- Dirty files: diagnostics.py, train.py, tests/test_diagnostics.py,
+  docs/diagnostics.md, HANDOFF.md. No config/dependency/model/kernel changes.
+- Validation: targeted diagnostics tests: 50 passed. Full suite: 231 passed,
+  143 CUDA-dependent tests skipped. `git diff --check` passed. CUDA event
+  inspection remains pending on Vista.
+
+## TensorBoard diagnostics (committed implementation)
 
 - New `diagnostics.py` owns aggregation/snapshot/emission logic. TOML defaults:
   `[diagnostics] scalar_interval=10, histogram_interval=0, during_nsys=false`.
@@ -35,7 +56,7 @@ remote jobs, dependency installs or extension rebuilds performed this task.
   norm/ratio summaries remain and gain p10/p90. Median is the typical-expert
   statistic; percentiles use linear interpolation via kthvalue selection.
 - Router `logit_rms` pools token-wise centered variance over all sampled
-  microbatches, so common logit shifts do not change it. `dL_dlogits_rms` uses
+  microbatches, so common logit shifts do not change it. `dlogit_rms` uses
   temporary router-forward/tensor-gradient hooks only inside sampled capture;
   hooks retain scalar sums/counts, not logits, full gradients or graphs, and
   are removed in finally. No normal-update hooks, extra backward, synchronization
@@ -53,8 +74,8 @@ remote jobs, dependency installs or extension rebuilds performed this task.
   expert sort; median via kthvalue selection. Counts/sums aggregate over the
   entire sampled update. Margins retained as detached per-token FP32 values
   (~24 MiB for 12 layers/524288 rank-local tokens). No graphs retained.
-- `train/loss` is sampled rank-local cross entropy per token; `val/loss` aliases
-  existing `eval/val_loss`. Existing scalar tags/cleanup/purge unchanged. Scalars
+- `metric/loss/train` is sampled rank-local cross entropy per token;
+  `metric/loss/val` logs validation loss. Writer cleanup/purge unchanged. Scalars
   use one batched host transfer per sample; optional histograms use a second.
   Routing/loss are rank-local; gradients follow the existing SUM all-reduce.
   No new distributed reductions or checkpoint payload state.
@@ -74,12 +95,7 @@ remote jobs, dependency installs or extension rebuilds performed this task.
   with TB enabled. Lower frequency reduces average overhead, not snapshot peak
   memory; disable diagnostics for tight memory budgets. Do not infer GPU overhead
   from CPU tests. Existing end-to-end benchmark remains diagnostic-free.
-- Dirty task files: diagnostics.py (new), config.py, model.py, train.py,
-  tests/test_diagnostics.py (new), tests/test_package.py, docs/diagnostics.md
-  (new), README.md, HANDOFF.md. Prior GEMM files and optimizers untouched.
-  Follow-up edits are limited to diagnostics.py, tests/test_diagnostics.py,
-  docs/diagnostics.md and HANDOFF.md; earlier uncommitted diagnostics work is
-  preserved. Next: inspect these new tags and sampled overhead on Vista with
+- Next: inspect the canonical tags and sampled overhead on Vista with
   TensorBoard enabled; CPU tests cannot establish CUDA correctness/performance.
 
 ## Native grouped GEMM candidate (committed; GPU validation pending)
