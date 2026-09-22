@@ -451,6 +451,8 @@ def test_vista_launcher_submits_itself_as_nonrecursive_worker(tmp_path, mail_use
     subprocess.run(
         [
             "bash", str(launcher), "--submit", "--time", "08:00:00",
+            "--job-name", "dense-moe comparison", "--account", "allocation",
+            "--sbatch-arg=--partition=gh", "--sbatch-arg", "--exclusive",
             "configs/dense_baseline.toml", "configs/moe_e8k2_r2.toml",
         ],
         cwd=tmp_path,
@@ -461,6 +463,7 @@ def test_vista_launcher_submits_itself_as_nonrecursive_worker(tmp_path, mail_use
     assert capture.read_text().splitlines() == [
         "--time=08:00:00",
         *([f"--mail-user={mail_user}", "--mail-type=ALL"] if mail_user else []),
+        "--job-name=dense-moe comparison", "--account=allocation", "--partition=gh", "--exclusive",
         str(launcher),
         "--worker",
         "--",
@@ -487,7 +490,7 @@ def test_vista_submission_email_options_without_cluster_setup(tmp_path, mail_use
     environment.pop("SLURM_MAIL_USER", None)
     if mail_user is not None:
         environment["SLURM_MAIL_USER"] = mail_user
-    setup = ('set -euo pipefail\nsubmit=1\nwalltime_set=0\n'
+    setup = ('set -euo pipefail\nsubmit=1\nwalltime_set=0\nsbatch_options=()\n'
              'script_path="/repo with spaces/scripts/vista/train.sh"\n'
              'checkpoint_interval=""\nresume_checkpoint=""\n'
              'config_paths=("/repo with spaces/config.toml")\n')

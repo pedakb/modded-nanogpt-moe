@@ -114,8 +114,26 @@ scripts/vista/train.sh --submit \
 
 `train.sh --submit` submits the same script in a non-recursive worker mode. It
 preserves the established `gh`, one-node, one-task, six-hour default. Override
-only the Slurm time request with, for example,
-`scripts/vista/train.sh --submit --time 08:00:00 CONFIG`. All config paths and
+Slurm settings with `--time`, `--job-name`, and `--account`, for example:
+
+```bash
+scripts/vista/train.sh --submit \
+  --job-name dense-moe-comparison --account YOUR_ALLOCATION --time 06:00:00 \
+  --sbatch-arg=--partition=gh \
+  configs/dense_baseline.toml configs/moe_e8k2_r2.toml configs/moe_e64k8_r0.5.toml
+```
+
+Use repeatable `--sbatch-arg=--option=value` (or `--sbatch-arg --flag`) for other
+scheduler options. Each occurrence forwards one argument, without shell
+evaluation; use `=` inside options taking a value. These options require
+`--submit` and are not passed to the training worker. `--wrap` is disallowed
+because it would replace the worker script. Additional options follow the
+launcher time/email settings in the sbatch argument list; avoid conflicting
+settings. Resource overrides do not enable multi-node or multi-GPU training.
+The job name labels the allocation only: TOML `run_name`, TensorBoard paths,
+checkpoint paths, and the persistent suite log name are unchanged.
+
+All config paths and
 TOML run names are validated before submission and again before execution.
 Configs run as separate processes in the supplied order, stopping at the first
 failure. Duplicate run names in one suite are rejected. One combined suite log

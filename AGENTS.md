@@ -187,6 +187,12 @@ runs belong on an existing interactive allocation. Checkpoint cadence normally
 comes from each TOML; the optional override and first-config resume controls are
 documented in `README.md`.
 
+Submission accepts `--job-name NAME`, `--account ACCOUNT`, and repeatable
+`--sbatch-arg=--option=value` (or `--sbatch-arg --flag`), all requiring
+`--submit`. Scheduler options are quoted array elements, not shell commands;
+`--wrap` is rejected to preserve the worker. These do not change TOML run names,
+checkpoint/TensorBoard paths, or enable distributed training. See README.
+
 Set `SLURM_MAIL_USER` to a nonempty email address before `--submit` to request
 `--mail-user` and `--mail-type=ALL`. Unset/empty adds no email options.
 Notifications cover the Slurm job, not individual configs within the suite.

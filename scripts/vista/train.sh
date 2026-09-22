@@ -21,6 +21,9 @@ If no config is supplied, configs/moe_e64k8_r0.5.toml is used.
 Options:
   --submit                 Submit this script through sbatch
   --time SLURM_TIME        Override Slurm walltime (requires --submit)
+  --job-name NAME          Set the Slurm job name (requires --submit)
+  --account ACCOUNT        Set the Slurm allocation account (requires --submit)
+  --sbatch-arg OPTION      Forward one --option[=value] to sbatch (repeatable)
   --steps N                Run N updates interactively (one config only)
   --checkpoint-interval N  Save per-run checkpoints every N updates (0 = final only)
   --resume PATH            Resume the first config from PATH
@@ -33,6 +36,7 @@ worker=0
 benchmark_worker=0
 walltime=""
 walltime_set=0
+sbatch_options=()
 steps=""
 checkpoint_interval=""
 resume_checkpoint=""
@@ -60,6 +64,26 @@ while [[ $# -gt 0 ]]; do
             fi
             steps="$2"
             shift 2
+            ;;
+        --job-name|--account|--sbatch-arg)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "Error: $1 requires a nonempty value" >&2
+                exit 2
+            fi
+            if [[ "$1" == --sbatch-arg ]]; then
+                sbatch_options+=("$2")
+            else
+                if [[ "$2" == -* ]]; then
+                    echo "Error: $1 requires a value, not another option" >&2
+                    exit 2
+                fi
+                sbatch_options+=("$1=$2")
+            fi
+            shift 2
+            ;;
+        --sbatch-arg=*)
+            sbatch_options+=("${1#*=}")
+            shift
             ;;
         --checkpoint-interval)
             if [[ $# -lt 2 ]]; then
@@ -117,6 +141,18 @@ fi
 if [[ "$walltime_set" -eq 1 && -z "$walltime" ]]; then
     echo "Error: --time requires a nonempty Slurm time value" >&2
     exit 2
+fi
+if [[ ${#sbatch_options[@]} -gt 0 ]]; then
+    if [[ "$submit" -ne 1 ]]; then
+        echo "Error: --job-name, --account and --sbatch-arg require --submit" >&2
+        exit 2
+    fi
+    for option in "${sbatch_options[@]}"; do
+        if [[ ! "$option" =~ ^--[a-zA-Z][a-zA-Z0-9-]*(=.*)?$ || "$option" == --wrap || "$option" == --wrap=* ]]; then
+            echo "Error: expected one --option[=value] for sbatch (no --wrap), got: $option" >&2
+            exit 2
+        fi
+    done
 fi
 if [[ -n "$steps" && ! "$steps" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: --steps must be a positive integer, got: $steps" >&2
@@ -207,6 +243,9 @@ if [[ "$submit" -eq 1 ]]; then
     fi
     if [[ -n "${SLURM_MAIL_USER:-}" ]]; then
         submission+=("--mail-user=$SLURM_MAIL_USER" --mail-type=ALL)
+    fi
+    if [[ ${#sbatch_options[@]} -gt 0 ]]; then
+        submission+=("${sbatch_options[@]}")
     fi
     submission+=("$script_path" --worker)
     if [[ -n "$checkpoint_interval" ]]; then

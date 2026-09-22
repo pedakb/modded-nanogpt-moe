@@ -4,12 +4,30 @@ Updated: 2026-09-22
 
 ## Current goal and state
 
-Current base on `cleanup-active-codebase`: `f24cc5a` (`Add config-driven
-checkpoint policy`). Current uncommitted task moves validation tokens and
-cadence into `[evaluation]`. No training, benchmark, submission, dependency
-installation, commit or push performed.
+Current base on `cleanup-active-codebase`: `ef85121` (`Restore optional Vista
+Slurm email notifications`), initially clean. Current uncommitted task: expose
+Slurm job name/account and additional scheduler options. No training, benchmark,
+submission, dependency installation, commit or push performed.
 
-## Production config standardization (current work)
+## Slurm submission options (current work)
+
+- `scripts/vista/train.sh --submit` accepts `--job-name NAME`, `--account ACCOUNT`
+  and repeatable `--sbatch-arg=--option=value` / `--sbatch-arg --flag`.
+  Options are quoted array elements before the script path, never evaluated;
+  they require submission mode. `--wrap` is rejected to preserve the worker.
+  No changes to scientific configs, run identities, log paths or training code.
+- Updated README/AGENTS and tests. CPU submission parser/block tests use a fake
+  sbatch; 21 passed, including unset/empty mail, quoting, invalid arguments,
+  worker argument separation, and scheduler exit status. Shell syntax and diff
+  checks passed. Broader package selection: 35 passed, 4 failed, 6 deselected.
+  The four failures predate this patch: committed configs use checkpoint250,
+  but tests still expect100. Left untouched. Full-launcher tests require Bash4+
+  (this Mac has3.2); run them on Vista before submission.
+- Dirty files: launcher, tests/test_package.py, new tests/test_vista_submission.py,
+  README.md, AGENTS.md, HANDOFF.md. Next: review/commit separately when authorized,
+  then verify the full submission tests on Vista (all use fake sbatch, no jobs).
+
+## Production config standardization (prior work)
 
 - Dense ratio 4; E8/K2 ratio 2; E64/K8 ratio 0.5. Both MoE configs now use
   `grouped_gemm` + `packed` + selected-probability normalization. E8 is now
