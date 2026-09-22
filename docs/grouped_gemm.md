@@ -157,7 +157,7 @@ unset MLP_RATIO_OVERRIDE NUM_EXPERTS_OVERRIDE TOP_K_OVERRIDE MOE_BACKEND_OVERRID
 unset CHECKPOINT_DIR CHECKPOINT_INTERVAL CHECKPOINT_ROOT CHECKPOINT_POLICY_DISABLED
 unset RESUME_CHECKPOINT STOP_AFTER_COMPLETED_UPDATES
 unset REPRO_DIAGNOSTICS_DIR BENCHMARK_WARMUP_UPDATES BENCHMARK_MEASURED_UPDATES
-for config in configs/moe_e64k8_r0.5.toml configs/moe_grouped.toml; do
+for config in configs/moe_e64k8_r0.5.toml configs/moe_e8k2_r2.toml; do
   name="$(basename "$config" .toml)"
   for implementation in extension torch; do
     MOE_GMM_IMPLEMENTATION="$implementation" scripts/vista/benchmark.sh "$config" \

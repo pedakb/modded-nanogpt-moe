@@ -2,9 +2,6 @@ run_name = "moe-e64k8-r0.5"
 num_trials = 1
 seed = 1234
 
-[checkpoint]
-interval = 250
-
 [model]
 vocab_size = 50304
 num_layers = 12
@@ -22,7 +19,7 @@ sequence_length = 1024
 global_batch_tokens = 524288
 microbatch_sequences = 64
 validation_tokens = 10485760
-total_steps = 3500
+total_steps = 3250
 cooldown_fraction = 0.7
 training_shard_pattern = "data/fineweb10B/fineweb_train_*.bin"
 validation_shard_pattern = "data/fineweb10B/fineweb_val_*.bin"
@@ -43,3 +40,6 @@ mu = 0.95
 scalar_interval = 25
 histogram_interval = 0
 during_nsys = false
+
+[checkpoint]
+interval = 100

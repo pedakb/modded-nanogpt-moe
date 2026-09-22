@@ -4,9 +4,36 @@ Updated: 2026-09-22
 
 ## Current goal and state
 
-Current base on `cleanup-active-codebase`: `88ed985` (`Simplify TensorBoard
-diagnostics and finalize E64 config`). The Vista launcher refactor is
-uncommitted. No commit or push has been made for it.
+Current base on `cleanup-active-codebase`: `f24cc5a` (`Add config-driven
+checkpoint policy`), initially clean. Current uncommitted task: standardize the
+three production configs and rename the E8 config. No training, benchmark,
+submission, dependency installation, commit or push performed.
+
+## Production config standardization (current work)
+
+- Dense ratio 4; E8/K2 ratio 2; E64/K8 ratio 0.5. Both MoE configs now use
+  `grouped_gemm` + `packed` + selected-probability normalization. E8 is now
+  `configs/moe_e8k2_r2.toml`, run name `moe-e8k2-r2`; repository references
+  updated. Dense omits MoE-only fields and resolves their existing defaults.
+- Shared D=768/L=12/vocab=50304, microbatch=64, global batch=524288, sequence=1024,
+  validation=10485760, horizon=3250, cooldown=0.7, seed=1234, one trial, identical
+  optimizers/data patterns, diagnostics=25 (no histograms/Nsight), checkpoint=100
+  plus final save. No schema, launcher, optimizer or training implementation edits.
+- The earlier E64 horizon of 3500 intentionally matched an older checkpoint-confirmed
+  E8 reference. This new suite explicitly supersedes that comparison with 3250;
+  E64 checkpoint cadence changes from 250 to 100. Preserve original configs for older
+  resumes: ModuleList E8 and 3500-step checkpoints are not compatible with these
+  production settings. Existing TensorBoard run directories are not migrated.
+- `git mv` records the E8 rename in the index; subsequent edits are unstaged.
+  Tests cover exact shared settings, section order, dense field omission, and
+  MoE geometry-only differences. Requested package tests: 18 passed, 4 failed
+  because local `/bin/bash` is 3.2 and the existing Vista launcher requires
+  associative arrays (`declare -A`, Bash 4+). No launcher/shell changes made.
+  Packed-expert tests: 19 passed, 10 CUDA-dependent tests skipped.
+  `git diff --check` passed; no stale old E8 filename/run-name references remain.
+
+Next: review the config diff and use the README three-config `--submit` command
+on Vista only when ready. Check for existing run-name directories first.
 
 ## Compact production TensorBoard diagnostics (final design)
 
@@ -46,7 +73,7 @@ uncommitted. No commit or push has been made for it.
 ## Production E64/K8 configuration
 
 - The production experiment is `configs/moe_e64k8_r0.5.toml`, with run name
-  `moe-e64k8-r0.5`, D=768, E=64, K=8, `mlp_ratio=0.5`, 3500 updates, grouped
+  `moe-e64k8-r0.5`, D=768, E=64, K=8, `mlp_ratio=0.5`, 3250 updates, grouped
   GEMM execution, and packed expert parameters. Packed storage is an
   implementation detail and is no longer part of the scientific config/run name.
 - Vista production training uses `MOE_GMM_IMPLEMENTATION=torch`, scoped to the
@@ -55,8 +82,8 @@ uncommitted. No commit or push has been made for it.
   **Do not globally export `MOE_GMM_IMPLEMENTATION=torch` before pytest**: CPU
   unit tests that exercise the extension/fallback contract will fail under that
   global override.
-- `configs/moe_grouped.toml` also uses the production diagnostics interval 25;
-  its E8/K2 scientific and training settings are otherwise unchanged.
+- `configs/moe_e8k2_r2.toml` uses the same packed backend and shared production
+  settings; only run name, ratio, expert count and top-k differ from E64/K8.
 
 ## Vista execution workflow
 
@@ -79,7 +106,7 @@ uncommitted. No commit or push has been made for it.
   Slurm worker were removed.
 - Checkpoint cadence is configured by `[checkpoint].interval`; omission disables
   checkpointing, 0 saves only at completion, and positive values add periodic
-  saves. E64/K8 production uses 250. `--checkpoint-interval N` overrides every
+  saves. All three production configs use 100. `--checkpoint-interval N` overrides every
   config in one invocation. Vista derives a separate Stockyard directory from
   each TOML `run_name`; `--resume PATH` resumes only the first supplied config.
   Checkpoint/resume still requires one trial, preventing file collisions.
@@ -225,8 +252,8 @@ uv run --no-sync python -m pytest -q -rs tests
 # Continue only after correctness passes; unset stale overrides per docs.
 MOE_GMM_IMPLEMENTATION=extension scripts/vista/benchmark.sh configs/moe_e64k8_r0.5_packed.toml
 MOE_GMM_IMPLEMENTATION=torch scripts/vista/benchmark.sh configs/moe_e64k8_r0.5_packed.toml
-MOE_GMM_IMPLEMENTATION=extension scripts/vista/benchmark.sh configs/moe_grouped.toml
-MOE_GMM_IMPLEMENTATION=torch scripts/vista/benchmark.sh configs/moe_grouped.toml
+MOE_GMM_IMPLEMENTATION=extension scripts/vista/benchmark.sh configs/moe_e8k2_r2.toml
+MOE_GMM_IMPLEMENTATION=torch scripts/vista/benchmark.sh configs/moe_e8k2_r2.toml
 ```
 
 The sections below retain earlier implementation notes; historical pending
@@ -337,10 +364,11 @@ bottlenecks; tiles have not been GH200-tuned. No speedup is claimed yet.
   unchanged. Only packed checkpoint configs add the layout key, so cross-layout
   resume fails compatibility checks. Rebuild optimizers with `build_optimizers`
   to restore packed orientation metadata; there is no checkpoint converter.
-- The packed E64/K8 config differs from `moe_e64k8_r0.5.toml` only in run name
-  and layout. D=768, H=384, global batch=524288, microbatch=64, horizon=3500.
+- Historical packed-layout experiment used D=768, H=384, global batch=524288,
+  microbatch=64, horizon=3500. Its separate packed config has since been removed;
+  the current production E64 config itself uses packed storage and horizon 3250.
 
-Pending Vista validation, from the repository root on an allocated GH200:
+Current geometry comparison, from the repository root on an allocated GH200:
 
 ```bash
 cd "$WORK/projects/modded-nanogpt-moe"
@@ -349,7 +377,7 @@ export CC=/usr/bin/gcc CXX=/usr/bin/g++
 uv run --no-sync python -m pytest -q -rs tests
 # Only after correctness passes; run sequentially on the same allocation.
 scripts/vista/benchmark.sh configs/moe_e64k8_r0.5.toml
-scripts/vista/benchmark.sh configs/moe_e64k8_r0.5_packed.toml
+scripts/vista/benchmark.sh configs/moe_e8k2_r2.toml
 ```
 
 The benchmark wrapper uses the real trainer, 10 warmup + 30 measured updates,
@@ -368,13 +396,13 @@ available in Git and on the earlier branches.
 - The package contains model/MoE, optimizers, data loading, checkpointing,
   TOML configuration, and training in separate focused modules.
 - `configs/dense_baseline.toml` defines D=768, ratio=4 dense training;
-  `configs/moe_grouped.toml` defines E=8, k=2, ratio=2 grouped MoE. Both keep
+  `configs/moe_e8k2_r2.toml` defines E=8, k=2, ratio=2 grouped MoE. Both keep
   the 524288-token global batch.
 - `configs/moe_e64k8_r0.5.toml` adds a controlled OLMoE-style geometry:
   D=768, E=64, k=8, and a 384-wide expert FFN (`mlp_ratio=0.5`). It retains
-  selected-probability normalization, grouped GEMM, and the checkpoint-confirmed
-  E8/K2 reference settings, including its 3500-step schedule horizon. The older
-  checked-in `configs/moe_grouped.toml` remains unchanged at 3250 steps.
+  selected-probability normalization and grouped GEMM. The historical 3500-step
+  checkpoint reference is superseded by the shared 3250-step production suite;
+  both MoE configs now use packed storage.
 - Dense uses whole-model compilation. MoE uses an eager transformer prefix and
   independently compiled head/loss to avoid the prior softcap OOM.
 - Default grouped MoE preserves the expert `ModuleList`, dropless routing,

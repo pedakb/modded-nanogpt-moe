@@ -1,4 +1,4 @@
-run_name = "moe-e8-k2-ratio2"
+run_name = "moe-e8k2-r2"
 num_trials = 1
 seed = 1234
 
@@ -12,6 +12,7 @@ num_experts = 8
 top_k = 2
 normalize_topk = true
 moe_backend = "grouped_gemm"
+moe_parameter_layout = "packed"
 
 [training]
 sequence_length = 1024
@@ -39,3 +40,6 @@ mu = 0.95
 scalar_interval = 25
 histogram_interval = 0
 during_nsys = false
+
+[checkpoint]
+interval = 100

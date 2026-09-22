@@ -1,6 +1,7 @@
 import io
 import os
 import subprocess
+import tomllib
 import types
 from pathlib import Path
 
@@ -305,12 +306,12 @@ def test_dense_example_config_resolves_current_training_defaults():
     repository_root = Path(__file__).resolve().parents[1]
     config = load_experiment_config(repository_root / "configs/dense_baseline.toml")
     grouped_config = load_experiment_config(
-        repository_root / "configs/moe_grouped.toml")
+        repository_root / "configs/moe_e8k2_r2.toml")
 
     assert config["run_name"] == "dense-baseline"
     assert config["num_trials"] == 1
     assert config["seed"] == 1234
-    assert config["checkpoint"] == {"interval": None}
+    assert config["checkpoint"] == {"interval": 100}
     assert config["model"] == {
         "vocab_size": 50304,
         "num_layers": 12,
@@ -339,23 +340,19 @@ def test_dense_example_config_resolves_current_training_defaults():
             config["training"]["validation_shard_pattern"])
 
 
-def test_olmoe_style_production_config_changes_controlled_geometry_and_layout():
+def test_olmoe_style_production_config_changes_only_controlled_geometry():
     repository_root = Path(__file__).resolve().parents[1]
     intended_reference = load_experiment_config(
-        repository_root / "configs/moe_grouped.toml")
+        repository_root / "configs/moe_e8k2_r2.toml")
     experiment = load_experiment_config(
         repository_root / "configs/moe_e64k8_r0.5.toml")
 
-    # The completed E8/K2 reference checkpoint used this schedule horizon.
-    intended_reference["training"]["total_steps"] = 3500
     intended_reference["run_name"] = "moe-e64k8-r0.5"
-    intended_reference["checkpoint"]["interval"] = 250
     intended_reference["model"] = {
         **intended_reference["model"],
         "mlp_ratio": 0.5,
         "num_experts": 64,
         "top_k": 8,
-        "moe_parameter_layout": "packed",
     }
     assert experiment == intended_reference
     assert resolve_mlp_hidden_dim(
@@ -444,7 +441,7 @@ def test_vista_launcher_submits_itself_as_nonrecursive_worker(tmp_path):
     subprocess.run(
         [
             "bash", str(launcher), "--submit", "--time", "08:00:00",
-            "configs/dense_baseline.toml", "configs/moe_grouped.toml",
+            "configs/dense_baseline.toml", "configs/moe_e8k2_r2.toml",
         ],
         cwd=tmp_path,
         env=environment,
@@ -457,7 +454,7 @@ def test_vista_launcher_submits_itself_as_nonrecursive_worker(tmp_path):
         "--worker",
         "--",
         str(repository_root / "configs/dense_baseline.toml"),
-        str(repository_root / "configs/moe_grouped.toml"),
+        str(repository_root / "configs/moe_e8k2_r2.toml"),
     ]
 
 
@@ -491,7 +488,7 @@ def test_vista_launcher_runs_configs_in_order_with_explicit_checkpoints(
         [
             "bash", str(launcher), "--checkpoint-interval", "7",
             "--resume", str(resume), "configs/dense_baseline.toml",
-            "configs/moe_grouped.toml",
+            "configs/moe_e8k2_r2.toml",
         ],
         cwd=tmp_path,
         env=environment,
@@ -507,7 +504,7 @@ def test_vista_launcher_runs_configs_in_order_with_explicit_checkpoints(
         f"{resume}|{command_prefix}"
         f"{repository_root / 'configs/dense_baseline.toml'}",
         f"{stockyard}/checkpoints/modded-nanogpt-moe|7||"
-        f"{command_prefix}{repository_root / 'configs/moe_grouped.toml'}",
+        f"{command_prefix}{repository_root / 'configs/moe_e8k2_r2.toml'}",
     ]
 
 
@@ -550,7 +547,7 @@ def test_vista_benchmark_launcher_uses_trainer_without_artifacts(
         environment.pop(name, None)
 
     subprocess.run(
-        ["bash", str(launcher), "configs/moe_grouped.toml"],
+        ["bash", str(launcher), "configs/moe_e8k2_r2.toml"],
         cwd=outside_repository,
         env=environment,
         check=True,
@@ -561,7 +558,7 @@ def test_vista_benchmark_launcher_uses_trainer_without_artifacts(
     assert captured[6:] == [
         "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
         "--module", "modded_nanogpt_moe.train", "--config",
-        str(repository_root / "configs/moe_grouped.toml"),
+        str(repository_root / "configs/moe_e8k2_r2.toml"),
     ]
 
 
@@ -636,13 +633,43 @@ def test_checkpoint_environment_override_precedes_toml(monkeypatch):
     assert config["checkpoint"]["interval"] == 17
 
 
-def test_production_configs_can_have_independent_checkpoint_policies():
+@pytest.mark.parametrize("filename,run_name,ratio,experts,top_k", [
+    ("dense_baseline.toml", "dense-baseline", 4, None, None),
+    ("moe_e8k2_r2.toml", "moe-e8k2-r2", 2, 8, 2),
+    ("moe_e64k8_r0.5.toml", "moe-e64k8-r0.5", 0.5, 64, 8),
+])
+def test_production_configs_share_training_policy(filename, run_name, ratio, experts, top_k):
     repository_root = Path(__file__).resolve().parents[1]
-    grouped = load_experiment_config(repository_root / "configs/moe_grouped.toml")
-    e64 = load_experiment_config(repository_root / "configs/moe_e64k8_r0.5.toml")
-
-    assert grouped["checkpoint"]["interval"] is None
-    assert e64["checkpoint"]["interval"] == 250
+    path = repository_root / "configs" / filename
+    config = load_experiment_config(path)
+    raw = tomllib.loads(path.read_text())
+    assert list(raw) == ["run_name", "num_trials", "seed", "model", "training",
+                         "optimizers", "diagnostics", "checkpoint"]
+    assert list(raw["optimizers"]) == ["adamw", "muon"]
+    assert config["run_name"] == run_name
+    assert config["num_trials"] == 1
+    assert config["seed"] == 1234
+    assert config["checkpoint"] == {"interval": 100}
+    assert config["diagnostics"] == dict(scalar_interval=25, histogram_interval=0, during_nsys=False)
+    assert config["training"] == {
+        "sequence_length": 1024, "global_batch_tokens": 524288,
+        "microbatch_sequences": 64, "validation_tokens": 10485760,
+        "total_steps": 3250, "cooldown_fraction": 0.7,
+        "training_shard_pattern": "data/fineweb10B/fineweb_train_*.bin",
+        "validation_shard_pattern": "data/fineweb10B/fineweb_val_*.bin",
+    }
+    assert config["optimizers"] == {
+        "adamw": dict(group_lrs=[0.7, 0.004, 0.015], betas=[0.8, 0.95],
+                      eps=1e-10, weight_decay=0.001, fused=True),
+        "muon": dict(lr=0.025, weight_decay=0.05, mu=0.95),
+    }
+    expected_model = dict(vocab_size=50304, num_layers=12, model_dim=768,
+                          mlp_type="moe" if experts else "dense", mlp_ratio=ratio)
+    if experts:
+        expected_model.update(num_experts=experts, top_k=top_k, normalize_topk=True,
+                              moe_backend="grouped_gemm", moe_parameter_layout="packed")
+    assert raw["model"] == expected_model  # Dense doesn't explicitly carry MoE-only fields.
+    assert resolve_mlp_hidden_dim(768, ratio) == {4: 3072, 2: 1536, 0.5: 384}[ratio]
 
 
 def test_tensorboard_run_name_is_used_and_existing_directory_is_rejected(tmp_path):

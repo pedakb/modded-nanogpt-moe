@@ -143,7 +143,7 @@ uv run --no-sync torchrun --standalone --nproc_per_node=1 \
 Cluster launchers load the established modules and set reusable defaults:
 
 ```bash
-scripts/ls6/train.sh configs/moe_grouped.toml
+scripts/ls6/train.sh configs/moe_e8k2_r2.toml
 source scripts/vista/env.sh
 scripts/vista/train.sh --steps 30 configs/moe_e64k8_r0.5.toml
 scripts/vista/train.sh configs/moe_e64k8_r0.5.toml
@@ -161,7 +161,7 @@ defaulting to 10 warmup plus 30 measured optimizer updates. They disable
 TensorBoard and reject experiment/checkpoint/profiling overrides:
 
 ```bash
-scripts/vista/benchmark.sh configs/moe_grouped.toml
+scripts/vista/benchmark.sh configs/moe_e8k2_r2.toml
 ```
 
 Use `BENCHMARK_WARMUP_UPDATES` and `BENCHMARK_MEASURED_UPDATES` only when a

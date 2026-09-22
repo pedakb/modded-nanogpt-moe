@@ -8,10 +8,6 @@ num_layers = 12
 model_dim = 768
 mlp_type = "dense"
 mlp_ratio = 4
-num_experts = 1
-top_k = 1
-normalize_topk = true
-moe_backend = "loop"
 
 [training]
 sequence_length = 1024
@@ -34,3 +30,11 @@ fused = true
 lr = 0.025
 weight_decay = 0.05
 mu = 0.95
+
+[diagnostics]
+scalar_interval = 25
+histogram_interval = 0
+during_nsys = false
+
+[checkpoint]
+interval = 100

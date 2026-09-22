@@ -52,14 +52,19 @@ uv run --no-sync torchrun \
   --config configs/dense_baseline.toml
 ```
 
-The grouped MoE configuration is:
+The production comparison uses dense ratio 4, E8/K2 ratio 2, and E64/K8 ratio
+0.5. Both MoE configs use grouped GEMM with packed experts. All three share
+D=768, 12 layers, 3250 updates, seed 1234, a 524288-token global batch,
+microbatch 64, diagnostics every 25 updates, and checkpoints every 100 updates.
+
+The E8/K2 configuration is:
 
 ```bash
 uv run --no-sync torchrun \
   --standalone \
   --nproc_per_node=1 \
   --module modded_nanogpt_moe.train \
-  --config configs/moe_grouped.toml
+  --config configs/moe_e8k2_r2.toml
 ```
 
 Vista machine setup is reusable without selecting any experiment state:
@@ -81,7 +86,7 @@ supplied. Short runs stay on an already allocated node:
 scripts/vista/train.sh --steps 30 configs/moe_e64k8_r0.5.toml
 scripts/vista/train.sh --steps 100 configs/moe_e64k8_r0.5.toml
 scripts/vista/train.sh configs/moe_e64k8_r0.5.toml
-scripts/vista/train.sh configs/moe_grouped.toml
+scripts/vista/train.sh configs/moe_e8k2_r2.toml
 ```
 
 It resolves the repository root from its location, uses that root as
@@ -101,7 +106,7 @@ Multiple configs run sequentially in the supplied order inside one allocation:
 ```bash
 scripts/vista/train.sh --submit \
   configs/dense_baseline.toml \
-  configs/moe_grouped.toml \
+  configs/moe_e8k2_r2.toml \
   configs/moe_e64k8_r0.5.toml
 ```
 
@@ -119,12 +124,12 @@ Checkpoint cadence normally comes from the experiment TOML:
 
 ```toml
 [checkpoint]
-interval = 250
+interval = 100
 ```
 
 An omitted section disables checkpointing. An explicit interval of zero writes
 only the final checkpoint; a positive interval also writes at that completed-
-update cadence. The E64/K8 production config uses 250. Each run writes under
+update cadence. All three production configs use 100. Each run writes under
 `$STOCKYARD/checkpoints/modded-nanogpt-moe/RUN_NAME`. Override the TOML cadence
 for every config in one invocation when needed:
 
@@ -138,10 +143,10 @@ After a failure, resubmit only the unfinished configs. To resume the first one,
 pass its checkpoint explicitly; `--resume` never applies to later configs:
 
 ```bash
-checkpoint_dir="$STOCKYARD/checkpoints/modded-nanogpt-moe/moe-e8-k2-ratio2"
+checkpoint_dir="$STOCKYARD/checkpoints/modded-nanogpt-moe/moe-e8k2-r2"
 scripts/vista/train.sh --submit \
   --resume "$checkpoint_dir/latest.pt" \
-  configs/moe_grouped.toml \
+  configs/moe_e8k2_r2.toml \
   configs/moe_e64k8_r0.5.toml
 ```
 
@@ -153,10 +158,15 @@ the parent shell. Effective cadence precedence is
 Checkpoint/resume remains restricted to `num_trials = 1`; multi-trial
 checkpointing is rejected before any files can collide.
 
+These configs define fresh production runs: older ModuleList E8 checkpoints
+and 3500-step schedules are not compatible with the new packed/3250-step
+settings. Preserve the original config when resuming an older run. Existing
+TensorBoard run directories are not migrated or overwritten.
+
 The LS6 launcher remains available as before:
 
 ```bash
-scripts/ls6/train.sh configs/moe_grouped.toml
+scripts/ls6/train.sh configs/moe_e8k2_r2.toml
 ```
 
 TensorBoard events are written under:
@@ -167,8 +177,9 @@ TensorBoard events are written under:
 
 A fresh run refuses to reuse an existing TensorBoard run directory.
 
-TensorBoard training diagnostics default to every 10 optimizer updates, with
-histograms off. See [diagnostic metrics and overhead](docs/diagnostics.md) for
+TensorBoard training diagnostics default in code to every 10 optimizer updates;
+all three production configs explicitly use 25, with histograms off.
+See [diagnostic metrics and overhead](docs/diagnostics.md) for
 the optional `[diagnostics]` TOML settings. Benchmarks always bypass diagnostics;
 Nsight bypasses them unless explicitly enabled.
 

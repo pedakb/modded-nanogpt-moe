@@ -144,10 +144,14 @@ def test_packed_forward_uses_storage_without_stacking(cpu_gmm, monkeypatch):
     assert pointers == [packed.fc_weight.data_ptr(), packed.proj_weight.data_ptr()]
 
 
-def test_packed_config_and_optimizer_assignment(cpu_gmm):
+@pytest.mark.parametrize("filename,run_name", [
+    ("moe_e8k2_r2.toml", "moe-e8k2-r2"),
+    ("moe_e64k8_r0.5.toml", "moe-e64k8-r0.5"),
+])
+def test_packed_config_and_optimizer_assignment(cpu_gmm, filename, run_name):
     root = Path(__file__).resolve().parents[1]
-    config = load_experiment_config(root / "configs/moe_e64k8_r0.5.toml")
-    assert config["run_name"] == "moe-e64k8-r0.5"
+    config = load_experiment_config(root / "configs" / filename)
+    assert config["run_name"] == run_name
     assert config["model"]["moe_parameter_layout"] == "packed"
     assert config["diagnostics"]["scalar_interval"] == 25
     model = GPT(vocab_size=37, num_layers=1, model_dim=128, mlp_type="moe",
