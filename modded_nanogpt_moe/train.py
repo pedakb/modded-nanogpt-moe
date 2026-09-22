@@ -148,6 +148,9 @@ def read_source_snapshot():
 def main(argv=None):
     argv = sys.argv if argv is None else argv
     experiment_config, config_path = parse_train_args(argv[1:])
+    if experiment_config["model"]["moe_backward"] == "grad_em":
+        raise NotImplementedError(
+            "Grad-EM is reference-only (Stage 1); production backward is not implemented")
     code = read_source_snapshot()
 
     # torchrun sets these environment variables.
@@ -539,6 +542,8 @@ def main(argv=None):
                 "top_k": top_k,
                 "normalize_topk": normalize_topk,
                 "moe_backend": moe_backend,
+                "moe_backward": model_config["moe_backward"],
+                "grad_em_eta": model_config["grad_em_eta"],
             },
             "training": {
                 "sequence_length": sequence_length,
@@ -558,7 +563,7 @@ def main(argv=None):
             },
             "seed_override": seed,
         }
-        # Keep default checkpoint config/state formats identical to older runs.
+        # Keep default parameter-layout metadata identical to older runs.
         # Packed checkpoints explicitly record their incompatible storage layout.
         if model.moe_parameter_layout != "modulelist":
             resolved_config["model"]["moe_parameter_layout"] = model.moe_parameter_layout

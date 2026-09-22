@@ -16,6 +16,10 @@ its license and attribution.
 - `scripts/`: data download and LS6/Vista launchers.
 - `docs/`: system-specific implementation notes.
 
+Grad-EM is currently a CPU-tested mathematical reference only, not a training
+mode. See [`docs/grad_em.md`](docs/grad_em.md) for the frozen backward contract
+and opt-in config reserved for future integration; existing runs stay standard.
+
 ## Environment
 
 Create the environment appropriate for the current platform with `uv`. Cluster
@@ -56,7 +60,7 @@ The production comparison uses dense ratio 4, E8/K2 ratio 2, and E64/K8 ratio
 0.5. Both MoE configs use grouped GEMM with packed experts. All three share
 D=768, 12 layers, 3250 updates, seed 1234, a 524288-token global batch,
 microbatch 64, 10485760 validation tokens per evaluation, diagnostics every 25
-updates, and checkpoints every 100 updates. Evaluation runs every 125 updates,
+updates, and checkpoints every 250 updates. Evaluation runs every 125 updates,
 switching to every 25 updates for the final 10%.
 
 The E8/K2 configuration is:
@@ -153,7 +157,7 @@ Checkpoint cadence normally comes from the experiment TOML:
 
 ```toml
 [checkpoint]
-interval = 100
+interval = 250
 ```
 
 An omitted section disables checkpointing. An explicit interval of zero writes

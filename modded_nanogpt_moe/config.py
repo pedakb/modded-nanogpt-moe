@@ -37,6 +37,8 @@ DEFAULT_CONFIG = {
         "normalize_topk": True,
         "moe_backend": "loop",
         "moe_parameter_layout": "modulelist",
+        "moe_backward": "standard",
+        "grad_em_eta": 0.1,
     },
     "training": {
         "sequence_length": 1024,
@@ -88,6 +90,12 @@ def _positive_int(config, section, key):
     value = config[section][key]
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{section}.{key} must be a positive integer")
+
+
+def validate_grad_em_eta(eta):
+    if (isinstance(eta, bool) or not isinstance(eta, (int, float))
+            or not math.isfinite(eta) or eta < 0):
+        raise ValueError("model.grad_em_eta must be finite and nonnegative")
 
 
 def validate_experiment_config(config, require_run_name=False):
@@ -145,6 +153,12 @@ def validate_experiment_config(config, require_run_name=False):
         raise ValueError("model.mlp_type must be 'dense' or 'moe'")
     if config["model"]["moe_backend"] not in ("loop", "grouped_gemm"):
         raise ValueError("model.moe_backend must be 'loop' or 'grouped_gemm'")
+    if config["model"]["moe_backward"] not in ("standard", "grad_em"):
+        raise ValueError("model.moe_backward must be 'standard' or 'grad_em'")
+    validate_grad_em_eta(config["model"]["grad_em_eta"])
+    if (config["model"]["moe_backward"] == "grad_em"
+            and config["model"]["mlp_type"] != "moe"):
+        raise ValueError("model.moe_backward='grad_em' requires MoE")
     layout = config["model"]["moe_parameter_layout"]
     if layout not in ("modulelist", "packed"):
         raise ValueError("model.moe_parameter_layout must be 'modulelist' or 'packed'")

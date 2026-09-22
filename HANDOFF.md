@@ -4,28 +4,44 @@ Updated: 2026-09-22
 
 ## Current goal and state
 
-Current base on `cleanup-active-codebase`: `ef85121` (`Restore optional Vista
-Slurm email notifications`), initially clean. Current uncommitted task: expose
-Slurm job name/account and additional scheduler options. No training, benchmark,
-submission, dependency installation, commit or push performed.
+Current base on `cleanup-active-codebase`: `761c8cc` (Slurm submission options),
+initially clean. Uncommitted task: **Grad-EM Stage 1 only**, mathematical reference,
+config and CPU tests. No kernel/model/optimizer changes, dependency installation,
+training, submission, commit or push.
 
-## Slurm submission options (current work)
+## Grad-EM reference (current work)
 
-- `scripts/vista/train.sh --submit` accepts `--job-name NAME`, `--account ACCOUNT`
-  and repeatable `--sbatch-arg=--option=value` / `--sbatch-arg --flag`.
-  Options are quoted array elements before the script path, never evaluated;
-  they require submission mode. `--wrap` is rejected to preserve the worker.
-  No changes to scientific configs, run identities, log paths or training code.
-- Updated README/AGENTS and tests. CPU submission parser/block tests use a fake
-  sbatch; 21 passed, including unset/empty mail, quoting, invalid arguments,
-  worker argument separation, and scheduler exit status. Shell syntax and diff
-  checks passed. Broader package selection: 35 passed, 4 failed, 6 deselected.
-  The four failures predate this patch: committed configs use checkpoint250,
-  but tests still expect100. Left untouched. Full-launcher tests require Bash4+
-  (this Mac has3.2); run them on Vista before submission.
-- Dirty files: launcher, tests/test_package.py, new tests/test_vista_submission.py,
-  README.md, AGENTS.md, HANDOFF.md. Next: review/commit separately when authorized,
-  then verify the full submission tests on Vista (all use fake sbatch, no jobs).
+- `grad_em.py::grad_em_reference` computes detached FP32 v, q, q_tilde,
+  selected expert gradients q*g, and router gradients q_tilde-p. The sign is
+  frozen. Uses selected logits directly, never log(top-k weights). g=0 still
+  generally gives nonzero router gradients; eta=0 is not ordinary backward.
+- Config defaults: `model.moe_backward="standard"`, `model.grad_em_eta=0.1`.
+  Eta must be finite/nonnegative. Grad-EM requires MoE; the trainer explicitly
+  rejects it before CUDA setup because production integration is not done.
+  Production TOMLs unchanged. Resolved checkpoint metadata records both fields;
+  missing legacy fields mean standard/0.1, while explicit differences reject
+  resume. No state keys or format version change.
+- Tests: `tests/test_grad_em.py`: **28 passed**; together with the existing
+  checkpoint-resume suite: **37 passed**, all CPU. `tests/test_package.py`:
+  **17 passed, 10 failed** (four existing checkpoint250-vs100 expectations and
+  six launcher failures on Bash3.2). No skips in these runs. `git diff --check`
+  passed. CUDA checks intentionally not run in Stage 1.
+- Dirty files: config.py, checkpoint.py, train.py, new grad_em.py,
+  tests/test_package.py, new tests/test_grad_em.py, README.md, HANDOFF.md,
+  new docs/grad_em.md. See the new document for the contract and future boundary.
+- Next: review Stage 1; only in a separately authorized stage integrate a
+  custom combine backward with full logits/support, q*g to the existing expert
+  graph, and q_tilde-p directly to logits. Do not change GEMM or standard combine.
+  No Grad-EM CUDA correctness/performance claim or active run/checkpoint exists.
+
+Follow-up: user confirmed checkpoint cadence **250 completed updates** for all
+three production configs (already set in TOML). Updated stale package-test
+expectations and README/handoff text; runtime defaults and overrides unchanged.
+Follow-up validation: all four formerly failing config tests passed. Full
+package suite: **21 passed, 6 failed**, all six due to Bash3.2 launcher support.
+`git diff --check` passed. No training or CUDA checks run.
+Committed Slurm options remain documented in README/AGENTS. Full launcher tests
+require Bash4+ (this Mac has3.2); that unrelated limitation remains.
 
 ## Production config standardization (prior work)
 
@@ -35,13 +51,13 @@ submission, dependency installation, commit or push performed.
   updated. Dense omits MoE-only fields and resolves their existing defaults.
 - Shared D=768/L=12/vocab=50304, microbatch=64, global batch=524288, sequence=1024,
   horizon=3250, cooldown=0.7, seed=1234, one trial, identical optimizers/data
-  patterns, diagnostics=25 (no histograms/Nsight), and checkpoint=100 plus final
+  patterns, diagnostics=25 (no histograms/Nsight), and checkpoint=250 plus final
   save. `[evaluation]` now owns 10485760 validation tokens and cadence 125,
   switching to 25 for the final 10%; step 0 and the final step are always due.
   This schedule is independent of diagnostics cadence.
 - The earlier E64 horizon of 3500 intentionally matched an older checkpoint-confirmed
   E8 reference. This new suite explicitly supersedes that comparison with 3250;
-  E64 checkpoint cadence changes from 250 to 100. Preserve original configs for older
+  all three configs use checkpoint cadence 250. Preserve original configs for older
   resumes: ModuleList E8 and 3500-step checkpoints are not compatible with these
   production settings. Existing TensorBoard run directories are not migrated.
 - Evaluation-focused tests cover parsing, validation, the exact 3250-update
@@ -128,7 +144,7 @@ on Vista only when ready. Check for existing run-name directories first.
   Slurm worker were removed.
 - Checkpoint cadence is configured by `[checkpoint].interval`; omission disables
   checkpointing, 0 saves only at completion, and positive values add periodic
-  saves. All three production configs use 100. `--checkpoint-interval N` overrides every
+  saves. All three production configs use 250. `--checkpoint-interval N` overrides every
   config in one invocation. Vista derives a separate Stockyard directory from
   each TOML `run_name`; `--resume PATH` resumes only the first supplied config.
   Checkpoint/resume still requires one trial, preventing file collisions.

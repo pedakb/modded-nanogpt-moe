@@ -311,7 +311,7 @@ def test_dense_example_config_resolves_current_training_defaults():
     assert config["run_name"] == "dense-baseline"
     assert config["num_trials"] == 1
     assert config["seed"] == 1234
-    assert config["checkpoint"] == {"interval": 100}
+    assert config["checkpoint"] == {"interval": 250}
     assert config["evaluation"] == {
         "tokens": 10485760,
         "interval": 125,
@@ -329,6 +329,8 @@ def test_dense_example_config_resolves_current_training_defaults():
         "normalize_topk": True,
         "moe_backend": "loop",
         "moe_parameter_layout": "modulelist",
+        "moe_backward": "standard",
+        "grad_em_eta": 0.1,
     }
     assert config["training"]["global_batch_tokens"] == 524288
     assert config["training"]["microbatch_sequences"] == 64
@@ -695,7 +697,7 @@ def test_production_configs_share_training_policy(filename, run_name, ratio, exp
     assert config["run_name"] == run_name
     assert config["num_trials"] == 1
     assert config["seed"] == 1234
-    assert config["checkpoint"] == {"interval": 100}
+    assert config["checkpoint"] == {"interval": 250}
     assert config["diagnostics"] == dict(scalar_interval=25, histogram_interval=0, during_nsys=False)
     assert config["training"] == {
         "sequence_length": 1024, "global_batch_tokens": 524288,

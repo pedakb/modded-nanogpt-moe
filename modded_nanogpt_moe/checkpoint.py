@@ -1,5 +1,6 @@
 """Versioned training checkpoints, RNG state, and compatibility restoration."""
 
+import copy
 import os
 import platform
 import random
@@ -85,12 +86,21 @@ def atomic_save_checkpoint(payload, checkpoint_dir: str | Path):
         raise
 
 
+def _with_backward_defaults(config):
+    """Legacy checkpoints predate backward-mode metadata and mean standard."""
+    config = copy.deepcopy(config)
+    if isinstance(config, dict) and isinstance(config.get("model"), dict):
+        config["model"].setdefault("moe_backward", "standard")
+        config["model"].setdefault("grad_em_eta", 0.1)
+    return config
+
+
 def validate_checkpoint_config(checkpoint, resolved_config):
     if checkpoint.get("format_version") != CHECKPOINT_FORMAT_VERSION:
         raise ValueError(
             f"unsupported checkpoint format version: {checkpoint.get('format_version')}")
     checkpoint_config = checkpoint.get("resolved_config")
-    if checkpoint_config != resolved_config:
+    if _with_backward_defaults(checkpoint_config) != _with_backward_defaults(resolved_config):
         raise ValueError(
             f"checkpoint configuration is incompatible:\n"
             f"checkpoint={checkpoint_config!r}\ncurrent={resolved_config!r}")
