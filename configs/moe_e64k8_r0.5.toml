@@ -47,4 +47,4 @@ histogram_interval = 0
 during_nsys = false
 
 [checkpoint]
-interval = 100
+interval = 250
