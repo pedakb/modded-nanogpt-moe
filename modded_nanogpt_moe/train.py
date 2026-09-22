@@ -95,6 +95,21 @@ def require_unused_tensorboard_run_directory(root, system, run_name):
     return run_directory
 
 
+def checkpoint_directory_from_environment(run_name, checkpointing_requested,
+                                          environment=None):
+    """Resolve an explicit directory or a machine root plus experiment identity."""
+    if not checkpointing_requested:
+        return ""
+    environment = os.environ if environment is None else environment
+    checkpoint_dir = environment.get("CHECKPOINT_DIR", "")
+    if checkpoint_dir:
+        return checkpoint_dir
+    checkpoint_root = environment.get("CHECKPOINT_ROOT", "")
+    if checkpoint_root and run_name:
+        return str(Path(checkpoint_root) / run_name)
+    return ""
+
+
 def read_source_snapshot():
     package_dir = Path(__file__).resolve().parent
     repository_root = package_dir.parent
@@ -131,6 +146,7 @@ def main(argv=None):
     assert 8 % dist.get_world_size() == 0
     
     num_trials = experiment_config["num_trials"]
+    requested_run_name = experiment_config["run_name"]
     benchmark = benchmark_settings_from_environment()
     if benchmark["enabled"]:
         if dist.get_world_size() != 1:
@@ -143,16 +159,25 @@ def main(argv=None):
             raise ValueError("REPRO_DIAGNOSTICS_DIR currently requires exactly one GPU")
         if num_trials != 1:
             raise ValueError("REPRO_DIAGNOSTICS_DIR currently requires exactly one trial")
-    checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "")
-    checkpoint_interval = int(os.environ.get("CHECKPOINT_INTERVAL", 0))
+    explicit_checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "")
+    checkpoint_interval = experiment_config["checkpoint"]["interval"]
+    checkpoint_policy_disabled_value = os.environ.get(
+        "CHECKPOINT_POLICY_DISABLED", "0")
+    if checkpoint_policy_disabled_value not in ("0", "1"):
+        raise ValueError(
+            "CHECKPOINT_POLICY_DISABLED must be 0 or 1, got "
+            f"{checkpoint_policy_disabled_value!r}")
+    if benchmark["enabled"] or checkpoint_policy_disabled_value == "1":
+        checkpoint_interval = None
     resume_checkpoint_path = os.environ.get("RESUME_CHECKPOINT", "")
     stop_after_value = os.environ.get("STOP_AFTER_COMPLETED_UPDATES", "")
     stop_after_updates = int(stop_after_value) if stop_after_value else None
     checkpointing_requested = bool(
-        checkpoint_dir or checkpoint_interval or resume_checkpoint_path
+        explicit_checkpoint_dir or checkpoint_interval is not None
+        or resume_checkpoint_path
         or stop_after_updates is not None)
-    if checkpoint_interval < 0:
-        raise ValueError("CHECKPOINT_INTERVAL must be nonnegative")
+    checkpoint_dir = checkpoint_directory_from_environment(
+        requested_run_name, checkpointing_requested)
     if checkpointing_requested:
         if dist.get_world_size() != 1:
             raise ValueError("checkpoint/resume currently requires exactly one GPU")
@@ -194,7 +219,6 @@ def main(argv=None):
     if benchmark["enabled"] and tensorboard_log:
         raise ValueError("TRAINING_BENCHMARK requires TensorBoard to be disabled")
 
-    requested_run_name = experiment_config["run_name"]
     run_id = (resume_checkpoint["run"]["run_id"]
               if resume_checkpoint is not None
               else requested_run_name or str(uuid.uuid4()))
@@ -229,7 +253,7 @@ def main(argv=None):
     print0("="*100)
     if checkpointing_requested:
         print0(
-            f"checkpointing: directory={checkpoint_dir} interval={checkpoint_interval} "
+            f"checkpointing: directory={checkpoint_dir} interval={checkpoint_interval or 0} "
             f"resume={resume_checkpoint_path or 'none'} "
             f"stop_after={stop_after_updates if stop_after_updates is not None else 'none'}",
             console=True,
@@ -822,7 +846,7 @@ def main(argv=None):
             completed_updates = step + 1
             save_due = bool(checkpoint_dir) and (
                 completed_updates == train_steps
-                or (checkpoint_interval > 0
+                or (checkpoint_interval is not None and checkpoint_interval > 0
                     and completed_updates % checkpoint_interval == 0)
                 or completed_updates == stop_after_updates)
             if save_due:

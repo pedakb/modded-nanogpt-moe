@@ -12,6 +12,9 @@ DEFAULT_CONFIG = {
     "run_name": None,
     "num_trials": 1,
     "seed": None,
+    "checkpoint": {
+        "interval": None,
+    },
     "diagnostics": {
         "scalar_interval": 10,
         "histogram_interval": 0,
@@ -83,6 +86,12 @@ def _positive_int(config, section, key):
 
 
 def validate_experiment_config(config, require_run_name=False):
+    checkpoint_interval = config["checkpoint"]["interval"]
+    if checkpoint_interval is not None and (
+            isinstance(checkpoint_interval, bool)
+            or not isinstance(checkpoint_interval, int)
+            or checkpoint_interval < 0):
+        raise ValueError("checkpoint.interval must be a nonnegative integer")
     diagnostics = config["diagnostics"]
     for key in ("scalar_interval", "histogram_interval"):
         value = diagnostics[key]
@@ -207,6 +216,7 @@ def apply_environment_overrides(config):
         ("NUM_EXPERTS_OVERRIDE", "model", "num_experts", int),
         ("TOP_K_OVERRIDE", "model", "top_k", int),
         ("MOE_BACKEND_OVERRIDE", "model", "moe_backend", str),
+        ("CHECKPOINT_INTERVAL", "checkpoint", "interval", int),
     )
     for environment_name, section, key, convert in overrides:
         value = os.environ.get(environment_name, "")

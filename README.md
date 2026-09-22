@@ -87,8 +87,8 @@ scripts/vista/train.sh configs/moe_grouped.toml
 It resolves the repository root from its location, uses that root as
 `DATA_ROOT`, clears inherited run state, and runs one GPU. `--steps` requires
 one config, cannot be combined with `--submit` or checkpoint controls, and
-disables TensorBoard so a smoke run cannot claim a production run directory.
-It does not modify the TOML or parent shell.
+disables TensorBoard and TOML checkpoint policy so a smoke run cannot claim or
+overwrite production artifacts. It does not modify the TOML or parent shell.
 
 Submit one config by adding `--submit`:
 
@@ -115,10 +115,18 @@ failure. Duplicate run names in one suite are rejected. One combined suite log
 is kept at
 `$STOCKYARD/logs/modded-nanogpt-moe/vista/slurm/train-configs-JOBID.log`.
 
-Checkpointing remains an explicit command-line opt-in. There is no canonical
-nonzero checkpoint cadence; choose one for a long run. The following enables a
-separate checkpoint directory for each config under
-`$STOCKYARD/checkpoints/modded-nanogpt-moe/RUN_NAME` (250 is only an example):
+Checkpoint cadence normally comes from the experiment TOML:
+
+```toml
+[checkpoint]
+interval = 250
+```
+
+An omitted section disables checkpointing. An explicit interval of zero writes
+only the final checkpoint; a positive interval also writes at that completed-
+update cadence. The E64/K8 production config uses 250. Each run writes under
+`$STOCKYARD/checkpoints/modded-nanogpt-moe/RUN_NAME`. Override the TOML cadence
+for every config in one invocation when needed:
 
 ```bash
 scripts/vista/train.sh --submit \
@@ -132,16 +140,18 @@ pass its checkpoint explicitly; `--resume` never applies to later configs:
 ```bash
 checkpoint_dir="$STOCKYARD/checkpoints/modded-nanogpt-moe/moe-e8-k2-ratio2"
 scripts/vista/train.sh --submit \
-  --checkpoint-interval 250 \
   --resume "$checkpoint_dir/latest.pt" \
   configs/moe_grouped.toml \
   configs/moe_e64k8_r0.5.toml
 ```
 
 `latest.pt` and `previous.pt` rotate atomically. Resume restores the saved run
-identity, model, both optimizers, loader cursor, RNG, and timing. Runs without
-explicit checkpoint options start fresh and do not inherit stale checkpoint or
-resume variables from the parent shell.
+identity, model, both optimizers, loader cursor, RNG, and timing. Resume is
+enabled only by `--resume`; stale checkpoint variables are not inherited from
+the parent shell. Effective cadence precedence is
+`--checkpoint-interval`, then TOML `[checkpoint].interval`, then disabled.
+Checkpoint/resume remains restricted to `num_trials = 1`; multi-trial
+checkpointing is rejected before any files can collide.
 
 The LS6 launcher remains available as before:
 

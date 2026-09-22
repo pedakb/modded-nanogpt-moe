@@ -2,6 +2,9 @@ run_name = "moe-e64k8-r0.5"
 num_trials = 1
 seed = 1234
 
+[checkpoint]
+interval = 250
+
 [model]
 vocab_size = 50304
 num_layers = 12

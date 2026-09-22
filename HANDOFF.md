@@ -71,15 +71,18 @@ uncommitted. No commit or push has been made for it.
   GH/one-node/one-task/six-hour default, validates the ordered config list,
   runs each config in a separate process, stops on failure, and writes one
   persistent Stockyard suite log. `--submit --time SLURM_TIME` overrides the
-  time request. `--steps` is current-node only and disables TensorBoard.
+  time request. `--steps` is current-node only and disables TensorBoard and
+  TOML checkpoint policy so smoke runs cannot overwrite production artifacts.
 - The launcher defaults to the E64/K8 config when omitted, scopes the torch
   grouped-GEMM implementation to each torchrun process, and clears stale
   parent-shell run controls. The obsolete submission wrapper and separate
   Slurm worker were removed.
-- Checkpointing has no canonical nonzero cadence. The worker's explicit
-  `--checkpoint-interval N` option creates a separate directory per TOML
-  `run_name`; `--resume PATH` resumes only the first supplied config. Resubmit
-  only unfinished configs after a failure. `README.md` records exact commands.
+- Checkpoint cadence is configured by `[checkpoint].interval`; omission disables
+  checkpointing, 0 saves only at completion, and positive values add periodic
+  saves. E64/K8 production uses 250. `--checkpoint-interval N` overrides every
+  config in one invocation. Vista derives a separate Stockyard directory from
+  each TOML `run_name`; `--resume PATH` resumes only the first supplied config.
+  Checkpoint/resume still requires one trial, preventing file collisions.
   Atomic `latest.pt`/`previous.pt` rotation and restore semantics are unchanged.
 
 ## Final validation and pending work
@@ -87,9 +90,9 @@ uncommitted. No commit or push has been made for it.
 - Full Vista test suite: **357 passed, 1 skipped**.
 - A 30-update TensorBoard smoke test completed successfully with the compact
   diagnostics enabled.
-- The unified Vista launcher passes `bash -n`, and `git diff --check` is clean.
-  Its focused `tests/test_package.py` rerun is pending: the current sandbox
-  could not write the configured uv cache under Vista SCRATCH.
+- The unified Vista launcher/checkpoint refactor passes `bash -n` and
+  `git diff --check`. Focused validation passed: `tests/test_package.py` has
+  **20 passed**, and the config-focused packed-expert selection has **4 passed**.
 - CUDA TensorBoard event-file inspection and the final diagnostics overhead
   benchmark remain pending. Do not infer final runtime overhead from tests or
   the smoke run.
@@ -281,7 +284,7 @@ uv run --no-sync python -m pytest -q -rs tests
 unset TRAINING_BENCHMARK NSYS_PROFILE NSYS_WARMUP_STEPS NSYS_ACTIVE_STEPS
 unset SEED_OVERRIDE MBS_OVERRIDE TRAIN_STEPS_OVERRIDE MLP_TYPE_OVERRIDE
 unset MLP_RATIO_OVERRIDE NUM_EXPERTS_OVERRIDE TOP_K_OVERRIDE MOE_BACKEND_OVERRIDE
-unset CHECKPOINT_DIR CHECKPOINT_INTERVAL RESUME_CHECKPOINT STOP_AFTER_COMPLETED_UPDATES
+unset CHECKPOINT_DIR CHECKPOINT_INTERVAL CHECKPOINT_ROOT RESUME_CHECKPOINT STOP_AFTER_COMPLETED_UPDATES
 unset REPRO_DIAGNOSTICS_DIR BENCHMARK_WARMUP_UPDATES BENCHMARK_MEASURED_UPDATES
 export TB_ROOT=
 set -o pipefail

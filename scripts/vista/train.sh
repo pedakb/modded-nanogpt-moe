@@ -248,7 +248,8 @@ unset NUM_EXPERTS_OVERRIDE TOP_K_OVERRIDE MOE_BACKEND_OVERRIDE
 unset TRAIN_STEPS_OVERRIDE TRAINING_BENCHMARK
 unset BENCHMARK_WARMUP_UPDATES BENCHMARK_MEASURED_UPDATES
 unset NSYS_PROFILE NSYS_WARMUP_STEPS NSYS_ACTIVE_STEPS
-unset CHECKPOINT_DIR CHECKPOINT_INTERVAL RESUME_CHECKPOINT
+unset CHECKPOINT_DIR CHECKPOINT_INTERVAL CHECKPOINT_ROOT
+unset CHECKPOINT_POLICY_DISABLED RESUME_CHECKPOINT
 unset STOP_AFTER_COMPLETED_UPDATES REPRO_DIAGNOSTICS_DIR
 unset MOE_GMM_IMPLEMENTATION
 
@@ -263,10 +264,15 @@ for index in "${!config_paths[@]}"; do
     training_environment=(
         env
         "DATA_ROOT=$repo_root"
+        "CHECKPOINT_ROOT=$STOCKYARD/checkpoints/modded-nanogpt-moe"
         MOE_GMM_IMPLEMENTATION=torch
     )
     if [[ -n "$steps" ]]; then
-        training_environment+=("TRAIN_STEPS_OVERRIDE=$steps" "TB_ROOT=")
+        training_environment+=(
+            "TRAIN_STEPS_OVERRIDE=$steps"
+            CHECKPOINT_POLICY_DISABLED=1
+            "TB_ROOT="
+        )
     fi
     if [[ "$benchmark_worker" -eq 1 ]]; then
         training_environment+=(TRAINING_BENCHMARK=1 "TB_ROOT=")
@@ -277,16 +283,11 @@ for index in "${!config_paths[@]}"; do
             training_environment+=("BENCHMARK_MEASURED_UPDATES=$benchmark_measured_updates")
         fi
     fi
-    if [[ -n "$checkpoint_interval" || ( "$index" -eq 0 && -n "$resume_checkpoint" ) ]]; then
-        checkpoint_dir="$STOCKYARD/checkpoints/modded-nanogpt-moe/$run_name"
-        mkdir -p "$checkpoint_dir"
-        training_environment+=(
-            "CHECKPOINT_DIR=$checkpoint_dir"
-            "CHECKPOINT_INTERVAL=${checkpoint_interval:-0}"
-        )
-        if [[ "$index" -eq 0 && -n "$resume_checkpoint" ]]; then
-            training_environment+=("RESUME_CHECKPOINT=$resume_checkpoint")
-        fi
+    if [[ -n "$checkpoint_interval" ]]; then
+        training_environment+=("CHECKPOINT_INTERVAL=$checkpoint_interval")
+    fi
+    if [[ "$index" -eq 0 && -n "$resume_checkpoint" ]]; then
+        training_environment+=("RESUME_CHECKPOINT=$resume_checkpoint")
     fi
 
     if "${training_environment[@]}" \

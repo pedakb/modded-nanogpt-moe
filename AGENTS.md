@@ -96,8 +96,12 @@ environment overrides take precedence over TOML values; keep them compatible.
 - In the trainer, an empty/unset `TB_ROOT` disables TensorBoard and `TB_SYSTEM`
   labels the system. Vista `env.sh` sets the shared Stockyard root; its
   step-limited and benchmark launch paths scope `TB_ROOT=` to the trainer.
-- `CHECKPOINT_DIR`, `CHECKPOINT_INTERVAL`, `RESUME_CHECKPOINT`, and
-  `STOP_AFTER_COMPLETED_UPDATES` control opt-in checkpoint workflows.
+- `[checkpoint].interval` is the portable checkpoint policy; omission disables
+  it, 0 saves only at completion, and a positive value adds periodic saves.
+  Vista derives the directory from its Stockyard root and TOML `run_name`.
+  `CHECKPOINT_INTERVAL` is a runtime cadence override; `CHECKPOINT_DIR`,
+  `RESUME_CHECKPOINT`, and `STOP_AFTER_COMPLETED_UPDATES` remain compatibility
+  and recovery controls.
 - `REPRO_DIAGNOSTICS_DIR` enables exact-state snapshots.
 - `NSYS_PROFILE`, `NSYS_WARMUP_STEPS`, and `NSYS_ACTIVE_STEPS` control capture.
 - Smoke-test overrides include `SEED_OVERRIDE`, `MBS_OVERRIDE`,
@@ -150,7 +154,7 @@ Vista `env.sh` establishes machine state only. Do not globally export
 process and clears stale experiment/profile/checkpoint state. It defaults to
 `configs/moe_e64k8_r0.5.toml`; multiple configs run sequentially. The `--steps`
 validation path is current-node only and disables TensorBoard so it cannot
-claim the production run directory.
+claim the production run directory; it also disables TOML checkpoint policy.
 
 Vista training-pipeline benchmarks reuse the same trainer and update loop,
 defaulting to 10 warmup plus 30 measured optimizer updates. They disable
@@ -175,8 +179,9 @@ runs them sequentially in one allocation, clears inherited run controls, and
 writes one persistent combined log under
 `$STOCKYARD/logs/modded-nanogpt-moe/vista/slurm/`. It uses the established
 six-hour default; `--submit --time SLURM_TIME` overrides it. Short validation
-runs belong on an existing interactive allocation. Explicit checkpoint and
-first-config resume options are documented in `README.md`.
+runs belong on an existing interactive allocation. Checkpoint cadence normally
+comes from each TOML; the optional override and first-config resume controls are
+documented in `README.md`.
 
 - LS6: A100, `gcc/11.2.0`, CUDA 12.8; the validated grouped-GEMM build used
   `nv-grouped-gemm==1.1.4.post8` and device capability 80.

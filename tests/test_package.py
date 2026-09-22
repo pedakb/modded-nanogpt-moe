@@ -14,6 +14,7 @@ from modded_nanogpt_moe.model import GPT, initialize_model_parameters, resolve_m
 from modded_nanogpt_moe.optim import Muon, build_optimizers
 from modded_nanogpt_moe.train import (
     benchmark_settings_from_environment,
+    checkpoint_directory_from_environment,
     main,
     read_source_snapshot,
     require_unused_tensorboard_run_directory,
@@ -309,6 +310,7 @@ def test_dense_example_config_resolves_current_training_defaults():
     assert config["run_name"] == "dense-baseline"
     assert config["num_trials"] == 1
     assert config["seed"] == 1234
+    assert config["checkpoint"] == {"interval": None}
     assert config["model"] == {
         "vocab_size": 50304,
         "num_layers": 12,
@@ -347,6 +349,7 @@ def test_olmoe_style_production_config_changes_controlled_geometry_and_layout():
     # The completed E8/K2 reference checkpoint used this schedule horizon.
     intended_reference["training"]["total_steps"] = 3500
     intended_reference["run_name"] = "moe-e64k8-r0.5"
+    intended_reference["checkpoint"]["interval"] = 250
     intended_reference["model"] = {
         **intended_reference["model"],
         "mlp_ratio": 0.5,
@@ -376,7 +379,9 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path):
         "\"${TRAIN_STEPS_OVERRIDE-}\" \"${MOE_GMM_IMPLEMENTATION-}\" "
         "\"${TRAINING_BENCHMARK-}\" \"${NSYS_PROFILE-}\" "
         "\"${RESUME_CHECKPOINT-}\" \"${STOP_AFTER_COMPLETED_UPDATES-}\" "
-        "\"${CHECKPOINT_DIR-}\" \"${TB_ROOT-}\" \"${TB_SYSTEM-}\" "
+        "\"${CHECKPOINT_DIR-}\" \"${CHECKPOINT_INTERVAL-}\" "
+        "\"${CHECKPOINT_ROOT-}\" \"${CHECKPOINT_POLICY_DISABLED-}\" "
+        "\"${TB_ROOT-}\" \"${TB_SYSTEM-}\" "
         "> \"$LAUNCH_CAPTURE\"\n"
         "printf '%s\\n' \"$@\" >> \"$LAUNCH_CAPTURE\"\n"
     )
@@ -396,6 +401,9 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path):
     environment["RESUME_CHECKPOINT"] = "/stale/checkpoint.pt"
     environment["STOP_AFTER_COMPLETED_UPDATES"] = "2"
     environment["CHECKPOINT_DIR"] = "/stale/checkpoints"
+    environment["CHECKPOINT_INTERVAL"] = "99"
+    environment["CHECKPOINT_ROOT"] = "/stale/checkpoint-root"
+    environment["CHECKPOINT_POLICY_DISABLED"] = "0"
 
     subprocess.run(
         ["bash", str(launcher), "--steps", "17", "configs/dense_baseline.toml"],
@@ -405,11 +413,12 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path):
     )
 
     captured = capture.read_text().splitlines()
-    assert captured[:11] == [
+    assert captured[:14] == [
         str(repository_root), str(repository_root), "17", "torch",
-        "", "", "", "", "", "", "vista",
+        "", "", "", "", "", "",
+        str(tmp_path / "stockyard/checkpoints/modded-nanogpt-moe"), "1", "", "vista",
     ]
-    assert captured[11:] == [
+    assert captured[14:] == [
         "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
         "--module", "modded_nanogpt_moe.train", "--config",
         str(repository_root / "configs/dense_baseline.toml"),
@@ -464,7 +473,7 @@ def test_vista_launcher_runs_configs_in_order_with_explicit_checkpoints(
     uv = fake_bin / "uv"
     uv.write_text(
         "#!/usr/bin/env bash\n"
-        "printf '%s|%s|%s|%s\\n' \"${CHECKPOINT_DIR-}\" "
+        "printf '%s|%s|%s|%s\\n' \"${CHECKPOINT_ROOT-}\" "
         "\"${CHECKPOINT_INTERVAL-}\" \"${RESUME_CHECKPOINT-}\" \"$*\" "
         ">> \"$LAUNCH_CAPTURE\"\n"
     )
@@ -494,10 +503,10 @@ def test_vista_launcher_runs_configs_in_order_with_explicit_checkpoints(
         "--module modded_nanogpt_moe.train --config "
     )
     assert capture.read_text().splitlines() == [
-        f"{stockyard}/checkpoints/modded-nanogpt-moe/dense-baseline|7|"
+        f"{stockyard}/checkpoints/modded-nanogpt-moe|7|"
         f"{resume}|{command_prefix}"
         f"{repository_root / 'configs/dense_baseline.toml'}",
-        f"{stockyard}/checkpoints/modded-nanogpt-moe/moe-e8-k2-ratio2|7||"
+        f"{stockyard}/checkpoints/modded-nanogpt-moe|7||"
         f"{command_prefix}{repository_root / 'configs/moe_grouped.toml'}",
     ]
 
@@ -568,6 +577,33 @@ def test_config_requires_run_name_and_rejects_unknown_fields(tmp_path):
         load_experiment_config(unknown)
 
 
+def test_checkpoint_config_interval_validation_and_default(tmp_path):
+    assert load_experiment_config()["checkpoint"] == {"interval": None}
+
+    configured = tmp_path / "configured.toml"
+    configured.write_text(
+        'run_name = "checkpointed"\n[checkpoint]\ninterval = 0\n')
+    assert load_experiment_config(configured)["checkpoint"] == {"interval": 0}
+
+    invalid = tmp_path / "invalid.toml"
+    invalid.write_text(
+        'run_name = "invalid-checkpoint"\n[checkpoint]\ninterval = -1\n')
+    with pytest.raises(ValueError, match="checkpoint.interval must be a nonnegative integer"):
+        load_experiment_config(invalid)
+
+
+def test_checkpoint_directory_uses_run_name_under_machine_root(tmp_path):
+    root = tmp_path / "checkpoints" / "modded-nanogpt-moe"
+    assert checkpoint_directory_from_environment(
+        "run-a", True, {"CHECKPOINT_ROOT": str(root)}) == str(root / "run-a")
+    assert checkpoint_directory_from_environment(
+        "run-a", True,
+        {"CHECKPOINT_ROOT": str(root), "CHECKPOINT_DIR": "/explicit"},
+    ) == "/explicit"
+    assert checkpoint_directory_from_environment(
+        "run-a", False, {"CHECKPOINT_ROOT": str(root)}) == ""
+
+
 def test_existing_environment_overrides_take_precedence(monkeypatch):
     repository_root = Path(__file__).resolve().parents[1]
     monkeypatch.setenv("MBS_OVERRIDE", "32")
@@ -588,6 +624,25 @@ def test_existing_environment_overrides_take_precedence(monkeypatch):
     assert config["model"]["num_experts"] == 8
     assert config["model"]["top_k"] == 2
     assert config["model"]["moe_backend"] == "grouped_gemm"
+
+
+def test_checkpoint_environment_override_precedes_toml(monkeypatch):
+    repository_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("CHECKPOINT_INTERVAL", "17")
+
+    config, _ = parse_train_args([
+        "--config", str(repository_root / "configs/moe_e64k8_r0.5.toml")])
+
+    assert config["checkpoint"]["interval"] == 17
+
+
+def test_production_configs_can_have_independent_checkpoint_policies():
+    repository_root = Path(__file__).resolve().parents[1]
+    grouped = load_experiment_config(repository_root / "configs/moe_grouped.toml")
+    e64 = load_experiment_config(repository_root / "configs/moe_e64k8_r0.5.toml")
+
+    assert grouped["checkpoint"]["interval"] is None
+    assert e64["checkpoint"]["interval"] == 250
 
 
 def test_tensorboard_run_name_is_used_and_existing_directory_is_rejected(tmp_path):
