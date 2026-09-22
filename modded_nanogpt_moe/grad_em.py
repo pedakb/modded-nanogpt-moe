@@ -1,8 +1,9 @@
-"""Stage-1 value oracle for Grad-EM; not a production autograd backward.
+"""Grad-EM value oracle and Stage-2A CPU-only autograd combine boundary.
 
 Only selected expert outputs are supplied. All arithmetic/results are FP32,
 detached, including products before the dot-product reduction. No activation-
-dtype rounding or extra loss/accumulation scaling is applied here.
+dtype rounding or extra loss/accumulation scaling is applied in the oracle.
+The boundary casts returned gradients to their original activation dtypes.
 """
 
 from typing import NamedTuple
@@ -10,6 +11,44 @@ from typing import NamedTuple
 import torch
 
 from .config import validate_grad_em_eta
+
+
+def require_grad_em_cpu(device):
+    if device.type != "cpu":
+        raise NotImplementedError(
+            "Grad-EM Stage 2A is CPU-only; the optimized CUDA combine kernel "
+            "is not yet implemented (Stage 2B)")
+
+
+class GradEMCombine(torch.autograd.Function):
+    """CPU correctness boundary; leave the existing expert graph intact.
+
+    order maps expert-sorted rows to flattened token/slot assignments. Only
+    backward materializes [T,K,D]. No [T,E,D] tensor is ever needed.
+    """
+
+    @staticmethod
+    def forward(ctx, out_sorted, router_logits, topk_weights, topk_experts, order, eta):
+        require_grad_em_cpu(out_sorted.device)
+        validate_grad_em_eta(eta)
+        # Lazy import avoids a model/reference import cycle. Reuse the exact
+        # existing forward, including activation-dtype mixing/rounding.
+        from .model import combine_expert_outputs
+        ctx.save_for_backward(out_sorted, router_logits, topk_experts, order)
+        ctx.eta = eta
+        return combine_expert_outputs(out_sorted, topk_weights, order)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output):
+        out_sorted, logits, indices, order = ctx.saved_tensors
+        selected = torch.empty_like(out_sorted)
+        selected[order] = out_sorted
+        selected = selected.view(*indices.shape, out_sorted.shape[-1])
+        result = grad_em_reference(logits, indices, selected, grad_output, ctx.eta)
+        grad_sorted = result.grad_expert.flatten(0, 1)[order].to(out_sorted.dtype)
+        # Direct edge to original logits; NO edge through forward mixing weights.
+        return grad_sorted, result.grad_logits.to(logits.dtype), None, None, None, None
 
 
 class GradEMResult(NamedTuple):

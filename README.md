@@ -16,9 +16,9 @@ its license and attribution.
 - `scripts/`: data download and LS6/Vista launchers.
 - `docs/`: system-specific implementation notes.
 
-Grad-EM is currently a CPU-tested mathematical reference only, not a training
-mode. See [`docs/grad_em.md`](docs/grad_em.md) for the frozen backward contract
-and opt-in config reserved for future integration; existing runs stay standard.
+Grad-EM has a CPU-only reference/autograd integration, not a CUDA training
+path. See [`docs/grad_em.md`](docs/grad_em.md) for the frozen backward contract
+and Stage-2A limitations; existing runs stay standard.
 
 ## Environment
 

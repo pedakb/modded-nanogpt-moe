@@ -277,8 +277,17 @@ class MoE(nn.Module):
     production nn.ModuleList instead of a separate ParameterList."""
     def __init__(self, dim: int, num_experts: int, top_k: int, normalize_topk: bool = True,
                  moe_backend: str = "loop", hidden_dim: int | None = None,
-                 moe_parameter_layout: str = "modulelist"):
+                 moe_parameter_layout: str = "modulelist", moe_backward: str = "standard",
+                 grad_em_eta: float = 0.1):
         super().__init__()
+        from .config import validate_grad_em_eta
+        validate_grad_em_eta(grad_em_eta)
+        if moe_backward not in ("standard", "grad_em"):
+            raise ValueError("moe_backward must be 'standard' or 'grad_em'")
+        if moe_backward == "grad_em" and moe_backend != "grouped_gemm":
+            raise NotImplementedError("Grad-EM Stage 2A requires the grouped_gemm combine boundary")
+        self.moe_backward = moe_backward
+        self.grad_em_eta = grad_em_eta
         assert 1 <= top_k <= num_experts
         assert moe_backend in ("loop", "grouped_gemm"), f"unknown moe_backend: {moe_backend!r}"
         if moe_parameter_layout not in ("modulelist", "packed"):
@@ -332,6 +341,9 @@ class MoE(nn.Module):
             self._gmm = grouped_gemm.ops.gmm
 
     def forward(self, x: Tensor):
+        if self.moe_backward == "grad_em":
+            from .grad_em import require_grad_em_cpu
+            require_grad_em_cpu(x.device)
         if self.moe_backend == "grouped_gemm":
             return self._forward_grouped_gemm(x)
         return self._forward_loop(x)
@@ -455,7 +467,12 @@ class MoE(nn.Module):
         # Whether that is benign or causes drift for experts that are
         # repeatedly starved of tokens has not been checked empirically.
         with nsys_range(_moe_nsys_capture_active, "moe.combine"):
-            out = combine_expert_outputs(out_sorted, topk_weights, order)
+            if self.moe_backward == "standard":
+                out = combine_expert_outputs(out_sorted, topk_weights, order)
+            else:
+                from .grad_em import GradEMCombine
+                out = GradEMCombine.apply(out_sorted, router_logits, topk_weights,
+                                          topk_experts, order, self.grad_em_eta)
             out = out.view(B, T, D)
         if _moe_nsys_capture_active:
             _register_moe_backward_ranges(out, out_sorted, h_act, h_pre, x_sorted)
@@ -464,7 +481,8 @@ class MoE(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, mlp_type: str = "dense", num_experts: int = 1,
                  top_k: int = 1, normalize_topk: bool = True, moe_backend: str = "loop",
-                 hidden_dim: int | None = None, moe_parameter_layout: str = "modulelist"):
+                 hidden_dim: int | None = None, moe_parameter_layout: str = "modulelist",
+                 moe_backward: str = "standard", grad_em_eta: float = 0.1):
         super().__init__()
         self.attn = CausalSelfAttention(dim)
         if mlp_type == "dense":
@@ -472,7 +490,8 @@ class Block(nn.Module):
         elif mlp_type == "moe":
             self.mlp = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
                             moe_backend=moe_backend, hidden_dim=hidden_dim,
-                            moe_parameter_layout=moe_parameter_layout)
+                            moe_parameter_layout=moe_parameter_layout,
+                            moe_backward=moe_backward, grad_em_eta=grad_em_eta)
         else:
             raise ValueError(f"unknown mlp_type: {mlp_type!r}")
         self.norm1 = RMSNorm(dim)
@@ -487,8 +506,15 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, mlp_type: str = "dense",
                  num_experts: int = 1, top_k: int = 1, normalize_topk: bool = True,
                  moe_backend: str = "loop", mlp_ratio: float = 4,
-                 moe_parameter_layout: str = "modulelist"):
+                 moe_parameter_layout: str = "modulelist", moe_backward: str = "standard",
+                 grad_em_eta: float = 0.1):
         super().__init__()
+        from .config import validate_grad_em_eta
+        validate_grad_em_eta(grad_em_eta)
+        if moe_backward not in ("standard", "grad_em"):
+            raise ValueError("moe_backward must be 'standard' or 'grad_em'")
+        if moe_backward == "grad_em" and mlp_type != "moe":
+            raise ValueError("Grad-EM requires MoE")
         if moe_parameter_layout not in ("modulelist", "packed"):
             raise ValueError(f"unknown moe_parameter_layout: {moe_parameter_layout!r}")
         if moe_parameter_layout == "packed" and (mlp_type != "moe" or moe_backend != "grouped_gemm"):
@@ -502,7 +528,8 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([
             Block(model_dim, mlp_type=mlp_type, num_experts=num_experts, top_k=top_k,
                   normalize_topk=normalize_topk, moe_backend=moe_backend,
-                  hidden_dim=hidden_dim, moe_parameter_layout=moe_parameter_layout)
+                  hidden_dim=hidden_dim, moe_parameter_layout=moe_parameter_layout,
+                  moe_backward=moe_backward, grad_em_eta=grad_em_eta)
             for _ in range(num_layers)
         ])
         self.proj = Linear(model_dim, vocab_size)

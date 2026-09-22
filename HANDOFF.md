@@ -4,42 +4,42 @@ Updated: 2026-09-22
 
 ## Current goal and state
 
-Current base on `cleanup-active-codebase`: `761c8cc` (Slurm submission options),
-initially clean. Uncommitted task: **Grad-EM Stage 1 only**, mathematical reference,
-config and CPU tests. No kernel/model/optimizer changes, dependency installation,
-training, submission, commit or push.
+Current base on `cleanup-active-codebase`: `7462a4e` (Grad-EM reference), initially
+clean. Uncommitted task: **Grad-EM Stage 2A**, CPU-only custom combine autograd
+integration. No GPU kernel/GEMM/optimizer changes, installation, training,
+benchmark, submission, commit or push.
 
-## Grad-EM reference (current work)
+## Grad-EM Stage 2A (current work)
 
 - `grad_em.py::grad_em_reference` computes detached FP32 v, q, q_tilde,
   selected expert gradients q*g, and router gradients q_tilde-p. The sign is
   frozen. Uses selected logits directly, never log(top-k weights). g=0 still
   generally gives nonzero router gradients; eta=0 is not ordinary backward.
-- Config defaults: `model.moe_backward="standard"`, `model.grad_em_eta=0.1`.
-  Eta must be finite/nonnegative. Grad-EM requires MoE; the trainer explicitly
-  rejects it before CUDA setup because production integration is not done.
-  Production TOMLs unchanged. Resolved checkpoint metadata records both fields;
-  missing legacy fields mean standard/0.1, while explicit differences reject
-  resume. No state keys or format version change.
-- Tests: `tests/test_grad_em.py`: **28 passed**; together with the existing
-  checkpoint-resume suite: **37 passed**, all CPU. `tests/test_package.py`:
-  **17 passed, 10 failed** (four existing checkpoint250-vs100 expectations and
-  six launcher failures on Bash3.2). No skips in these runs. `git diff --check`
-  passed. CUDA checks intentionally not run in Stage 1.
-- Dirty files: config.py, checkpoint.py, train.py, new grad_em.py,
-  tests/test_package.py, new tests/test_grad_em.py, README.md, HANDOFF.md,
-  new docs/grad_em.md. See the new document for the contract and future boundary.
-- Next: review Stage 1; only in a separately authorized stage integrate a
-  custom combine backward with full logits/support, q*g to the existing expert
-  graph, and q_tilde-p directly to logits. Do not change GEMM or standard combine.
-  No Grad-EM CUDA correctness/performance claim or active run/checkpoint exists.
+- `GradEMCombine` wraps only the grouped-MoE combine call. Forward delegates to
+  the existing helper. Saves out_sorted, original router logits, selected expert
+  indices and order, plus scalar eta. Backward unsorts to [T,K,D], calls the
+  unchanged oracle, returns q*g in sorted order and q_tilde-p directly to logits,
+  cast to original dtypes. Returns None for mixing weights (no duplicate router
+  gradient). Router linear and expert graph both remain connected to input x.
+- Mode/eta now pass through GPT/Block/MoE constructors. Defaults, parameter keys,
+  checkpoint metadata and compilation unchanged. Standard mode adds no tensor
+  operations or custom autograd node. Grad-EM rejects loop backend and non-CPU
+  tensors; CUDA trainer rejects before setup. CPU GEMM integration tests use a
+  test double, not a new production GEMM implementation. [T,K,D] temporaries are
+  deliberately not allowed on GPU; higher-order backward is unsupported.
+- Tests: reference/integration **69 passed**. Requested reference/package selection:
+  **49 passed, 6 failed** (existing Bash3.2 launcher limitation). Existing MoE,
+  packed-expert and checkpoint suites: **57 passed, 12 CUDA skips**.
+  `git diff --check` passed. No CUDA tests executed on this CPU-only Mac.
+- Dirty files: grad_em.py, model.py, train.py, tests/test_grad_em.py,
+  new tests/test_grad_em_integration.py, README.md, docs/grad_em.md, HANDOFF.md.
+- Next (separate Stage 2B): efficient sorted-layout GPU backward without the
+  [T,K,D] temporary; preserve fused forward and compare outputs/gradients/casts
+  against this oracle. CUDA correctness/memory/performance remain unverified.
+  No active Grad-EM run or checkpoint exists.
 
-Follow-up: user confirmed checkpoint cadence **250 completed updates** for all
-three production configs (already set in TOML). Updated stale package-test
-expectations and README/handoff text; runtime defaults and overrides unchanged.
-Follow-up validation: all four formerly failing config tests passed. Full
-package suite: **21 passed, 6 failed**, all six due to Bash3.2 launcher support.
-`git diff --check` passed. No training or CUDA checks run.
+Checkpoint cadence remains **250 completed updates** for all three production
+configs; the stale checkpoint100 expectations were fixed in the base commit.
 Committed Slurm options remain documented in README/AGENTS. Full launcher tests
 require Bash4+ (this Mac has3.2); that unrelated limitation remains.
 

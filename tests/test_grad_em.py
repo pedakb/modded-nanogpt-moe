@@ -145,9 +145,9 @@ def test_grad_em_toml_and_early_training_guard(tmp_path, monkeypatch):
     assert config["model"]["grad_em_eta"] == 0
     monkeypatch.delenv("MLP_TYPE_OVERRIDE", raising=False)
     def forbidden(*args, **kwargs):
-        pytest.fail("reference-only mode must fail before CUDA setup")
+        pytest.fail("CPU-only Grad-EM must fail before CUDA setup")
     monkeypatch.setattr(torch.cuda, "set_device", forbidden)
-    with pytest.raises(NotImplementedError, match="reference-only"):
+    with pytest.raises(NotImplementedError, match="CPU-only.*CUDA combine kernel"):
         main(["train", "--config", str(path)])
 
 

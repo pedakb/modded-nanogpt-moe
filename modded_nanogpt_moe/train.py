@@ -149,8 +149,8 @@ def main(argv=None):
     argv = sys.argv if argv is None else argv
     experiment_config, config_path = parse_train_args(argv[1:])
     if experiment_config["model"]["moe_backward"] == "grad_em":
-        raise NotImplementedError(
-            "Grad-EM is reference-only (Stage 1); production backward is not implemented")
+        from .grad_em import require_grad_em_cpu
+        require_grad_em_cpu(torch.device("cuda"))  # This trainer is CUDA-only.
     code = read_source_snapshot()
 
     # torchrun sets these environment variables.
@@ -445,7 +445,9 @@ def main(argv=None):
                 num_layers=model_config["num_layers"], model_dim=model_dim, mlp_type=mlp_type,
                 num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
                 moe_backend=moe_backend, mlp_ratio=mlp_ratio,
-                moe_parameter_layout=model_config["moe_parameter_layout"])
+                moe_parameter_layout=model_config["moe_parameter_layout"],
+                moe_backward=model_config["moe_backward"],
+                grad_em_eta=model_config["grad_em_eta"])
     assert model.hidden_dim == hidden_dim
     gmm_implementation = (model.blocks[0].mlp.gmm_implementation if mlp_type == "moe" else "n/a")
     print0(
