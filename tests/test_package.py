@@ -337,7 +337,7 @@ def test_dense_example_config_resolves_current_training_defaults():
             config["training"]["validation_shard_pattern"])
 
 
-def test_olmoe_style_config_changes_only_controlled_model_geometry():
+def test_olmoe_style_production_config_changes_controlled_geometry_and_layout():
     repository_root = Path(__file__).resolve().parents[1]
     intended_reference = load_experiment_config(
         repository_root / "configs/moe_grouped.toml")
@@ -346,12 +346,13 @@ def test_olmoe_style_config_changes_only_controlled_model_geometry():
 
     # The completed E8/K2 reference checkpoint used this schedule horizon.
     intended_reference["training"]["total_steps"] = 3500
-    intended_reference["run_name"] = "moe-e64-k8-ratio0.5"
+    intended_reference["run_name"] = "moe-e64k8-r0.5"
     intended_reference["model"] = {
         **intended_reference["model"],
         "mlp_ratio": 0.5,
         "num_experts": 64,
         "top_k": 8,
+        "moe_parameter_layout": "packed",
     }
     assert experiment == intended_reference
     assert resolve_mlp_hidden_dim(

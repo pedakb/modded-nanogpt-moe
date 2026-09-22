@@ -605,8 +605,6 @@ def main(argv=None):
             if resume_checkpoint is not None and completed_updates > 0:
                 restored_elapsed = training_time + current_segment_time
                 writer.add_scalar(
-                    "perf/train_s", restored_elapsed, completed_updates)
-                writer.add_scalar(
                     "perf/step_ms",
                     1000 * restored_elapsed / completed_updates,
                     completed_updates,
@@ -725,6 +723,7 @@ def main(argv=None):
                 diagnostic_update = (
                     step + 1 if repro_diagnostics_dir and step in (0, 1) else None)
                 diagnostic_losses = [] if diagnostic_update is not None else None
+                tensorboard_losses = [] if writer is not None else None
                 collect_tb = tb_diagnostics is not None and tb_diagnostics.due(step + 1)
                 with tb_diagnostics.capture_routing() if collect_tb else nullcontext():
                     for i in range(len(inputs) // mbs):
@@ -733,8 +732,8 @@ def main(argv=None):
                                 inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
                             if diagnostic_losses is not None:
                                 diagnostic_losses.append(loss.detach())
-                            if collect_tb:
-                                tb_diagnostics.observe_loss(loss)
+                            if tensorboard_losses is not None:
+                                tensorboard_losses.append(loss.detach())
                         with nsys_range(nsys_capture_active, f"backward.microbatch_{i}"):
                             loss.backward()
                         del loss
@@ -763,8 +762,14 @@ def main(argv=None):
                             nsys_capture_active,
                             f"optimizer_update.index_{opt_idx}.{optimizer_name}"):
                         opt.step()
+                train_loss = (torch.stack(tensorboard_losses).sum() / inputs.numel()
+                              if tensorboard_losses is not None else None)
                 if collect_tb:
-                    tb_diagnostics.after_optimizers(writer, step + 1, inputs.numel())
+                    tb_diagnostics.after_optimizers(
+                        writer, step + 1,
+                        extra_scalars={"metric/loss/train": train_loss})
+                elif writer is not None:
+                    writer.add_scalar("metric/loss/train", train_loss, step + 1)
                 model.zero_grad(set_to_none=True)
                 if diagnostic_gradients is not None:
                     stage = (
@@ -809,7 +814,6 @@ def main(argv=None):
                        + f" mem_reserved_peak:{torch.cuda.max_memory_reserved()/2**30:.3f}GiB",
                        console=True, log=False)
             if writer is not None:
-                writer.add_scalar("perf/train_s", approx_training_time, step + 1)
                 writer.add_scalar("perf/step_ms", 1000 * approx_training_time / (step + 1), step + 1)
                 writer.add_scalar("perf/tok_s", batch_size * (step + 1) / approx_training_time
                                   if approx_training_time > 0 else float("nan"), step + 1)

@@ -146,11 +146,10 @@ def test_packed_forward_uses_storage_without_stacking(cpu_gmm, monkeypatch):
 
 def test_packed_config_and_optimizer_assignment(cpu_gmm):
     root = Path(__file__).resolve().parents[1]
-    reference = load_experiment_config(root / "configs/moe_e64k8_r0.5.toml")
-    packed = load_experiment_config(root / "configs/moe_e64k8_r0.5_packed.toml")
-    reference["run_name"] += "-packed"
-    reference["model"]["moe_parameter_layout"] = "packed"
-    assert reference == packed
+    config = load_experiment_config(root / "configs/moe_e64k8_r0.5.toml")
+    assert config["run_name"] == "moe-e64k8-r0.5"
+    assert config["model"]["moe_parameter_layout"] == "packed"
+    assert config["diagnostics"]["scalar_interval"] == 25
     model = GPT(vocab_size=37, num_layers=1, model_dim=128, mlp_type="moe",
                 num_experts=8, top_k=2, moe_backend="grouped_gemm",
                 moe_parameter_layout="packed")

@@ -34,3 +34,8 @@ fused = true
 lr = 0.025
 weight_decay = 0.05
 mu = 0.95
+
+[diagnostics]
+scalar_interval = 25
+histogram_interval = 0
+during_nsys = false

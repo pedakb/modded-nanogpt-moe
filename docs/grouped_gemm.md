@@ -156,7 +156,7 @@ unset SEED_OVERRIDE MBS_OVERRIDE TRAIN_STEPS_OVERRIDE MLP_TYPE_OVERRIDE
 unset MLP_RATIO_OVERRIDE NUM_EXPERTS_OVERRIDE TOP_K_OVERRIDE MOE_BACKEND_OVERRIDE
 unset CHECKPOINT_DIR CHECKPOINT_INTERVAL RESUME_CHECKPOINT STOP_AFTER_COMPLETED_UPDATES
 unset REPRO_DIAGNOSTICS_DIR BENCHMARK_WARMUP_UPDATES BENCHMARK_MEASURED_UPDATES
-for config in configs/moe_e64k8_r0.5_packed.toml configs/moe_grouped.toml; do
+for config in configs/moe_e64k8_r0.5.toml configs/moe_grouped.toml; do
   name="$(basename "$config" .toml)"
   for implementation in extension torch; do
     MOE_GMM_IMPLEMENTATION="$implementation" scripts/vista/benchmark.sh "$config" \

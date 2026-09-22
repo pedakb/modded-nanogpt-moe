@@ -1,4 +1,4 @@
-run_name = "moe-e64-k8-ratio0.5"
+run_name = "moe-e64k8-r0.5"
 num_trials = 1
 seed = 1234
 
@@ -12,6 +12,7 @@ num_experts = 64
 top_k = 8
 normalize_topk = true
 moe_backend = "grouped_gemm"
+moe_parameter_layout = "packed"
 
 [training]
 sequence_length = 1024
@@ -34,3 +35,8 @@ fused = true
 lr = 0.025
 weight_decay = 0.05
 mu = 0.95
+
+[diagnostics]
+scalar_interval = 25
+histogram_interval = 0
+during_nsys = false

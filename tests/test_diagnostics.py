@@ -29,118 +29,24 @@ class Writer:
         self.histograms[tag] = (values.copy(), step)
 
 
-def test_router_metrics_from_full_softmax_and_actual_assignments():
-    p = torch.tensor([[0.6, 0.3, 0.1], [0.1, 0.3, 0.6]], requires_grad=True)
-    stats = diag.RoutingStatistics(3, 2)
-    # Feed two accumulation passes. Loads aggregate counts, not average CVs.
-    stats.observe(p[:1].log(), p[:1], torch.tensor([[0, 1]]))
-    stats.observe(p[1:].log(), p[1:], torch.tensor([[2, 1]]))
-    values, q = stats.finish()
-    expected_h = -(0.6 * math.log(0.6) + 0.3 * math.log(0.3) + 0.1 * math.log(0.1))
-    assert values["entropy"].item() == pytest.approx(expected_h)
-    assert values["normalized_entropy"].item() == pytest.approx(expected_h / math.log(3))
-    assert values["top1_prob"].item() == pytest.approx(0.6)
-    assert values["max_prob"] == values["top1_prob"]
-    assert values["top1_top2_gap"].item() == pytest.approx(0.3)
-    assert values["topk_margin"].item() == pytest.approx(math.log(3))
-    assert values["topk_margin_median"].item() == pytest.approx(math.log(3))
-    torch.testing.assert_close(q, torch.tensor([0.25, 0.5, 0.25]))
-    assert values["load_cv"].item() == pytest.approx(q.std(correction=0).item() / q.mean().item())
-    assert values["max_over_mean_load"].item() == pytest.approx(1.5)
-    assert values["zero_experts"] == 0
-    assert all(not v.requires_grad and v.grad_fn is None for v in values.values())
-
-
-def test_margins_thresholds_zero_load_and_zero_probabilities():
-    logits = torch.tensor([[0.4, 0.2, 0.2], [0.4, 0.2, 0.18], [0.4, 0.2, 0.12], [0.4, 0.2, 0.]])
-    stats = diag.RoutingStatistics(3, 2)
-    stats.observe(logits, logits.softmax(-1), torch.tensor([[0, 1]] * 4))
-    values, q = stats.finish()
-    assert values["topk_margin_median"].item() == pytest.approx(0.05)
-    for threshold, fraction in (("0.01", 0.25), ("0.05", 0.5), ("0.1", 0.75)):
-        assert values[f"topk_margin_below_{threshold}"].item() == fraction
-    torch.testing.assert_close(q, torch.tensor([0.5, 0.5, 0.]))
-    assert values["zero_experts"] == 1
-    assert values["load_entropy"].item() == pytest.approx(math.log(2))
-    assert values["normalized_load_entropy"].item() == pytest.approx(math.log(2) / math.log(3))
-    stats = diag.RoutingStatistics(3, 1)
-    stats.observe(torch.tensor([[0., -1000., -1000.]]), torch.tensor([[1., 0., 0.]]), torch.tensor([[0]]))
-    assert stats.finish()[0]["entropy"] == 0
-
-
-@pytest.mark.parametrize("e", [1, 3])
-def test_k_equals_e_and_uniform_entropy(e):
-    stats = diag.RoutingStatistics(e, e)
-    stats.observe(torch.zeros(2, e), torch.full((2, e), 1 / e), torch.arange(e).expand(2, e))
-    metrics, _ = stats.finish()
-    assert "topk_margin" not in metrics
-    assert metrics["normalized_entropy"].item() == pytest.approx(1 if e > 1 else 0)
-    assert metrics["normalized_load_entropy"].item() == pytest.approx(1 if e > 1 else 0)
-    assert metrics["logit_rms"].item() == 0
-
-
-def test_centered_logit_rms_shift_invariance_and_microbatch_weighting():
-    logits = torch.tensor([[1., 3.], [2., 6.], [0., 0.]])
-    selected = logits.topk(1, dim=-1).indices
-    def collect(z, parts):
-        stats = diag.RoutingStatistics(2, 1)
-        for start, end in parts:
-            stats.observe(z[start:end], z[start:end].softmax(-1), selected[start:end])
-        return stats.finish()[0]
-    whole = collect(logits, [(0, 3)])
-    split = collect(logits, [(0, 1), (1, 3)])
-    shifted = collect(logits + torch.tensor([[100.], [-20.], [5.]]), [(0, 1), (1, 3)])
-    assert whole["logit_rms"].item() == pytest.approx(math.sqrt(5 / 3))
-    for metrics in (split, shifted):
-        torch.testing.assert_close(metrics["logit_rms"], whole["logit_rms"], atol=0, rtol=0)
-    assert whole["logit_rms"].grad_fn is None
-
-
-@pytest.mark.parametrize("values", [[1.], [1., 2., 3., 4.], [1., 7., 9.], [0.] * 64,
-                                    [float("nan"), 1., 2.]])
-def test_percentile_selection_matches_linear_interpolation(values):
-    values = torch.tensor(values)
-    for q in (0.1, 0.9):
-        torch.testing.assert_close(diag.percentile(values, q), values.quantile(q), equal_nan=True)
-
-
-def test_rms_is_size_normalized_before_expert_aggregation():
-    values = [torch.full((2, 2), 3.), torch.full((2, 8), 5.)]
-    group = diag.ParameterGroup(values, experts=True)
-    norms = group.norms(values)
-    torch.testing.assert_close(norms, torch.tensor([6., 20.]))
-    torch.testing.assert_close(group.rms(norms), torch.tensor([3., 5.]))
-    assert diag.midpoint_median(group.rms(norms)) == 4
-    router = diag.ParameterGroup(values)
-    torch.testing.assert_close(router.rms(router.norms(values)), torch.tensor([math.sqrt(436 / 20)]))
-    packed_values = torch.stack([torch.full((2, 4), 3.), torch.full((2, 4), 5.)])
-    packed = diag.ParameterGroup([packed_values], experts=True, packed=True)
-    torch.testing.assert_close(packed.rms(packed.norms([packed_values])), torch.tensor([3., 5.]))
-
-
-def test_expert_summary_and_group_norms():
-    values = torch.tensor([1., 2., 3., 4.])
-    results = diag.summary(values)
-    assert {name: v.item() for name, v in results.items()} == pytest.approx(
-        dict(min=1, median=2.5, mean=2.5, max=4, std=math.sqrt(1.25)))
-    x = torch.tensor([[[3., 4.]], [[0., 12.]]])
-    for group, tensors in ((diag.ParameterGroup([], True, True), [x]),
-                           (diag.ParameterGroup([], True), list(x))):
-        torch.testing.assert_close(group.norms(tensors), torch.tensor([5., 12.]))
-    torch.testing.assert_close(diag.ParameterGroup([]).norms(list(x)), torch.tensor([13.]))
-    assert torch.isnan(diag.ratio(torch.tensor(1.), torch.tensor(0.)))
-
-
-def toy_model(monkeypatch, layout="modulelist"):
+def toy_model(monkeypatch, layout="modulelist", layers=1):
     def gmm(a, w, counts, trans_b=False):
-        return torch.cat([segment @ matrix for segment, matrix in zip(a.split(counts.tolist()), w)])
-    monkeypatch.setitem(sys.modules, "grouped_gemm", SimpleNamespace(ops=SimpleNamespace(gmm=gmm)))
+        return torch.cat([
+            segment @ matrix for segment, matrix in zip(a.split(counts.tolist()), w)])
+
+    monkeypatch.setitem(
+        sys.modules, "grouped_gemm", SimpleNamespace(ops=SimpleNamespace(gmm=gmm)))
     monkeypatch.setenv("MOE_GMM_IMPLEMENTATION", "extension")
     model = nn.Module()
-    block = nn.Module()
-    block.attn = nn.Linear(8, 8)
-    block.mlp = MoE(8, 4, 2, hidden_dim=8, moe_backend="grouped_gemm", moe_parameter_layout=layout)
-    model.blocks = nn.ModuleList([block])
+    blocks = []
+    for _ in range(layers):
+        block = nn.Module()
+        block.attn = nn.Linear(8, 8)
+        block.mlp = MoE(
+            8, 4, 2, hidden_dim=8, moe_backend="grouped_gemm",
+            moe_parameter_layout=layout)
+        blocks.append(block)
+    model.blocks = nn.ModuleList(blocks)
     model.embed = nn.Embedding(8, 8)
     model.proj = nn.Linear(8, 8)
     with torch.no_grad():
@@ -149,70 +55,187 @@ def toy_model(monkeypatch, layout="modulelist"):
     return model
 
 
+def expert_weights(moe, expert):
+    if moe.moe_parameter_layout == "packed":
+        return moe.fc_weight[expert], moe.proj_weight[expert]
+    return moe.experts[expert].fc.weight, moe.experts[expert].proj.weight
+
+
+def test_router_statistics_compute_only_retained_behavior_metrics():
+    p = torch.tensor([[0.6, 0.3, 0.1], [0.1, 0.3, 0.6]])
+    stats = diag.RoutingStatistics(3, 2)
+    stats.observe(p[:1].log(), p[:1], torch.tensor([[0, 1]]))
+    stats.observe(p[1:].log(), p[1:], torch.tensor([[2, 1]]))
+    values = stats.finish()
+    expected_entropy = -sum(value * math.log(value) for value in (0.6, 0.3, 0.1))
+    q = torch.tensor([0.25, 0.5, 0.25])
+    assert set(values) == {
+        "normalized_entropy", "topk_margin_median", "load_cv", "zero_experts"}
+    assert values["normalized_entropy"].item() == pytest.approx(
+        expected_entropy / math.log(3))
+    assert values["topk_margin_median"].item() == pytest.approx(math.log(3))
+    assert values["load_cv"].item() == pytest.approx(
+        q.std(correction=0).item() / q.mean().item())
+    assert values["zero_experts"] == 0
+    assert all(not value.requires_grad and value.grad_fn is None
+               for value in values.values())
+
+
+@pytest.mark.parametrize("experts", [1, 3])
+def test_k_equals_e_omits_boundary_margin(experts):
+    stats = diag.RoutingStatistics(experts, experts)
+    stats.observe(
+        torch.zeros(2, experts), torch.full((2, experts), 1 / experts),
+        torch.arange(experts).expand(2, experts))
+    metrics = stats.finish()
+    assert "topk_margin_median" not in metrics
+    assert metrics["normalized_entropy"].item() == pytest.approx(
+        1 if experts > 1 else 0)
+
+
+def test_margin_median_and_empty_experts_preserve_definitions():
+    logits = torch.tensor([
+        [0.4, 0.2, 0.2], [0.4, 0.2, 0.18],
+        [0.4, 0.2, 0.12], [0.4, 0.2, 0.]])
+    stats = diag.RoutingStatistics(3, 2)
+    stats.observe(logits, logits.softmax(-1), torch.tensor([[0, 1]] * 4))
+    values = stats.finish()
+    assert values["topk_margin_median"].item() == pytest.approx(0.05)
+    assert values["zero_experts"] == 1
+
+
+def test_midpoint_median_selection():
+    assert diag.midpoint_median(torch.tensor([1., 4., 2., 3.])) == 2.5
+    assert diag.midpoint_median(torch.tensor([1., 9., 7.])) == 7
+    assert torch.isnan(diag.midpoint_median(torch.tensor([1., float("nan")])))
+
+
 @pytest.mark.parametrize("layout", ["modulelist", "packed"])
-def test_actual_adamw_muon_updates_gradients_and_no_state_changes(monkeypatch, layout):
+def test_expert_fc1_fc2_are_combined_before_median(monkeypatch, layout):
+    model = toy_model(monkeypatch, layout)
+    moe = model.blocks[0].mlp
+    observer = diag.TrainingDiagnostics(model, SETTINGS)
+    fc_values = torch.tensor([1., 2., 3., 4.])
+    proj_values = torch.tensor([7., 6., 5., 4.])
+    fc_grads = torch.tensor([2., 4., 6., 8.])
+    proj_grads = torch.tensor([1., 3., 5., 7.])
+    fc_updates = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    proj_updates = torch.tensor([0.8, 0.6, 0.4, 0.2])
+    with torch.no_grad():
+        if layout == "packed":
+            moe.fc_weight.grad = torch.empty_like(moe.fc_weight)
+            moe.proj_weight.grad = torch.empty_like(moe.proj_weight)
+        for expert in range(4):
+            fc, proj = expert_weights(moe, expert)
+            fc.fill_(fc_values[expert])
+            proj.fill_(proj_values[expert])
+            if layout == "packed":
+                moe.fc_weight.grad[expert].fill_(fc_grads[expert])
+                moe.proj_weight.grad[expert].fill_(proj_grads[expert])
+            else:
+                fc.grad = torch.full_like(fc, fc_grads[expert])
+                proj.grad = torch.full_like(proj, proj_grads[expert])
+    with observer.capture_routing():
+        pass
+    observer.before_optimizers()
+    with torch.no_grad():
+        for expert in range(4):
+            fc, proj = expert_weights(moe, expert)
+            fc.add_(fc_updates[expert])
+            proj.add_(proj_updates[expert])
+    writer = Writer()
+    observer.after_optimizers(writer, 10)
+
+    param_rms = ((fc_values.square() + proj_values.square()) / 2).sqrt()
+    grad_rms = ((fc_grads.square() + proj_grads.square()) / 2).sqrt()
+    update_rms = ((fc_updates.square() + proj_updates.square()) / 2).sqrt()
+    update_ratio = ((fc_updates.square() + proj_updates.square()) /
+                    (fc_values.square() + proj_values.square())).sqrt()
+    for metric, values in (
+            ("param_rms", param_rms), ("grad_rms", grad_rms),
+            ("update_rms", update_rms), ("update_ratio", update_ratio)):
+        expected = diag.midpoint_median(values).item()
+        assert writer.scalars[f"opt/expert/l00/{metric}_med"] == pytest.approx(
+            (expected, 10))
+    # This differs from combining independently summarized FC1 and FC2 values.
+    separate_then_combine = math.sqrt(
+        (diag.midpoint_median(fc_values).square()
+         + diag.midpoint_median(proj_values).square()).item() / 2)
+    assert writer.scalars["opt/expert/l00/param_rms_med"][0] != pytest.approx(
+        separate_then_combine)
+    assert not writer.histograms
+
+
+def test_global_metrics_are_true_parameter_count_weighted_values(monkeypatch):
+    model = toy_model(monkeypatch)
+    observer = diag.TrainingDiagnostics(model, SETTINGS)
+    old_values, grad_values, delta_values = [], [], []
+    with torch.no_grad():
+        for index, parameter in enumerate(model.parameters()):
+            parameter.fill_((index + 1) / 10)
+            parameter.grad = torch.full_like(parameter, (index + 2) / 20)
+            old_values.append(parameter.detach().float().flatten().clone())
+            grad_values.append(parameter.grad.detach().float().flatten().clone())
+            delta_values.append(torch.full_like(old_values[-1], (index + 1) / 1000))
+    with observer.capture_routing():
+        pass
+    observer.before_optimizers()
+    with torch.no_grad():
+        for index, parameter in enumerate(model.parameters()):
+            parameter.add_((index + 1) / 1000)
+    writer = Writer()
+    observer.after_optimizers(writer, 10)
+    old = torch.cat(old_values)
+    gradients = torch.cat(grad_values)
+    deltas = torch.cat(delta_values)
+    expected = {
+        "param_rms": old.square().mean().sqrt(),
+        "grad_rms": gradients.square().mean().sqrt(),
+        "update_rms": deltas.square().mean().sqrt(),
+        "update_ratio": deltas.norm() / old.norm(),
+    }
+    for metric, value in expected.items():
+        assert writer.scalars[f"opt/global/{metric}"] == pytest.approx(
+            (value.item(), 10), rel=1e-5)
+
+
+@pytest.mark.parametrize("layout", ["modulelist", "packed"])
+def test_actual_optimizer_steps_and_states_are_unchanged(monkeypatch, layout):
     model = toy_model(monkeypatch, layout)
     reference = copy.deepcopy(model)
-    settings = dict(SETTINGS, histogram_interval=10)
-    observer = diag.TrainingDiagnostics(model, settings)
-    assert not observer.due(9) and observer.due(10)
-    writer = Writer()
+    observer = diag.TrainingDiagnostics(model, SETTINGS)
     monkeypatch.setattr(optim.dist, "get_world_size", lambda: 1)
     monkeypatch.setattr(optim.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(optim.dist, "all_gather", lambda outputs, value: None)
-    # The real Muon update including all 12 NS iterations, without compilation.
-    monkeypatch.setattr(optim, "muon_update", optim.muon_update._torchdynamo_orig_callable)
+    monkeypatch.setattr(
+        optim, "muon_update", optim.muon_update._torchdynamo_orig_callable)
     config = load_experiment_config()["optimizers"]
     config["adamw"]["fused"] = False
-    actual_opts, expected_opts = optim.build_optimizers(model, config), optim.build_optimizers(reference, config)
-    for p, ref in zip(model.parameters(), reference.parameters()):
-        p.grad = torch.full_like(p, 0.25)
-        ref.grad = p.grad.clone()
-    old = {name: p.detach().clone() for name, p in model.named_parameters()}
-    saved_rng = torch.get_rng_state().clone()
+    actual_opts = optim.build_optimizers(model, config)
+    expected_opts = optim.build_optimizers(reference, config)
+    for parameter, expected in zip(model.parameters(), reference.parameters()):
+        parameter.grad = torch.full_like(parameter, 0.25)
+        expected.grad = parameter.grad.clone()
     with observer.capture_routing():
         with torch.no_grad():
             model.blocks[0].mlp(torch.ones(1, 2, 8))
-        observer.observe_loss(torch.tensor(2.))
     observer.before_optimizers()
-    # Gradients/snapshots are independent of subsequent optimizer mutation.
-    for p, ref in zip(model.parameters(), reference.parameters()):
-        torch.testing.assert_close(p.grad, ref.grad, atol=0, rtol=0)
     for optimizer in actual_opts + expected_opts:
         optimizer.step()
-    observer.after_optimizers(writer, 10, 1)
-    assert not observer.before and not observer.metrics
+    writer = Writer()
+    observer.after_optimizers(
+        writer, 10, extra_scalars={"metric/loss/train": torch.tensor(2.)})
     assert writer.scalars["metric/loss/train"] == (2., 10)
-    assert "router/l00/load/fraction" in writer.histograms
-    assert writer.scalars["router/l00/load/zero"] == (2., 10)
-    torch.testing.assert_close(torch.get_rng_state(), saved_rng, atol=0, rtol=0)
-    for (name, p), ref in zip(model.named_parameters(), reference.parameters()):
-        torch.testing.assert_close(p, ref, atol=0, rtol=0)
-    p = model.embed.weight
-    delta = (old["embed.weight"].float() - p.detach().float()).norm().item()
-    assert writer.scalars["opt/embed/update_norm"] == pytest.approx((delta, 10))
-    assert writer.scalars["opt/embed/grad_norm"][0] == pytest.approx(2.)
-    assert writer.scalars["opt/embed/param_rms"][0] == pytest.approx(0.125)
-    assert writer.scalars["opt/embed/grad_rms"][0] == pytest.approx(0.25)
-    assert writer.scalars["opt/embed/update_rms"][0] == pytest.approx(delta / 8)
-    fc = model.blocks[0].mlp.fc_weight[0] if layout == "packed" else model.blocks[0].mlp.experts[0].fc.weight
-    delta = (torch.full_like(fc, 0.125).float() - fc.detach().float()).norm().item()
-    assert writer.scalars["opt/expert/l00/fc1/update_norm_med"][0] == pytest.approx(delta)
-    for stat in ("p10", "med", "p90"):
-        assert writer.scalars[f"opt/expert/l00/fc1/update_rms_{stat}"][0] == pytest.approx(delta / 8)
-        assert writer.scalars[f"opt/expert/l00/fc1/param_rms_{stat}"][0] == pytest.approx(0.125)
-        assert writer.scalars[f"opt/expert/l00/fc1/grad_rms_{stat}"][0] == pytest.approx(0.25)
-        assert writer.scalars[f"opt/expert/l00/fc1/update_ratio_{stat}"][0] == pytest.approx(delta)
-    assert writer.scalars["opt/router/l00/param_rms"][0] == pytest.approx(0.125)
-    assert writer.scalars["opt/router/l00/grad_rms"][0] == pytest.approx(0.25)
-    assert "opt/expert/l00/fc1/grad_rms_min" not in writer.scalars
-    assert "opt/expert/l00/fc1/grad_rms" not in writer.histograms
-    assert "opt/expert/l00/fc1/update_norm" in writer.histograms
+    for parameter, expected in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(parameter, expected, atol=0, rtol=0)
     for actual, expected in zip(actual_opts, expected_opts):
-        for p, ref in zip([p for g in actual.param_groups for p in g["params"]],
-                          [p for g in expected.param_groups for p in g["params"]]):
-            for key in actual.state[p]:
-                torch.testing.assert_close(actual.state[p][key], expected.state[ref][key], atol=0, rtol=0)
+        actual_parameters = [p for group in actual.param_groups for p in group["params"]]
+        expected_parameters = [p for group in expected.param_groups for p in group["params"]]
+        for parameter, expected_parameter in zip(actual_parameters, expected_parameters):
+            for key in actual.state[parameter]:
+                torch.testing.assert_close(
+                    actual.state[parameter][key], expected.state[expected_parameter][key],
+                    atol=0, rtol=0)
 
 
 def test_bf16_actual_delta_uses_stored_values(monkeypatch):
@@ -222,25 +245,17 @@ def test_bf16_actual_delta_uses_stored_values(monkeypatch):
         pass
     observer.before_optimizers()
     with torch.no_grad():
-        model.embed.weight.add_(0.0001)  # Rounds away at 0.125 in BF16.
+        for parameter in model.parameters():
+            parameter.add_(0.0001)  # Rounds away at 0.125 in BF16.
     writer = Writer()
-    observer.after_optimizers(writer, 10, 1)
-    assert writer.scalars["opt/embed/update_norm"] == (0., 10)
-    assert not writer.histograms
-
-
-def test_profile_explicit_opt_in_and_benchmark_always_wins(monkeypatch):
-    sentinel = object()
-    monkeypatch.setattr(diag, "TrainingDiagnostics", lambda model, settings: sentinel)
-    kwargs = dict(model=object(), writer=object(), settings=dict(SETTINGS, during_nsys=True),
-                  rank=0, benchmark=False, nsys_profile=True)
-    assert diag.make_diagnostics(**kwargs) is sentinel
-    kwargs["benchmark"] = True
-    assert diag.make_diagnostics(**kwargs) is None
+    observer.after_optimizers(writer, 10)
+    assert writer.scalars["opt/global/update_rms"] == (0., 10)
+    assert writer.scalars["opt/global/update_ratio"] == (0., 10)
 
 
 @pytest.mark.parametrize("layout", ["modulelist", "packed"])
-def test_routing_observer_parity_detachment_and_cleanup(monkeypatch, layout):
+def test_routing_observer_preserves_outputs_gradients_rng_and_cleanup(
+        monkeypatch, layout):
     model = toy_model(monkeypatch, layout)
     moe = model.blocks[0].mlp
     observer = diag.TrainingDiagnostics(model, SETTINGS)
@@ -250,229 +265,225 @@ def test_routing_observer_parity_detachment_and_cleanup(monkeypatch, layout):
     rng = torch.get_rng_state().clone()
     with observer.capture_routing():
         new = moe(x)
-        observer.observe_loss(new.sum())
         actual = torch.autograd.grad(new.sum(), (x, *moe.parameters()))
     torch.testing.assert_close(new, old, atol=0, rtol=0)
-    for a, b in zip(actual, expected):
-        torch.testing.assert_close(a, b, atol=0, rtol=0)
+    for value, expected_value in zip(actual, expected):
+        torch.testing.assert_close(value, expected_value, atol=0, rtol=0)
+    assert observer.routing["l00"].tokens == 7
     assert moe._routing_diagnostics is None
     assert not moe.router._forward_hooks
-    assert observer.routing["layer_00"].tokens == 7
-    assert not observer.losses[0].requires_grad
     torch.testing.assert_close(torch.get_rng_state(), rng, atol=0, rtol=0)
     with pytest.raises(RuntimeError), observer.capture_routing():
-        output = moe(x)
+        moe(x)
         raise RuntimeError("forward failed")
     assert moe._routing_diagnostics is None
     assert not moe.router._forward_hooks
-    assert not observer.routing["layer_00"].gradient_handles
+    assert not observer.routing["l00"].gradient_handles
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_sampled_logit_gradient_rms_no_retention_and_no_normal_hooks(monkeypatch, dtype):
+def test_logit_gradient_rms_retains_no_graph_and_has_no_normal_hooks(
+        monkeypatch, dtype):
     model = toy_model(monkeypatch).to(dtype)
     moe = model.blocks[0].mlp
     observer = diag.TrainingDiagnostics(model, SETTINGS)
-    # A normal update has no module or tensor gradient hooks installed.
     normal = moe.router(torch.ones(1, 8, dtype=dtype))
     assert not moe.router._forward_hooks and not normal._backward_hooks
     refs = []
     expected_squares = 0.
     with observer.capture_routing():
-        stats = observer.routing["layer_00"]
+        stats = observer.routing["l00"]
         for tokens, magnitude in ((1, 2.), (3, 4.)):
             logits = moe.router(torch.ones(tokens, 8, dtype=dtype))
             refs.append(weakref.ref(logits))
-            p = logits.float().softmax(-1)
-            stats.observe(logits, p, p.topk(2, dim=-1).indices)
+            probabilities = logits.float().softmax(-1)
+            stats.observe(logits, probabilities, probabilities.topk(2, dim=-1).indices)
             (logits * magnitude).sum().backward()
             expected_squares += tokens * 4 * magnitude**2
-            del logits, p
-            assert refs[-1]() is None  # Observer doesn't keep logits/graph alive.
-        assert stats.logit_grad_elements == 16
-        assert stats.logit_grad_squares.grad_fn is None
-        assert stats.logit_grad_squares.numel() == 1
-    value = stats.finish()[0]["dL_dlogits_rms"]
+            del logits, probabilities
+            assert refs[-1]() is None
+    value = stats.finish()["dL_dlogits_rms"]
     assert value.item() == pytest.approx(math.sqrt(expected_squares / 16))
     assert not moe.router._forward_hooks and not stats.gradient_handles
     observer.before_optimizers()
     writer = Writer()
-    observer.after_optimizers(writer, 10, 4)
-    assert writer.scalars["opt/router/l00/dlogit_rms"] == pytest.approx((value.item(), 10))
-    # Detached/no-grad router output cannot carry a gradient hook.
-    with observer.capture_routing(), torch.no_grad():
-        moe(torch.ones(1, 2, 8, dtype=dtype))
-        assert not observer.routing["layer_00"].gradient_handles
-    assert "dL_dlogits_rms" not in observer.routing["layer_00"].finish()[0]
-    observer.before_optimizers()
-    writer = Writer()
-    observer.after_optimizers(writer, 10, 1)
-    assert "router/l00/logit_rms" in writer.scalars
-
-
-def test_expert_rms_percentile_series_are_per_expert(monkeypatch):
-    model = toy_model(monkeypatch)
-    observer = diag.TrainingDiagnostics(model, SETTINGS)
-    with torch.no_grad():
-        for index, expert in enumerate(model.blocks[0].mlp.experts):
-            expert.fc.weight.fill_(index + 1.)
-            expert.fc.weight.grad = torch.full_like(expert.fc.weight, 2 * (index + 1.))
-    with observer.capture_routing():
-        pass
-    observer.before_optimizers()
-    with torch.no_grad():
-        for index, expert in enumerate(model.blocks[0].mlp.experts):
-            expert.fc.weight.add_(0.25 * (index + 1.))
-    writer = Writer()
-    observer.after_optimizers(writer, 10, 1)
-    for suffix, quantile in (("p10", 1.3), ("med", 2.5), ("p90", 3.7)):
-        for metric, value in (("param_rms", quantile), ("grad_rms", 2 * quantile),
-                              ("update_rms", 0.25 * quantile), ("update_ratio", 0.25)):
-            tag = f"opt/expert/l00/fc1/{metric}_{suffix}"
-            assert writer.scalars[tag] == pytest.approx((value, 10))
+    observer.after_optimizers(writer, 10)
+    assert writer.scalars["opt/router/l00/dlogit_rms"] == pytest.approx(
+        (value.item(), 10))
 
 
 @pytest.mark.parametrize("layout", ["modulelist", "packed"])
-def test_canonical_diagnostic_tags_and_values(monkeypatch, layout):
-    model = toy_model(monkeypatch, layout)
-    model.blocks.append(copy.deepcopy(model.blocks[0]))
+def test_only_representative_layers_emit_compact_heavy_surface(monkeypatch, layout):
+    model = toy_model(monkeypatch, layout, layers=12)
     observer = diag.TrainingDiagnostics(model, dict(SETTINGS, histogram_interval=10))
+    assert set(observer.layers) == {"l00", "l05", "l11"}
     with observer.capture_routing():
-        for block in model.blocks:
-            block.mlp(torch.ones(1, 3, 8)).sum().backward()
-        observer.observe_loss(torch.tensor(6.))
-    routing = {layer: stats.finish()[0] for layer, stats in observer.routing.items()}
+        for index, block in enumerate(model.blocks):
+            assert (block.mlp._routing_diagnostics is not None) == (index in (0, 5, 11))
+        for index in (0, 5, 11):
+            model.blocks[index].mlp(torch.ones(1, 3, 8)).sum().backward()
     observer.before_optimizers()
     writer = Writer()
-    observer.after_optimizers(writer, 10, 3)
+    observer.after_optimizers(
+        writer, 10, extra_scalars={"metric/loss/train": torch.tensor(2.)})
+
     expected = {"metric/loss/train"}
-    norms = ("param_norm", "grad_norm", "grad_ratio", "update_norm", "update_ratio")
-    rms = ("param_rms", "grad_rms", "update_rms")
-    for group in ("attn", "embed", "head"):
-        expected.update(f"opt/{group}/{metric}" for metric in norms + rms)
-    # Explicit expected names, independent of the implementation's tag mapping.
-    router_names = {
-        "entropy": "entropy", "normalized_entropy": "entropy_norm",
-        "top1_prob": "top1_prob", "top1_top2_gap": "top1_top2_gap",
-        "logit_rms": "logit_rms", "topk_margin": "topk_margin",
-        "topk_margin_median": "topk_margin_med",
-        "min_load_fraction": "load/min", "max_load_fraction": "load/max",
-        "mean_load_fraction": "load/mean", "std_load_fraction": "load/std",
-        "load_cv": "load/cv", "load_entropy": "load/entropy",
-        "normalized_load_entropy": "load/entropy_norm",
-        "zero_experts": "load/zero", "max_over_mean_load": "load/max_mean",
-        "topk_margin_below_0.01": "margin/lt_001",
-        "topk_margin_below_0.05": "margin/lt_005",
-        "topk_margin_below_0.1": "margin/lt_01",
+    expected.update(f"opt/global/{metric}" for metric in (
+        "param_rms", "grad_rms", "update_rms", "update_ratio"))
+    for layer in ("l00", "l05", "l11"):
+        expected.update(f"opt/router/{layer}/{metric}" for metric in (
+            "param_rms", "grad_rms", "update_rms", "update_ratio", "dlogit_rms"))
+        expected.update(f"opt/expert/{layer}/{metric}_med" for metric in (
+            "param_rms", "grad_rms", "update_rms", "update_ratio"))
+        expected.update({
+            f"router/{layer}/entropy_norm", f"router/{layer}/topk_margin_med",
+            f"router/{layer}/load/cv", f"router/{layer}/load/zero",
+        })
+    assert set(writer.scalars) == expected
+    assert len(writer.scalars) == 44
+    assert not writer.histograms
+    discarded = (
+        "/fc1/", "/fc2/", "param_norm", "grad_norm", "update_norm",
+        "grad_ratio", "_min", "_max", "_mean", "_std", "_p10", "_p90",
+        "opt/compare/", "opt/attn/", "opt/embed/", "opt/head/",
+        "/logit_rms", "/top1_prob", "/top1_top2_gap",
+        "/margin/", "/load/entropy", "/load/min",
+        "/load/max", "/load/mean", "/load/std", "/load/max_mean",
+    )
+    for tag in writer.scalars:
+        assert not any(fragment in tag for fragment in discarded), tag
+        assert not any(f"l{index:02d}" in tag for index in range(12)
+                       if index not in (0, 5, 11)), tag
+
+
+def test_expected_production_scalar_surface_has_exactly_51_series():
+    tags = {
+        "metric/loss/train", "metric/loss/val", "perf/step_ms", "perf/tok_s",
+        "opt/lr/adamw/g0", "opt/lr/adamw/g1", "opt/lr/adamw/g2", "opt/lr/muon",
     }
-    expected_histograms = set()
-    for index in range(2):
-        layer = f"l{index:02d}"
-        expected.update(f"opt/router/{layer}/{metric}" for metric in norms + rms + ("dlogit_rms",))
-        for old, new in router_names.items():
-            tag = f"router/{layer}/{new}"
-            expected.add(tag)
-            assert writer.scalars[tag] == pytest.approx((routing[f"layer_{index:02d}"][old].item(), 10))
-        for fc in ("fc1", "fc2"):
-            for metric in norms + rms:
-                suffixes = ("p10", "med", "p90") if metric in rms else (
-                    "min", "med", "mean", "max", "std", "p10", "p90")
-                expected.update(f"opt/expert/{layer}/{fc}/{metric}_{suffix}" for suffix in suffixes)
-            expected.update(f"opt/compare/{layer}/{fc}/router_over_expert_{metric}"
-                            for metric in ("grad_norm", "update_ratio"))
-            expected_histograms.update(f"opt/expert/{layer}/{fc}/{metric}"
-                                       for metric in ("param_norm", "grad_norm", "update_norm"))
-        expected_histograms.add(f"router/{layer}/load/fraction")
-    assert set(writer.scalars) == expected  # No legacy aliases or other namespaces.
-    assert set(writer.histograms) == expected_histograms
-    assert writer.scalars["metric/loss/train"] == (2., 10)
+    tags.update(f"opt/global/{metric}" for metric in (
+        "param_rms", "grad_rms", "update_rms", "update_ratio"))
+    for layer in ("l00", "l05", "l11"):
+        tags.update(f"opt/router/{layer}/{metric}" for metric in (
+            "param_rms", "grad_rms", "update_rms", "update_ratio", "dlogit_rms"))
+        tags.update(f"opt/expert/{layer}/{metric}_med" for metric in (
+            "param_rms", "grad_rms", "update_rms", "update_ratio"))
+        tags.update({
+            f"router/{layer}/entropy_norm", f"router/{layer}/topk_margin_med",
+            f"router/{layer}/load/cv", f"router/{layer}/load/zero",
+        })
+    assert len(tags) == 51
 
 
-@pytest.mark.parametrize("index", range(12))
-def test_layer_tag_zero_padding(index):
-    assert diag._compact_group(f"experts/layer_{index:02d}/fc1") == f"expert/l{index:02d}/fc1"
+def test_sampling_cadence_uses_completed_updates(monkeypatch):
+    observer = diag.TrainingDiagnostics(
+        toy_model(monkeypatch), dict(SETTINGS, scalar_interval=25))
+    assert not observer.due(1)
+    assert not observer.due(24)
+    assert observer.due(25)
+    assert not observer.due(49)
+    assert observer.due(50)
 
 
 @pytest.mark.parametrize("adamw_groups,muon_groups", [(3, 1), (1, 1), (4, 2)])
 def test_trainer_learning_rate_tags_generalize_group_counts(adamw_groups, muon_groups):
     adamw = torch.optim.AdamW([
-        dict(params=[nn.Parameter(torch.ones(2, 2))], lr=0.01 * (i + 1))
-        for i in range(adamw_groups)])
+        dict(params=[nn.Parameter(torch.ones(2, 2))], lr=0.01 * (index + 1))
+        for index in range(adamw_groups)])
     muon = optim.Muon([nn.Parameter(torch.ones(2, 2))], lr=0.025)
-    for i in range(1, muon_groups):
-        muon.add_param_group(dict(params=[nn.Parameter(torch.ones(2, 2))], lr=0.025 * (i + 1)))
+    for index in range(1, muon_groups):
+        muon.add_param_group(dict(
+            params=[nn.Parameter(torch.ones(2, 2))], lr=0.025 * (index + 1)))
     tree = ast.parse(inspect.getsource(train.main))
     lr_loop = next(node for node in ast.walk(tree) if isinstance(node, ast.For)
                    and "learning_rate_tag(opt, grp_idx)" in ast.unparse(node)
                    and ast.unparse(node.target) == "(opt_idx, opt)")
     writer = Writer()
-    namespace = dict(writer=writer, optimizers=[adamw, muon], step=7,
-                     learning_rate_tag=train.learning_rate_tag)
-    exec(compile(ast.Module(body=[lr_loop], type_ignores=[]), train.__file__, "exec"), namespace)
-    expected = {f"opt/lr/adamw/g{i}": (0.01 * (i + 1), 7) for i in range(adamw_groups)}
-    expected.update({"opt/lr/muon" if muon_groups == 1 else f"opt/lr/muon/g{i}":
-                     (0.025 * (i + 1), 7) for i in range(muon_groups)})
+    namespace = dict(
+        writer=writer, optimizers=[adamw, muon], step=7,
+        learning_rate_tag=train.learning_rate_tag)
+    exec(compile(ast.Module(body=[lr_loop], type_ignores=[]), train.__file__, "exec"),
+         namespace)
+    expected = {
+        f"opt/lr/adamw/g{index}": (0.01 * (index + 1), 7)
+        for index in range(adamw_groups)}
+    expected.update({
+        "opt/lr/muon" if muon_groups == 1 else f"opt/lr/muon/g{index}":
+            (0.025 * (index + 1), 7)
+        for index in range(muon_groups)})
     assert writer.scalars == expected
 
 
-@pytest.mark.parametrize("seconds_per_update", [0., 2.])
-def test_trainer_loss_and_performance_tags(seconds_per_update):
+def test_trainer_has_only_canonical_loss_and_performance_tags():
     tree = ast.parse(inspect.getsource(train.main))
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
-             and ast.unparse(node.func) == "writer.add_scalar"
-             and isinstance(node.args[0], ast.Constant)]
-    namespace = dict(batch_size=1024, completed_updates=3, step=3, val_loss=2.5,
-                     restored_elapsed=3 * seconds_per_update, step_avg=seconds_per_update,
-                     approx_training_time=4 * seconds_per_update)
-    emitted = []
-    for call in calls:
-        tag, value, step = [eval(compile(ast.Expression(arg), train.__file__, "eval"), namespace)
-                            for arg in call.args]
-        emitted.append(tag)
-        if tag == "metric/loss/val":
-            assert (value, step) == (2.5, 3)
-        elif tag == "perf/step_ms":
-            assert value == 1000 * seconds_per_update
-        elif tag == "perf/train_s":
-            assert value == step * seconds_per_update
-        elif tag == "perf/tok_s":
-            assert value == 512 if seconds_per_update else math.isnan(value)
-        else:
-            pytest.fail(f"Noncanonical trainer tag: {tag}")
-    assert sorted(emitted) == sorted(["metric/loss/val"] + ["perf/train_s"] * 2
-                                     + ["perf/step_ms"] * 3 + ["perf/tok_s"] * 3)
+    constant_tags = [
+        node.args[0].value for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "writer.add_scalar"
+        and isinstance(node.args[0], ast.Constant)]
+    assert "perf/train_s" not in constant_tags
+    assert set(constant_tags) == {
+        "metric/loss/train", "metric/loss/val", "perf/step_ms", "perf/tok_s"}
+    assert constant_tags.count("metric/loss/train") == 1
+    source = inspect.getsource(train.main)
+    assert 'extra_scalars={"metric/loss/train": train_loss}' in source
+    assert 'elif writer is not None:\n                    writer.add_scalar(' in source
 
 
-@pytest.mark.parametrize("override", [dict(writer=None), dict(rank=1), dict(benchmark=True),
-                                     dict(nsys_profile=True), dict(settings=dict(SETTINGS, scalar_interval=0))])
+@pytest.mark.parametrize(
+    "override",
+    [dict(writer=None), dict(rank=1), dict(benchmark=True), dict(nsys_profile=True),
+     dict(settings=dict(SETTINGS, scalar_interval=0))])
 def test_disabled_does_not_construct_or_inspect_model(monkeypatch, override):
     def forbidden(*args):
         pytest.fail("disabled diagnostics constructed")
+
     monkeypatch.setattr(diag, "TrainingDiagnostics", forbidden)
-    kwargs = dict(model=object(), writer=object(), settings=SETTINGS, rank=0, benchmark=False, nsys_profile=False)
+    kwargs = dict(
+        model=object(), writer=object(), settings=SETTINGS, rank=0,
+        benchmark=False, nsys_profile=False)
     kwargs.update(override)
+    assert diag.make_diagnostics(**kwargs) is None
+
+
+def test_profile_explicit_opt_in_and_benchmark_always_wins(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr(diag, "TrainingDiagnostics", lambda model, settings: sentinel)
+    kwargs = dict(
+        model=object(), writer=object(), settings=dict(SETTINGS, during_nsys=True),
+        rank=0, benchmark=False, nsys_profile=True)
+    assert diag.make_diagnostics(**kwargs) is sentinel
+    kwargs["benchmark"] = True
     assert diag.make_diagnostics(**kwargs) is None
 
 
 def test_trainer_benchmark_guard_and_optimizer_boundaries(monkeypatch):
     tree = ast.parse(inspect.getsource(train.main))
     setup = next(node for node in ast.walk(tree) if isinstance(node, ast.Assign)
-                 and any(isinstance(t, ast.Name) and t.id == "tb_diagnostics" for t in node.targets))
+                 and any(isinstance(target, ast.Name) and target.id == "tb_diagnostics"
+                         for target in node.targets))
+
     def forbidden(*args):
         pytest.fail("benchmark instantiated diagnostics")
+
     monkeypatch.setattr(diag, "TrainingDiagnostics", forbidden)
-    namespace = dict(make_diagnostics=diag.make_diagnostics, model=object(), writer=object(),
-                     experiment_config=dict(diagnostics=SETTINGS), benchmark=dict(enabled=True),
-                     nsys_profile=False, dist=SimpleNamespace(get_rank=lambda: 0))
-    exec(compile(ast.Module(body=[setup], type_ignores=[]), train.__file__, "exec"), namespace)
+    namespace = dict(
+        make_diagnostics=diag.make_diagnostics, model=object(), writer=object(),
+        experiment_config=dict(diagnostics=SETTINGS), benchmark=dict(enabled=True),
+        nsys_profile=False, dist=SimpleNamespace(get_rank=lambda: 0))
+    exec(compile(ast.Module(body=[setup], type_ignores=[]), train.__file__, "exec"),
+         namespace)
     assert namespace["tb_diagnostics"] is None
-    calls = {ast.unparse(node.func): node.lineno for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    calls = {
+        ast.unparse(node.func): node.lineno for node in ast.walk(tree)
+        if isinstance(node, ast.Call)}
     assert calls["dist.all_reduce"] < calls["tb_diagnostics.before_optimizers"] < calls["opt.step"]
     assert calls["opt.step"] < calls["tb_diagnostics.after_optimizers"] < calls["model.zero_grad"]
 
 
-@pytest.mark.parametrize("key,value", [("scalar_interval", -1), ("scalar_interval", True),
-                                       ("histogram_interval", 11), ("during_nsys", "yes")])
+@pytest.mark.parametrize(
+    "key,value",
+    [("scalar_interval", -1), ("scalar_interval", True),
+     ("histogram_interval", 11), ("during_nsys", "yes")])
 def test_config_validation(key, value):
     config = load_experiment_config()
     config["diagnostics"][key] = value

@@ -1,37 +1,74 @@
 # Current handoff
 
-Updated: 2026-09-18
+Updated: 2026-09-22
 
 ## Current goal and state
 
-Current base on `cleanup-active-codebase`: `0fba645` (`Add sampled MoE training
-diagnostics`), initially clean. Current task: TensorBoard tag hierarchy cleanup
-only. Diagnostics and the prior GEMM candidate are committed;
-its CUDA correctness/performance remain pending as recorded below. No commits,
-remote jobs, dependency installs or extension rebuilds performed this task.
+Current base on `cleanup-active-codebase`: `e1e4cf2` (`Clean up TensorBoard
+diagnostics hierarchy`). The compact production diagnostics implementation and
+production-config cleanup are uncommitted. No commit or push has been made.
 
-## TensorBoard tag cleanup (current work)
+## Compact production TensorBoard diagnostics (final design)
 
-- Emit only `metric/`, `opt/`, `router/`, `perf/`; compact layer names `l00`,
-  expert summaries `_med`, and groups `expert`, `attn`, `embed`, `head`.
-  Losses are exclusively `metric/loss/train` and `metric/loss/val`. Router
-  logit-gradient RMS moves to `opt/router/l00/dlogit_rms`; behavioral metrics
-  remain under `router/l00/`, with `load/` and `margin/` subgroups. Remove the
-  duplicate max-probability alias (keep `top1_prob`). No metric math changes.
-- LR tags use `opt/lr/adamw/gN`, `opt/lr/muon` (or `/gN` for multiple Muon
-  groups). Performance tags are `perf/train_s`, `perf/step_ms`, `perf/tok_s`;
-  throughput is a host-side division using the same existing average duration
-  and global batch size. No extra clock reads, synchronization or GPU work.
-- Sampling, actual-update snapshots, benchmark/Nsight gating, optimizer/model
-  behavior, event steps and checkpoint/purge semantics unchanged. No historical
-  event migration or legacy aliases; resumed old runs retain old historical tags.
-- Dirty files: diagnostics.py, train.py, tests/test_diagnostics.py,
-  docs/diagnostics.md, HANDOFF.md. No config/dependency/model/kernel changes.
-- Validation: targeted diagnostics tests: 50 passed. Full suite: 231 passed,
-  143 CUDA-dependent tests skipped. `git diff --check` passed. CUDA event
-  inspection remains pending on Vista.
+- The standard production run has exactly **51 scalar series**: 8 ordinary
+  loss/performance/LR series, 4 global optimization series, and 13 heavy series
+  for each of three representative layers. No legacy aliases or histogram
+  series are emitted; `perf/train_s` was removed.
+- `metric/loss/train` is logged after every completed optimizer update.
+  `metric/loss/val`, `perf/step_ms`, `perf/tok_s`, the three AdamW LR groups,
+  and the Muon LR retain their existing trainer write points and meanings.
+- Heavy diagnostics follow completed-update `diagnostics.scalar_interval`
+  cadence. Production uses `scalar_interval = 25`, `histogram_interval = 0`,
+  and `during_nsys = false`.
+- Global optimization health is
+  `opt/global/{param_rms,grad_rms,update_rms,update_ratio}` over all optimized
+  trainable parameters. RMS values use true parameter-count weighting, and
+  update quantities use actual post-optimizer stored parameter changes.
+- Heavy per-layer diagnostics are restricted to `l00`, `l05`, and `l11`.
+  Router behavior is `entropy_norm`, `topk_margin_med`, `load/cv`, and
+  `load/zero`. Router optimization is `param_rms`, `grad_rms`, `update_rms`,
+  `update_ratio`, and `dlogit_rms`.
+- Expert diagnostics combine each expert's FC1 and FC2 weight squared sums and
+  element counts before summarizing across experts. The retained series are
+  `param_rms_med`, `grad_rms_med`, `update_rms_med`, and `update_ratio_med`.
+  Packed and ModuleList implementations remain supported by the observer.
+- Removed work includes diagnostics for the other nine layers; separate FC1/FC2
+  series; raw norms and grad ratios; min/max/mean/std/p10/p90; router-vs-expert
+  comparisons; attention/embedding/head groups; discarded router behavior; and
+  all histograms. Sampled updates still require one full-model parameter snapshot
+  and full-model reductions to measure exact global update metrics. Representative
+  groups reuse that snapshot rather than cloning parameters again.
+- Benchmark mode still bypasses diagnostics completely. Nsight still bypasses
+  diagnostics for the whole run unless `during_nsys=true` explicitly opts in.
+  Rank, TensorBoard writer, checkpoint, resume, run-name, model, routing, and
+  optimizer semantics are unchanged.
 
-## TensorBoard diagnostics (committed implementation)
+## Production E64/K8 configuration
+
+- The production experiment is `configs/moe_e64k8_r0.5.toml`, with run name
+  `moe-e64k8-r0.5`, D=768, E=64, K=8, `mlp_ratio=0.5`, 3500 updates, grouped
+  GEMM execution, and packed expert parameters. Packed storage is an
+  implementation detail and is no longer part of the scientific config/run name.
+- Vista production training should use `MOE_GMM_IMPLEMENTATION=torch`, scoped to
+  the training command (for example,
+  `MOE_GMM_IMPLEMENTATION=torch scripts/vista/submit.sh configs/moe_e64k8_r0.5.toml`).
+  **Do not globally export `MOE_GMM_IMPLEMENTATION=torch` before pytest**: CPU
+  unit tests that exercise the extension/fallback contract will fail under that
+  global override.
+- `configs/moe_grouped.toml` also uses the production diagnostics interval 25;
+  its E8/K2 scientific and training settings are otherwise unchanged.
+
+## Final validation and pending work
+
+- Full Vista test suite: **357 passed, 1 skipped**.
+- A 30-update TensorBoard smoke test completed successfully with the compact
+  diagnostics enabled.
+- `git diff --check` was clean after implementation validation.
+- CUDA TensorBoard event-file inspection and the final diagnostics overhead
+  benchmark remain pending. Do not infer final runtime overhead from tests or
+  the smoke run.
+
+## Prior sampled diagnostics implementation (historical; superseded)
 
 - New `diagnostics.py` owns aggregation/snapshot/emission logic. TOML defaults:
   `[diagnostics] scalar_interval=10, histogram_interval=0, during_nsys=false`.
