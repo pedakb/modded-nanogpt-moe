@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from modded_nanogpt_moe import model as model_module
-from modded_nanogpt_moe.grad_em import GradEMCombine, grad_em_reference, require_grad_em_cpu
+from modded_nanogpt_moe.grad_em import GradEMCombine, grad_em_reference, require_grad_em_device
 from modded_nanogpt_moe.model import GPT, MoE, combine_expert_outputs
 
 
@@ -153,16 +153,16 @@ def test_config_reaches_each_moe_block(cpu_gmm):
                for block in model.blocks)
 
 
-def test_cuda_rejected_without_allocating_gpu_tensors():
-    with pytest.raises(NotImplementedError, match="CPU-only.*Stage 2B"):
-        require_grad_em_cpu(torch.device("cuda"))
+def test_supported_devices_without_allocating_gpu_tensors():
+    require_grad_em_device(torch.device("cpu"))
+    require_grad_em_device(torch.device("cuda"))
 
 
-def test_moe_rejects_cuda_before_router_or_expert_execution(cpu_gmm):
+def test_moe_rejects_unsupported_device_before_router_or_expert_execution(cpu_gmm):
     moe = MoE(4, 8, 2, moe_backend="grouped_gemm", moe_backward="grad_em")
     # Only device is inspected: no actual GPU allocation or execution.
-    with pytest.raises(NotImplementedError, match="CPU-only.*Stage 2B"):
-        moe(SimpleNamespace(device=torch.device("cuda")))
+    with pytest.raises(NotImplementedError, match="only CPU and CUDA"):
+        moe(SimpleNamespace(device=torch.device("mps")))
 
 
 def test_loop_grad_em_rejected_explicitly():

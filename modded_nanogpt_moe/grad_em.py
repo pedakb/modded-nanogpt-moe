@@ -1,4 +1,4 @@
-"""Grad-EM oracle and combine boundary; CUDA enablement awaits GPU validation.
+"""Grad-EM oracle and CPU/CUDA combine boundary.
 
 Only selected expert outputs are supplied. All arithmetic/results are FP32,
 detached, including products before the dot-product reduction. No activation-
@@ -13,15 +13,14 @@ import torch
 from .config import validate_grad_em_eta
 
 
-def require_grad_em_cpu(device):
-    if device.type != "cpu":
+def require_grad_em_device(device):
+    if device.type not in ("cpu", "cuda"):
         raise NotImplementedError(
-            "Grad-EM remains CPU-only publicly; the CUDA combine kernel "
-            "awaits Stage 2B GPU correctness validation")
+            "Grad-EM supports only CPU and CUDA devices")
 
 
 class GradEMCombine(torch.autograd.Function):
-    """Leave the expert graph intact. CUDA branch is gated pending validation.
+    """Leave the expert graph intact with CPU reference and CUDA execution.
 
     order maps expert-sorted rows to flattened token/slot assignments. Only
     CPU backward materializes [T,K,D]; CUDA uses only compact routing scratch.
@@ -29,7 +28,7 @@ class GradEMCombine(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, out_sorted, router_logits, topk_weights, topk_experts, order, eta):
-        require_grad_em_cpu(out_sorted.device)
+        require_grad_em_device(out_sorted.device)
         validate_grad_em_eta(eta)
         ctx.is_cuda = out_sorted.is_cuda
         if ctx.is_cuda:

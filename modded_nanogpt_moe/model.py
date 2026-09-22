@@ -342,8 +342,8 @@ class MoE(nn.Module):
 
     def forward(self, x: Tensor):
         if self.moe_backward == "grad_em":
-            from .grad_em import require_grad_em_cpu
-            require_grad_em_cpu(x.device)
+            from .grad_em import require_grad_em_device
+            require_grad_em_device(x.device)
         if self.moe_backend == "grouped_gemm":
             return self._forward_grouped_gemm(x)
         return self._forward_loop(x)

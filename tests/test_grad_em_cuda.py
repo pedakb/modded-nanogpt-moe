@@ -1,4 +1,4 @@
-"""CUDA acceptance tests; never enable the unvalidated path for normal runs."""
+"""CUDA acceptance tests exercising the public Grad-EM path without bypasses."""
 import copy
 import importlib.util
 import sys
@@ -16,10 +16,8 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/T
 
 
 @pytest.fixture
-def candidate(monkeypatch):
-    # Tests alone bypass the release guard. No runtime/environment escape hatch.
+def candidate():
     pytest.importorskip("triton")
-    monkeypatch.setattr(em, "require_grad_em_cpu", lambda device: None)
     from modded_nanogpt_moe import _grad_em_cuda
     return _grad_em_cuda
 

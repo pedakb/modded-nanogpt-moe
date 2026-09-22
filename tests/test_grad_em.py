@@ -135,19 +135,24 @@ def test_existing_configs_default_to_standard(path):
     assert config["model"]["grad_em_eta"] == 0.1
 
 
-def test_grad_em_toml_and_early_training_guard(tmp_path, monkeypatch):
+def test_grad_em_toml_reaches_cuda_training_setup(tmp_path, monkeypatch):
     from modded_nanogpt_moe.train import main
     path = tmp_path / "grad_em.toml"
     path.write_text('run_name = "reference"\n[model]\nmlp_type = "moe"\n'
-                    'moe_backward = "grad_em"\ngrad_em_eta = 0.0\n')
+                    'moe_backward = "grad_em"\ngrad_em_eta = 0.0\n'
+                    'moe_backend = "grouped_gemm"\n')
     config = load_experiment_config(path)
     assert config["model"]["moe_backward"] == "grad_em"
     assert config["model"]["grad_em_eta"] == 0
     monkeypatch.delenv("MLP_TYPE_OVERRIDE", raising=False)
-    def forbidden(*args, **kwargs):
-        pytest.fail("CPU-only Grad-EM must fail before CUDA setup")
-    monkeypatch.setattr(torch.cuda, "set_device", forbidden)
-    with pytest.raises(NotImplementedError, match="CPU-only.*CUDA combine kernel"):
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    class SetupReached(Exception):
+        pass
+    def stop_at_setup(device):
+        assert device.type == "cuda"
+        raise SetupReached  # No actual CUDA/distributed setup in this CPU test.
+    monkeypatch.setattr(torch.cuda, "set_device", stop_at_setup)
+    with pytest.raises(SetupReached):
         main(["train", "--config", str(path)])
 
 

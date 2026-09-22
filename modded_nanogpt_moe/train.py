@@ -148,9 +148,6 @@ def read_source_snapshot():
 def main(argv=None):
     argv = sys.argv if argv is None else argv
     experiment_config, config_path = parse_train_args(argv[1:])
-    if experiment_config["model"]["moe_backward"] == "grad_em":
-        from .grad_em import require_grad_em_cpu
-        require_grad_em_cpu(torch.device("cuda"))  # This trainer is CUDA-only.
     code = read_source_snapshot()
 
     # torchrun sets these environment variables.
