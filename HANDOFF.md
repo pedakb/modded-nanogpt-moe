@@ -4,9 +4,9 @@ Updated: 2026-09-22
 
 ## Current goal and state
 
-Current base on `cleanup-active-codebase`: `e1e4cf2` (`Clean up TensorBoard
-diagnostics hierarchy`). The compact production diagnostics implementation and
-production-config cleanup are uncommitted. No commit or push has been made.
+Current base on `cleanup-active-codebase`: `88ed985` (`Simplify TensorBoard
+diagnostics and finalize E64 config`). The Vista launcher refactor is
+uncommitted. No commit or push has been made for it.
 
 ## Compact production TensorBoard diagnostics (final design)
 
@@ -49,21 +49,47 @@ production-config cleanup are uncommitted. No commit or push has been made.
   `moe-e64k8-r0.5`, D=768, E=64, K=8, `mlp_ratio=0.5`, 3500 updates, grouped
   GEMM execution, and packed expert parameters. Packed storage is an
   implementation detail and is no longer part of the scientific config/run name.
-- Vista production training should use `MOE_GMM_IMPLEMENTATION=torch`, scoped to
-  the training command (for example,
-  `MOE_GMM_IMPLEMENTATION=torch scripts/vista/submit.sh configs/moe_e64k8_r0.5.toml`).
+- Vista production training uses `MOE_GMM_IMPLEMENTATION=torch`, scoped to the
+  actual torchrun process by the launchers. Submit the full run with
+  `scripts/vista/train.sh --submit configs/moe_e64k8_r0.5.toml`.
   **Do not globally export `MOE_GMM_IMPLEMENTATION=torch` before pytest**: CPU
   unit tests that exercise the extension/fallback contract will fail under that
   global override.
 - `configs/moe_grouped.toml` also uses the production diagnostics interval 25;
   its E8/K2 scientific and training settings are otherwise unchanged.
 
+## Vista execution workflow
+
+- `source scripts/vista/env.sh` establishes only common machine state: modules,
+  system GCC/G++, user-local PATH, and Vista TensorBoard root/system.
+- Run tests after sourcing with `uv run --no-sync python -m pytest -q`. The
+  environment script deliberately does not select a grouped-GEMM implementation.
+- `scripts/vista/train.sh` is the only Vista training entry point. Interactive
+  commands are `train.sh --steps 30 CONFIG`, `train.sh --steps 100 CONFIG`, and
+  `train.sh CONFIG`; `train.sh --submit CONFIG [CONFIG ...]` submits the same
+  script into a non-recursive worker mode. It retains the established
+  GH/one-node/one-task/six-hour default, validates the ordered config list,
+  runs each config in a separate process, stops on failure, and writes one
+  persistent Stockyard suite log. `--submit --time SLURM_TIME` overrides the
+  time request. `--steps` is current-node only and disables TensorBoard.
+- The launcher defaults to the E64/K8 config when omitted, scopes the torch
+  grouped-GEMM implementation to each torchrun process, and clears stale
+  parent-shell run controls. The obsolete submission wrapper and separate
+  Slurm worker were removed.
+- Checkpointing has no canonical nonzero cadence. The worker's explicit
+  `--checkpoint-interval N` option creates a separate directory per TOML
+  `run_name`; `--resume PATH` resumes only the first supplied config. Resubmit
+  only unfinished configs after a failure. `README.md` records exact commands.
+  Atomic `latest.pt`/`previous.pt` rotation and restore semantics are unchanged.
+
 ## Final validation and pending work
 
 - Full Vista test suite: **357 passed, 1 skipped**.
 - A 30-update TensorBoard smoke test completed successfully with the compact
   diagnostics enabled.
-- `git diff --check` was clean after implementation validation.
+- The unified Vista launcher passes `bash -n`, and `git diff --check` is clean.
+  Its focused `tests/test_package.py` rerun is pending: the current sandbox
+  could not write the configured uv cache under Vista SCRATCH.
 - CUDA TensorBoard event-file inspection and the final diagnostics overhead
   benchmark remain pending. Do not infer final runtime overhead from tests or
   the smoke run.
@@ -355,12 +381,11 @@ available in Git and on the earlier branches.
   rotation. The user confirmed an end-to-end Vista resume run worked.
 - TensorBoard uses config `run_name`; new runs reject existing event
   directories. Optional Nsight and exact reproducibility diagnostics remain.
-- The Vista launcher now derives the repository root from its script location
-  and uses it as `DATA_ROOT` only when no explicit value is supplied. This
-  matches Vista's repository-local `data/fineweb10B` symlink into SCRATCH and
-  remains portable to other checkouts. The logical shard patterns are
-  unchanged. Launchers default `TB_ROOT` from Stockyard when unset; explicit
-  `TB_ROOT=` disables logging.
+- The Vista launchers derive the repository root from their script locations
+  and use it as `DATA_ROOT`. This matches Vista's repository-local
+  `data/fineweb10B` symlink into SCRATCH and remains portable to other
+  checkouts. The logical shard patterns are unchanged. `env.sh` selects the
+  Stockyard TensorBoard root; step-limited and benchmark processes disable it.
 - Startup output now records resolved runtime paths, matched shards, output
   destinations, Git state, and environment metadata; checkpoints retain this
   as metadata without making absolute paths compatibility requirements.
@@ -465,11 +490,11 @@ available in Git and on the earlier branches.
    commands above. Verify actual multi-rank behavior separately if needed.
    Compare the two E64/K8 layouts before drawing conclusions about the original
    E8/K2 versus E64/K8 bottleneck. Preserve console output and profile separately.
-2. Run a 10--20 update smoke test of `configs/moe_e64k8_r0.5.toml` on an
-   existing Vista idev GH200 node using `TRAIN_STEPS_OVERRIDE`; this preserves
-   the config's full-run schedule outside the smoke invocation.
-3. If the smoke succeeds, submit the full experiment through
-   `scripts/vista/submit.sh`.
+2. Use `scripts/vista/train.sh --steps N configs/moe_e64k8_r0.5.toml` for any
+   further short validation on an existing Vista idev GH200 node; do not queue
+   an sbatch smoke.
+3. Submit the full experiment with
+   `scripts/vista/train.sh --submit configs/moe_e64k8_r0.5.toml`.
 4. Validate the cleanup branch on LS6, including its actual data path, full
    pytest suite, and short dense/grouped smokes.
 5. Recheck checkpoint creation/resume and comparison from the cleaned paths

@@ -361,9 +361,7 @@ def test_olmoe_style_production_config_changes_controlled_geometry_and_layout():
     ) == 384
 
 
-@pytest.mark.parametrize("explicit_data_root", [None, "/custom/data-root"])
-def test_vista_launcher_defaults_data_root_to_repo_and_preserves_override(
-        tmp_path, explicit_data_root):
+def test_vista_launcher_scopes_machine_and_run_environment(tmp_path):
     repository_root = Path(__file__).resolve().parents[1]
     launcher = repository_root / "scripts/vista/train.sh"
     fake_bin = tmp_path / "bin"
@@ -374,8 +372,12 @@ def test_vista_launcher_defaults_data_root_to_repo_and_preserves_override(
     uv = fake_bin / "uv"
     uv.write_text(
         "#!/usr/bin/env bash\n"
-        "printf '%s\\n%s\\n%s\\n' \"$PWD\" \"${DATA_ROOT-}\" "
-        "\"${TRAIN_STEPS_OVERRIDE-}\" > \"$LAUNCH_CAPTURE\"\n"
+        "printf '%s\\n' \"$PWD\" \"${DATA_ROOT-}\" "
+        "\"${TRAIN_STEPS_OVERRIDE-}\" \"${MOE_GMM_IMPLEMENTATION-}\" "
+        "\"${TRAINING_BENCHMARK-}\" \"${NSYS_PROFILE-}\" "
+        "\"${RESUME_CHECKPOINT-}\" \"${STOP_AFTER_COMPLETED_UPDATES-}\" "
+        "\"${CHECKPOINT_DIR-}\" \"${TB_ROOT-}\" \"${TB_SYSTEM-}\" "
+        "> \"$LAUNCH_CAPTURE\"\n"
         "printf '%s\\n' \"$@\" >> \"$LAUNCH_CAPTURE\"\n"
     )
     uv.chmod(0o755)
@@ -385,31 +387,122 @@ def test_vista_launcher_defaults_data_root_to_repo_and_preserves_override(
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
     environment["LAUNCH_CAPTURE"] = str(capture)
-    environment["TRAIN_STEPS_OVERRIDE"] = "17"
-    if explicit_data_root is None:
-        environment.pop("DATA_ROOT", None)
-        expected_data_root = str(repository_root)
-    else:
-        environment["DATA_ROOT"] = explicit_data_root
-        expected_data_root = explicit_data_root
+    environment["STOCKYARD"] = str(tmp_path / "stockyard")
+    environment["DATA_ROOT"] = "/stale/data"
+    environment["TRAIN_STEPS_OVERRIDE"] = "999"
+    environment["MOE_GMM_IMPLEMENTATION"] = "extension"
+    environment["TRAINING_BENCHMARK"] = "1"
+    environment["NSYS_PROFILE"] = "1"
+    environment["RESUME_CHECKPOINT"] = "/stale/checkpoint.pt"
+    environment["STOP_AFTER_COMPLETED_UPDATES"] = "2"
+    environment["CHECKPOINT_DIR"] = "/stale/checkpoints"
 
     subprocess.run(
-        ["bash", str(launcher), "configs/dense_baseline.toml"],
+        ["bash", str(launcher), "--steps", "17", "configs/dense_baseline.toml"],
         cwd=outside_repository,
         env=environment,
         check=True,
     )
 
     captured = capture.read_text().splitlines()
-    assert captured[:3] == [str(repository_root), expected_data_root, "17"]
-    assert captured[3:] == [
+    assert captured[:11] == [
+        str(repository_root), str(repository_root), "17", "torch",
+        "", "", "", "", "", "", "vista",
+    ]
+    assert captured[11:] == [
         "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
         "--module", "modded_nanogpt_moe.train", "--config",
-        "configs/dense_baseline.toml",
+        str(repository_root / "configs/dense_baseline.toml"),
     ]
 
 
-def test_vista_benchmark_launcher_reuses_training_launcher_without_artifacts(
+def test_vista_launcher_submits_itself_as_nonrecursive_worker(tmp_path):
+    repository_root = Path(__file__).resolve().parents[1]
+    launcher = repository_root / "scripts/vista/train.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    sbatch = fake_bin / "sbatch"
+    sbatch.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$@\" > \"$SUBMIT_CAPTURE\"\n"
+    )
+    sbatch.chmod(0o755)
+    capture = tmp_path / "submit.txt"
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    environment["SUBMIT_CAPTURE"] = str(capture)
+
+    subprocess.run(
+        [
+            "bash", str(launcher), "--submit", "--time", "08:00:00",
+            "configs/dense_baseline.toml", "configs/moe_grouped.toml",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+    )
+
+    assert capture.read_text().splitlines() == [
+        "--time=08:00:00",
+        str(launcher),
+        "--worker",
+        "--",
+        str(repository_root / "configs/dense_baseline.toml"),
+        str(repository_root / "configs/moe_grouped.toml"),
+    ]
+
+
+def test_vista_launcher_runs_configs_in_order_with_explicit_checkpoints(
+        tmp_path):
+    repository_root = Path(__file__).resolve().parents[1]
+    launcher = repository_root / "scripts/vista/train.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    module = fake_bin / "module"
+    module.write_text("#!/usr/bin/env bash\nexit 0\n")
+    module.chmod(0o755)
+    uv = fake_bin / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s|%s|%s|%s\\n' \"${CHECKPOINT_DIR-}\" "
+        "\"${CHECKPOINT_INTERVAL-}\" \"${RESUME_CHECKPOINT-}\" \"$*\" "
+        ">> \"$LAUNCH_CAPTURE\"\n"
+    )
+    uv.chmod(0o755)
+    capture = tmp_path / "launches.txt"
+    resume = tmp_path / "latest.pt"
+    resume.touch()
+    stockyard = tmp_path / "stockyard"
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    environment["LAUNCH_CAPTURE"] = str(capture)
+    environment["STOCKYARD"] = str(stockyard)
+
+    subprocess.run(
+        [
+            "bash", str(launcher), "--checkpoint-interval", "7",
+            "--resume", str(resume), "configs/dense_baseline.toml",
+            "configs/moe_grouped.toml",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+    )
+
+    command_prefix = (
+        "run --no-sync torchrun --standalone --nproc_per_node=1 "
+        "--module modded_nanogpt_moe.train --config "
+    )
+    assert capture.read_text().splitlines() == [
+        f"{stockyard}/checkpoints/modded-nanogpt-moe/dense-baseline|7|"
+        f"{resume}|{command_prefix}"
+        f"{repository_root / 'configs/dense_baseline.toml'}",
+        f"{stockyard}/checkpoints/modded-nanogpt-moe/moe-e8-k2-ratio2|7||"
+        f"{command_prefix}{repository_root / 'configs/moe_grouped.toml'}",
+    ]
+
+
+def test_vista_benchmark_launcher_uses_trainer_without_artifacts(
         tmp_path):
     repository_root = Path(__file__).resolve().parents[1]
     launcher = repository_root / "scripts/vista/benchmark.sh"
@@ -434,6 +527,7 @@ def test_vista_benchmark_launcher_reuses_training_launcher_without_artifacts(
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
     environment["LAUNCH_CAPTURE"] = str(capture)
+    environment["STOCKYARD"] = str(tmp_path / "stockyard")
     environment["TB_ROOT"] = "/must/not/be/used"
     environment["BENCHMARK_WARMUP_UPDATES"] = "2"
     environment["BENCHMARK_MEASURED_UPDATES"] = "3"

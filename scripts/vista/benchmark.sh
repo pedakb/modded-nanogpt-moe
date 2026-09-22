@@ -39,8 +39,5 @@ if [[ -n "${NSYS_PROFILE:-}" && "${NSYS_PROFILE}" != 0 ]]; then
     exit 2
 fi
 
-export TRAINING_BENCHMARK=1
-export TB_ROOT=
-
 cd "$repo_root"
-exec "$repo_root/scripts/vista/train.sh" "$config_path"
+exec "$repo_root/scripts/vista/train.sh" --benchmark-worker "$config_path"

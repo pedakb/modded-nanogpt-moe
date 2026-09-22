@@ -94,8 +94,8 @@ environment overrides take precedence over TOML values; keep them compatible.
   `data/fineweb10B/fineweb_val_*.bin`. `DATA_ROOT` is the base prepended to
   those patterns, not the physical dataset directory itself.
 - In the trainer, an empty/unset `TB_ROOT` disables TensorBoard and `TB_SYSTEM`
-  labels the system. The cluster launchers provide a Stockyard default when
-  `TB_ROOT` is unset; pass `TB_ROOT=` explicitly to disable it through them.
+  labels the system. Vista `env.sh` sets the shared Stockyard root; its
+  step-limited and benchmark launch paths scope `TB_ROOT=` to the trainer.
 - `CHECKPOINT_DIR`, `CHECKPOINT_INTERVAL`, `RESUME_CHECKPOINT`, and
   `STOP_AFTER_COMPLETED_UPDATES` control opt-in checkpoint workflows.
 - `REPRO_DIAGNOSTICS_DIR` enables exact-state snapshots.
@@ -140,10 +140,19 @@ Cluster launchers load the established modules and set reusable defaults:
 
 ```bash
 scripts/ls6/train.sh configs/moe_grouped.toml
-scripts/vista/train.sh configs/moe_grouped.toml
+source scripts/vista/env.sh
+scripts/vista/train.sh --steps 30 configs/moe_e64k8_r0.5.toml
+scripts/vista/train.sh configs/moe_e64k8_r0.5.toml
 ```
 
-Vista training-pipeline benchmarks reuse the same launcher and update loop,
+Vista `env.sh` establishes machine state only. Do not globally export
+`MOE_GMM_IMPLEMENTATION=torch`; `train.sh` scopes it to the GH200 trainer
+process and clears stale experiment/profile/checkpoint state. It defaults to
+`configs/moe_e64k8_r0.5.toml`; multiple configs run sequentially. The `--steps`
+validation path is current-node only and disables TensorBoard so it cannot
+claim the production run directory.
+
+Vista training-pipeline benchmarks reuse the same trainer and update loop,
 defaulting to 10 warmup plus 30 measured optimizer updates. They disable
 TensorBoard and reject experiment/checkpoint/profiling overrides:
 
@@ -154,17 +163,20 @@ scripts/vista/benchmark.sh configs/moe_grouped.toml
 Use `BENCHMARK_WARMUP_UPDATES` and `BENCHMARK_MEASURED_UPDATES` only when a
 different benchmark window is intentionally required.
 
-Submit a single-node Vista batch run from a login node with:
+Submit one or more Vista configs from a login node with:
 
 ```bash
-scripts/vista/submit.sh configs/moe_grouped.toml
+scripts/vista/train.sh --submit configs/moe_e64k8_r0.5.toml
 ```
 
-The submission inherits the current environment and delegates execution to
-`scripts/vista/train.sh`, and writes combined stdout/stderr to
-`$STOCKYARD/logs/modded-nanogpt-moe/vista/slurm/%x-%j.log`. Set
-`SLURM_MAIL_USER` to request Slurm notifications for all job events; leave it
-unset to submit without email notifications.
+Use `scripts/vista/train.sh --submit CONFIG [CONFIG ...]`. The script submits
+itself in a non-recursive worker mode, validates all configs before starting,
+runs them sequentially in one allocation, clears inherited run controls, and
+writes one persistent combined log under
+`$STOCKYARD/logs/modded-nanogpt-moe/vista/slurm/`. It uses the established
+six-hour default; `--submit --time SLURM_TIME` overrides it. Short validation
+runs belong on an existing interactive allocation. Explicit checkpoint and
+first-config resume options are documented in `README.md`.
 
 - LS6: A100, `gcc/11.2.0`, CUDA 12.8; the validated grouped-GEMM build used
   `nv-grouped-gemm==1.1.4.post8` and device capability 80.

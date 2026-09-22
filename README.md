@@ -62,33 +62,92 @@ uv run --no-sync torchrun \
   --config configs/moe_grouped.toml
 ```
 
-Cluster launchers accept a config path and default to the dense baseline:
+Vista machine setup is reusable without selecting any experiment state:
 
 ```bash
-scripts/ls6/train.sh configs/moe_grouped.toml
+source scripts/vista/env.sh
+uv run --no-sync python -m pytest -q
+```
+
+Do **not** globally export `MOE_GMM_IMPLEMENTATION=torch`; it is specific to
+GH200 training and breaks CPU unit tests. The Vista training launchers scope it
+only to the trainer process.
+
+The Vista launcher is the single entry point for both current-node runs and
+Slurm submissions. It defaults to the production E64/K8 config when no path is
+supplied. Short runs stay on an already allocated node:
+
+```bash
+scripts/vista/train.sh --steps 30 configs/moe_e64k8_r0.5.toml
+scripts/vista/train.sh --steps 100 configs/moe_e64k8_r0.5.toml
+scripts/vista/train.sh configs/moe_e64k8_r0.5.toml
 scripts/vista/train.sh configs/moe_grouped.toml
 ```
 
-Each launcher supplies reusable machine defaults:
+It resolves the repository root from its location, uses that root as
+`DATA_ROOT`, clears inherited run state, and runs one GPU. `--steps` requires
+one config, cannot be combined with `--submit` or checkpoint controls, and
+disables TensorBoard so a smoke run cannot claim a production run directory.
+It does not modify the TOML or parent shell.
 
-```text
-Vista DATA_ROOT=<repository root>
-LS6   DATA_ROOT=$SCRATCH/modded-nanogpt-moe (when SCRATCH is available)
-TB_ROOT=$STOCKYARD/tensorboard
-TB_SYSTEM=ls6 or vista
+Submit one config by adding `--submit`:
+
+```bash
+scripts/vista/train.sh --submit configs/moe_e64k8_r0.5.toml
 ```
 
-The Vista launcher derives the repository root from its own location, so it
-works from any current directory. An already-set value takes precedence. Set
-`TB_ROOT=` explicitly to disable TensorBoard for an individual run. The trainer
-prints the resolved runtime paths, matched data shards, Git/environment
-metadata, and output destinations at startup; checkpoints retain that
-information as non-compatibility metadata.
+Multiple configs run sequentially in the supplied order inside one allocation:
 
-Existing operational environment controls remain available, including
-`DATA_ROOT`, `TB_ROOT`, `TB_SYSTEM`, checkpoint/resume variables, Nsight
-profiling variables, and the historical smoke-test overrides. Environment
-overrides take precedence over TOML values.
+```bash
+scripts/vista/train.sh --submit \
+  configs/dense_baseline.toml \
+  configs/moe_grouped.toml \
+  configs/moe_e64k8_r0.5.toml
+```
+
+`train.sh --submit` submits the same script in a non-recursive worker mode. It
+preserves the established `gh`, one-node, one-task, six-hour default. Override
+only the Slurm time request with, for example,
+`scripts/vista/train.sh --submit --time 08:00:00 CONFIG`. All config paths and
+TOML run names are validated before submission and again before execution.
+Configs run as separate processes in the supplied order, stopping at the first
+failure. Duplicate run names in one suite are rejected. One combined suite log
+is kept at
+`$STOCKYARD/logs/modded-nanogpt-moe/vista/slurm/train-configs-JOBID.log`.
+
+Checkpointing remains an explicit command-line opt-in. There is no canonical
+nonzero checkpoint cadence; choose one for a long run. The following enables a
+separate checkpoint directory for each config under
+`$STOCKYARD/checkpoints/modded-nanogpt-moe/RUN_NAME` (250 is only an example):
+
+```bash
+scripts/vista/train.sh --submit \
+  --checkpoint-interval 250 \
+  configs/moe_e64k8_r0.5.toml
+```
+
+After a failure, resubmit only the unfinished configs. To resume the first one,
+pass its checkpoint explicitly; `--resume` never applies to later configs:
+
+```bash
+checkpoint_dir="$STOCKYARD/checkpoints/modded-nanogpt-moe/moe-e8-k2-ratio2"
+scripts/vista/train.sh --submit \
+  --checkpoint-interval 250 \
+  --resume "$checkpoint_dir/latest.pt" \
+  configs/moe_grouped.toml \
+  configs/moe_e64k8_r0.5.toml
+```
+
+`latest.pt` and `previous.pt` rotate atomically. Resume restores the saved run
+identity, model, both optimizers, loader cursor, RNG, and timing. Runs without
+explicit checkpoint options start fresh and do not inherit stale checkpoint or
+resume variables from the parent shell.
+
+The LS6 launcher remains available as before:
+
+```bash
+scripts/ls6/train.sh configs/moe_grouped.toml
+```
 
 TensorBoard events are written under:
 
