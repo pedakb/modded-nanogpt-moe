@@ -1,4 +1,4 @@
-"""Grad-EM value oracle and Stage-2A CPU-only autograd combine boundary.
+"""Grad-EM oracle and combine boundary; CUDA enablement awaits GPU validation.
 
 Only selected expert outputs are supplied. All arithmetic/results are FP32,
 detached, including products before the dot-product reduction. No activation-
@@ -16,21 +16,28 @@ from .config import validate_grad_em_eta
 def require_grad_em_cpu(device):
     if device.type != "cpu":
         raise NotImplementedError(
-            "Grad-EM Stage 2A is CPU-only; the optimized CUDA combine kernel "
-            "is not yet implemented (Stage 2B)")
+            "Grad-EM remains CPU-only publicly; the CUDA combine kernel "
+            "awaits Stage 2B GPU correctness validation")
 
 
 class GradEMCombine(torch.autograd.Function):
-    """CPU correctness boundary; leave the existing expert graph intact.
+    """Leave the expert graph intact. CUDA branch is gated pending validation.
 
     order maps expert-sorted rows to flattened token/slot assignments. Only
-    backward materializes [T,K,D]. No [T,E,D] tensor is ever needed.
+    CPU backward materializes [T,K,D]; CUDA uses only compact routing scratch.
     """
 
     @staticmethod
     def forward(ctx, out_sorted, router_logits, topk_weights, topk_experts, order, eta):
         require_grad_em_cpu(out_sorted.device)
         validate_grad_em_eta(eta)
+        ctx.is_cuda = out_sorted.is_cuda
+        if ctx.is_cuda:
+            from ._grad_em_cuda import cuda_forward
+            output, rows = cuda_forward(out_sorted, router_logits, topk_weights, topk_experts, order)
+            ctx.save_for_backward(out_sorted, router_logits, topk_experts, rows)
+            ctx.eta = eta
+            return output
         # Lazy import avoids a model/reference import cycle. Reuse the exact
         # existing forward, including activation-dtype mixing/rounding.
         from .model import combine_expert_outputs
@@ -42,6 +49,11 @@ class GradEMCombine(torch.autograd.Function):
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad_output):
         out_sorted, logits, indices, order = ctx.saved_tensors
+        if ctx.is_cuda:
+            from ._grad_em_cuda import cuda_backward
+            gx, gz, _, _ = cuda_backward(out_sorted, logits, indices, order, grad_output,
+                                         ctx.eta, *ctx.needs_input_grad[:2])
+            return gx, gz, None, None, None, None
         selected = torch.empty_like(out_sorted)
         selected[order] = out_sorted
         selected = selected.view(*indices.shape, out_sorted.shape[-1])

@@ -4,39 +4,42 @@ Updated: 2026-09-22
 
 ## Current goal and state
 
-Current base on `cleanup-active-codebase`: `7462a4e` (Grad-EM reference), initially
-clean. Uncommitted task: **Grad-EM Stage 2A**, CPU-only custom combine autograd
-integration. No GPU kernel/GEMM/optimizer changes, installation, training,
-benchmark, submission, commit or push.
+Current base on `cleanup-active-codebase`: `5577a69` (Grad-EM Stage 2A), initially
+clean. Uncommitted task: **Stage 2B CUDA candidate**, still gated pending GPU
+correctness. No installation, remote training, benchmark, submission, commit
+or push performed. Mac has no CUDA; do not call Stage 2B validated/enabled.
 
-## Grad-EM Stage 2A (current work)
+## Grad-EM Stage 2B candidate (current work)
 
 - `grad_em.py::grad_em_reference` computes detached FP32 v, q, q_tilde,
   selected expert gradients q*g, and router gradients q_tilde-p. The sign is
   frozen. Uses selected logits directly, never log(top-k weights). g=0 still
   generally gives nonzero router gradients; eta=0 is not ordinary backward.
-- `GradEMCombine` wraps only the grouped-MoE combine call. Forward delegates to
-  the existing helper. Saves out_sorted, original router logits, selected expert
-  indices and order, plus scalar eta. Backward unsorts to [T,K,D], calls the
-  unchanged oracle, returns q*g in sorted order and q_tilde-p directly to logits,
-  cast to original dtypes. Returns None for mixing weights (no duplicate router
-  gradient). Router linear and expert graph both remain connected to input x.
-- Mode/eta now pass through GPT/Block/MoE constructors. Defaults, parameter keys,
-  checkpoint metadata and compilation unchanged. Standard mode adds no tensor
-  operations or custom autograd node. Grad-EM rejects loop backend and non-CPU
-  tensors; CUDA trainer rejects before setup. CPU GEMM integration tests use a
-  test double, not a new production GEMM implementation. [T,K,D] temporaries are
-  deliberately not allowed on GPU; higher-order backward is unsupported.
-- Tests: reference/integration **69 passed**. Requested reference/package selection:
-  **49 passed, 6 failed** (existing Bash3.2 launcher limitation). Existing MoE,
-  packed-expert and checkpoint suites: **57 passed, 12 CUDA skips**.
-  `git diff --check` passed. No CUDA tests executed on this CPU-only Mac.
-- Dirty files: grad_em.py, model.py, train.py, tests/test_grad_em.py,
-  new tests/test_grad_em_integration.py, README.md, docs/grad_em.md, HANDOFF.md.
-- Next (separate Stage 2B): efficient sorted-layout GPU backward without the
-  [T,K,D] temporary; preserve fused forward and compare outputs/gradients/casts
-  against this oracle. CUDA correctness/memory/performance remain unverified.
-  No active Grad-EM run or checkpoint exists.
+- New lazy `_grad_em_cuda.py`: imports unchanged standard forward kernels,
+  retains their inverse permutation once. Token-centric expert-backward kernel
+  computes FP32 v/q once, writes q*g directly to sorted gradient rows and emits
+  only compact [T,K] q. Second token kernel builds q_tilde-p in registers and
+  writes logits gradients. No atomics, gathered activation/gradient copies,
+  GEMM changes or q_tilde buffer. Optional compact v output is test-only.
+- CUDA Function branch saves out_sorted, logits, selected IDs and inverse rows,
+  plus eta. No mixing-weight gradient; CPU branch/oracle remain intact. Public
+  `require_grad_em_cpu` guards in model/Function/trainer are retained: tests
+  monkeypatch the guard locally to validate CUDA, no runtime escape hatch.
+  Explicit candidate bounds: K<=32,D<=4096,E<=1024,rounded K*D<=32768; first-order
+  only. Standard kernels, model, optimizers and checkpoint format unchanged.
+- Combined requested regression + new CUDA file: **163 passed, 118 skipped,
+  6 failed** (all six existing Bash3.2 launcher errors). Includes CPU launch/
+  allocation checks but does NOT compile Triton or prove GPU correctness.
+  56 new CUDA cases skipped. `git diff --check` passed.
+- Dirty files: grad_em.py, new _grad_em_cuda.py, new tests/test_grad_em_cuda.py,
+  README.md, docs/grad_em.md, HANDOFF.md.
+- Next: on an existing Vista allocation run the exact CUDA acceptance and
+  regression commands in docs/grad_em.md (native grouped GEMM for full graph
+  tests). Investigate discrepancies, do not loosen tolerances. After passing
+  without relevant skips, review a guard-enablement patch and its tests; only
+  then run 2-step/5-step smokes and matched 10+30 standard/Grad-EM benchmarks.
+  Document mean/median, tokens/s, peak allocated/reserved and overhead. All GPU
+  results currently pending; no active Grad-EM run or checkpoint exists.
 
 Checkpoint cadence remains **250 completed updates** for all three production
 configs; the stale checkpoint100 expectations were fixed in the base commit.
