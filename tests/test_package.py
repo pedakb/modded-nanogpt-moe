@@ -312,6 +312,12 @@ def test_dense_example_config_resolves_current_training_defaults():
     assert config["num_trials"] == 1
     assert config["seed"] == 1234
     assert config["checkpoint"] == {"interval": 100}
+    assert config["evaluation"] == {
+        "tokens": 10485760,
+        "interval": 125,
+        "final_fraction": 0.10,
+        "final_interval": 25,
+    }
     assert config["model"] == {
         "vocab_size": 50304,
         "num_layers": 12,
@@ -644,7 +650,7 @@ def test_production_configs_share_training_policy(filename, run_name, ratio, exp
     config = load_experiment_config(path)
     raw = tomllib.loads(path.read_text())
     assert list(raw) == ["run_name", "num_trials", "seed", "model", "training",
-                         "optimizers", "diagnostics", "checkpoint"]
+                         "evaluation", "optimizers", "diagnostics", "checkpoint"]
     assert list(raw["optimizers"]) == ["adamw", "muon"]
     assert config["run_name"] == run_name
     assert config["num_trials"] == 1
@@ -653,10 +659,13 @@ def test_production_configs_share_training_policy(filename, run_name, ratio, exp
     assert config["diagnostics"] == dict(scalar_interval=25, histogram_interval=0, during_nsys=False)
     assert config["training"] == {
         "sequence_length": 1024, "global_batch_tokens": 524288,
-        "microbatch_sequences": 64, "validation_tokens": 10485760,
-        "total_steps": 3250, "cooldown_fraction": 0.7,
+        "microbatch_sequences": 64, "total_steps": 3250, "cooldown_fraction": 0.7,
         "training_shard_pattern": "data/fineweb10B/fineweb_train_*.bin",
         "validation_shard_pattern": "data/fineweb10B/fineweb_val_*.bin",
+    }
+    assert config["evaluation"] == {
+        "tokens": 10485760, "interval": 125,
+        "final_fraction": 0.10, "final_interval": 25,
     }
     assert config["optimizers"] == {
         "adamw": dict(group_lrs=[0.7, 0.004, 0.015], betas=[0.8, 0.95],

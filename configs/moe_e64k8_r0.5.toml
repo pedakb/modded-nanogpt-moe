@@ -18,11 +18,16 @@ moe_parameter_layout = "packed"
 sequence_length = 1024
 global_batch_tokens = 524288
 microbatch_sequences = 64
-validation_tokens = 10485760
 total_steps = 3250
 cooldown_fraction = 0.7
 training_shard_pattern = "data/fineweb10B/fineweb_train_*.bin"
 validation_shard_pattern = "data/fineweb10B/fineweb_val_*.bin"
+
+[evaluation]
+tokens = 10485760
+interval = 125
+final_fraction = 0.10
+final_interval = 25
 
 [optimizers.adamw]
 group_lrs = [0.7, 0.004, 0.015]

@@ -96,6 +96,10 @@ environment overrides take precedence over TOML values; keep them compatible.
 - In the trainer, an empty/unset `TB_ROOT` disables TensorBoard and `TB_SYSTEM`
   labels the system. Vista `env.sh` sets the shared Stockyard root; its
   step-limited and benchmark launch paths scope `TB_ROOT=` to the trainer.
+- `[evaluation]` owns validation token count and regular/final-phase cadence.
+  It is independent of `[diagnostics].scalar_interval`, which controls sampled
+  training diagnostics only. Evaluation always includes step 0 and the final
+  completed update.
 - `[checkpoint].interval` is the portable checkpoint policy; omission disables
   it, 0 saves only at completion, and a positive value adds periodic saves.
   Vista derives the directory from its Stockyard root and TOML `run_name`.

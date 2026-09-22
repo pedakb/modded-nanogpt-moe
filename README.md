@@ -55,7 +55,9 @@ uv run --no-sync torchrun \
 The production comparison uses dense ratio 4, E8/K2 ratio 2, and E64/K8 ratio
 0.5. Both MoE configs use grouped GEMM with packed experts. All three share
 D=768, 12 layers, 3250 updates, seed 1234, a 524288-token global batch,
-microbatch 64, diagnostics every 25 updates, and checkpoints every 100 updates.
+microbatch 64, 10485760 validation tokens per evaluation, diagnostics every 25
+updates, and checkpoints every 100 updates. Evaluation runs every 125 updates,
+switching to every 25 updates for the final 10%.
 
 The E8/K2 configuration is:
 
@@ -176,6 +178,11 @@ TensorBoard events are written under:
 ```
 
 A fresh run refuses to reuse an existing TensorBoard run directory.
+
+Validation policy is independent of training diagnostics. `[evaluation]`
+controls validation tokens and the regular/final-phase cadence; validation is
+always run at step 0 and the final step. `[diagnostics].scalar_interval` controls
+only sampled training diagnostics. Validation loss remains `metric/loss/val`.
 
 TensorBoard training diagnostics default in code to every 10 optimizer updates;
 all three production configs explicitly use 25, with histograms off.

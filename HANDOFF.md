@@ -5,9 +5,9 @@ Updated: 2026-09-22
 ## Current goal and state
 
 Current base on `cleanup-active-codebase`: `f24cc5a` (`Add config-driven
-checkpoint policy`), initially clean. Current uncommitted task: standardize the
-three production configs and rename the E8 config. No training, benchmark,
-submission, dependency installation, commit or push performed.
+checkpoint policy`). Current uncommitted task moves validation tokens and
+cadence into `[evaluation]`. No training, benchmark, submission, dependency
+installation, commit or push performed.
 
 ## Production config standardization (current work)
 
@@ -16,21 +16,25 @@ submission, dependency installation, commit or push performed.
   `configs/moe_e8k2_r2.toml`, run name `moe-e8k2-r2`; repository references
   updated. Dense omits MoE-only fields and resolves their existing defaults.
 - Shared D=768/L=12/vocab=50304, microbatch=64, global batch=524288, sequence=1024,
-  validation=10485760, horizon=3250, cooldown=0.7, seed=1234, one trial, identical
-  optimizers/data patterns, diagnostics=25 (no histograms/Nsight), checkpoint=100
-  plus final save. No schema, launcher, optimizer or training implementation edits.
+  horizon=3250, cooldown=0.7, seed=1234, one trial, identical optimizers/data
+  patterns, diagnostics=25 (no histograms/Nsight), and checkpoint=100 plus final
+  save. `[evaluation]` now owns 10485760 validation tokens and cadence 125,
+  switching to 25 for the final 10%; step 0 and the final step are always due.
+  This schedule is independent of diagnostics cadence.
 - The earlier E64 horizon of 3500 intentionally matched an older checkpoint-confirmed
   E8 reference. This new suite explicitly supersedes that comparison with 3250;
   E64 checkpoint cadence changes from 250 to 100. Preserve original configs for older
   resumes: ModuleList E8 and 3500-step checkpoints are not compatible with these
   production settings. Existing TensorBoard run directories are not migrated.
-- `git mv` records the E8 rename in the index; subsequent edits are unstaged.
-  Tests cover exact shared settings, section order, dense field omission, and
-  MoE geometry-only differences. Requested package tests: 18 passed, 4 failed
-  because local `/bin/bash` is 3.2 and the existing Vista launcher requires
-  associative arrays (`declare -A`, Bash 4+). No launcher/shell changes made.
-  Packed-expert tests: 19 passed, 10 CUDA-dependent tests skipped.
-  `git diff --check` passed; no stale old E8 filename/run-name references remain.
+- Evaluation-focused tests cover parsing, validation, the exact 3250-update
+  schedule, transition/final boundaries, restored-step behavior, rejection of
+  the retired training field, and independence from diagnostics cadence: **14
+  passed**.
+  Requested package tests pass (22); packed-expert tests pass (29) with the
+  documented Vista `CC=/usr/bin/gcc CXX=/usr/bin/g++` environment. The initial
+  packed test invocation inherited `nvc++` and failed three Inductor CPU
+  compilations before passing cleanly with GCC/G++.
+  `git diff --check` passes.
 
 Next: review the config diff and use the README three-config `--submit` command
 on Vista only when ready. Check for existing run-name directories first.

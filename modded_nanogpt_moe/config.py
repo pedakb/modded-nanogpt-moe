@@ -20,6 +20,12 @@ DEFAULT_CONFIG = {
         "histogram_interval": 0,
         "during_nsys": False,
     },
+    "evaluation": {
+        "tokens": 10485760,
+        "interval": 125,
+        "final_fraction": 0.10,
+        "final_interval": 25,
+    },
     "model": {
         "vocab_size": 50304,
         "num_layers": 12,
@@ -36,7 +42,6 @@ DEFAULT_CONFIG = {
         "sequence_length": 1024,
         "global_batch_tokens": 524288,
         "microbatch_sequences": 64,
-        "validation_tokens": 10485760,
         "total_steps": 3250,
         "cooldown_fraction": 0.7,
         "training_shard_pattern": "data/fineweb10B/fineweb_train_*.bin",
@@ -103,6 +108,15 @@ def validate_experiment_config(config, require_run_name=False):
             not diagnostics["scalar_interval"]
             or diagnostics["histogram_interval"] % diagnostics["scalar_interval"]):
         raise ValueError("diagnostics.histogram_interval must be a multiple of scalar_interval")
+    evaluation = config["evaluation"]
+    for key in ("tokens", "interval", "final_interval"):
+        _positive_int(config, "evaluation", key)
+    final_fraction = evaluation["final_fraction"]
+    if (isinstance(final_fraction, bool)
+            or not isinstance(final_fraction, (int, float))
+            or not math.isfinite(final_fraction)
+            or not 0 <= final_fraction <= 1):
+        raise ValueError("evaluation.final_fraction must be in [0, 1]")
     run_name = config["run_name"]
     if require_run_name and not run_name:
         raise ValueError("run_name is required in an experiment config")
@@ -124,7 +138,7 @@ def validate_experiment_config(config, require_run_name=False):
         _positive_int(config, "model", key)
     for key in (
         "sequence_length", "global_batch_tokens", "microbatch_sequences",
-        "validation_tokens", "total_steps",
+        "total_steps",
     ):
         _positive_int(config, "training", key)
     if config["model"]["mlp_type"] not in ("dense", "moe"):

@@ -80,6 +80,19 @@ def tensorboard_run_directory(root, system, run_name):
     return Path(root) / "modded-nanogpt-moe" / system / str(run_name)
 
 
+def should_evaluate(step, total_steps, evaluation_config):
+    """Return whether a completed-update step is on the evaluation schedule."""
+    if not 0 <= step <= total_steps:
+        raise ValueError("evaluation step must be within the training horizon")
+    if step == 0 or step == total_steps:
+        return True
+    regular_phase = step / total_steps < 1 - evaluation_config["final_fraction"]
+    interval = (
+        evaluation_config["interval"]
+        if regular_phase else evaluation_config["final_interval"])
+    return step % interval == 0
+
+
 def learning_rate_tag(optimizer, group_index):
     name = type(optimizer).__name__.lower()
     suffix = "" if name == "muon" and len(optimizer.param_groups) == 1 else f"/g{group_index}"
@@ -273,8 +286,9 @@ def main(argv=None):
     
     model_config = experiment_config["model"]
     training_config = experiment_config["training"]
+    evaluation_config = experiment_config["evaluation"]
     optimizer_config = experiment_config["optimizers"]
-    val_tokens = training_config["validation_tokens"]
+    val_tokens = evaluation_config["tokens"]
     batch_size = training_config["global_batch_tokens"]
     sequence_length = training_config["sequence_length"]
     training_shard_pattern = training_config["training_shard_pattern"]
@@ -531,12 +545,12 @@ def main(argv=None):
                 "global_batch_tokens": batch_size,
                 "microbatch_sequences": mbs,
                 "accumulation_count": accumulation_count,
-                "validation_tokens": val_tokens,
                 "total_steps": train_steps,
                 "cooldown_fraction": training_config["cooldown_fraction"],
                 "training_shard_pattern": training_shard_pattern,
                 "validation_shard_pattern": validation_shard_pattern,
             },
+            "evaluation": evaluation_config,
             "optimizers": optimizer_config,
             "datasets": {
                 "validation_shards": (
@@ -664,9 +678,8 @@ def main(argv=None):
         for step in range(completed_updates, final_loop_step + 1):
     
             # --------------- VALIDATION SECTION -----------------
-            val_step_freq = 125 if step / train_steps < 0.9 else 25
             if (not benchmark["enabled"]
-                    and (step == train_steps or step % val_step_freq == 0)):
+                    and should_evaluate(step, train_steps, evaluation_config)):
                 # stop the clock
                 dist.barrier()
                 time_since_last_val = time.perf_counter() - t0
