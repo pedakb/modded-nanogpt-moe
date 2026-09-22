@@ -122,6 +122,15 @@ failure. Duplicate run names in one suite are rejected. One combined suite log
 is kept at
 `$STOCKYARD/logs/modded-nanogpt-moe/vista/slurm/train-configs-JOBID.log`.
 
+For optional Slurm email notifications, set `SLURM_MAIL_USER` for submission:
+
+```bash
+SLURM_MAIL_USER="you@example.com" scripts/vista/train.sh --submit configs/moe_e8k2_r2.toml
+```
+
+A nonempty value adds `--mail-user` and `--mail-type=ALL`; unset/empty adds no
+email options. Notifications apply to the whole job, not each config in a suite.
+
 Checkpoint cadence normally comes from the experiment TOML:
 
 ```toml

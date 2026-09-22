@@ -205,6 +205,9 @@ if [[ "$submit" -eq 1 ]]; then
     if [[ "$walltime_set" -eq 1 ]]; then
         submission+=("--time=$walltime")
     fi
+    if [[ -n "${SLURM_MAIL_USER:-}" ]]; then
+        submission+=("--mail-user=$SLURM_MAIL_USER" --mail-type=ALL)
+    fi
     submission+=("$script_path" --worker)
     if [[ -n "$checkpoint_interval" ]]; then
         submission+=(--checkpoint-interval "$checkpoint_interval")

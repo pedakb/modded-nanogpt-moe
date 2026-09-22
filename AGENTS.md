@@ -187,6 +187,10 @@ runs belong on an existing interactive allocation. Checkpoint cadence normally
 comes from each TOML; the optional override and first-config resume controls are
 documented in `README.md`.
 
+Set `SLURM_MAIL_USER` to a nonempty email address before `--submit` to request
+`--mail-user` and `--mail-type=ALL`. Unset/empty adds no email options.
+Notifications cover the Slurm job, not individual configs within the suite.
+
 - LS6: A100, `gcc/11.2.0`, CUDA 12.8; the validated grouped-GEMM build used
   `nv-grouped-gemm==1.1.4.post8` and device capability 80.
 - Vista: GH200, `nvidia/25.3`, CUDA 12.9, `CC=/usr/bin/gcc`,

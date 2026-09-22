@@ -428,7 +428,8 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path):
     ]
 
 
-def test_vista_launcher_submits_itself_as_nonrecursive_worker(tmp_path):
+@pytest.mark.parametrize("mail_user", [None, "", "researcher@example.com"])
+def test_vista_launcher_submits_itself_as_nonrecursive_worker(tmp_path, mail_user):
     repository_root = Path(__file__).resolve().parents[1]
     launcher = repository_root / "scripts/vista/train.sh"
     fake_bin = tmp_path / "bin"
@@ -443,6 +444,9 @@ def test_vista_launcher_submits_itself_as_nonrecursive_worker(tmp_path):
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
     environment["SUBMIT_CAPTURE"] = str(capture)
+    environment.pop("SLURM_MAIL_USER", None)
+    if mail_user is not None:
+        environment["SLURM_MAIL_USER"] = mail_user
 
     subprocess.run(
         [
@@ -456,11 +460,44 @@ def test_vista_launcher_submits_itself_as_nonrecursive_worker(tmp_path):
 
     assert capture.read_text().splitlines() == [
         "--time=08:00:00",
+        *([f"--mail-user={mail_user}", "--mail-type=ALL"] if mail_user else []),
         str(launcher),
         "--worker",
         "--",
         str(repository_root / "configs/dense_baseline.toml"),
         str(repository_root / "configs/moe_e8k2_r2.toml"),
+    ]
+
+
+@pytest.mark.parametrize("mail_user", [None, "", "researcher@example.com"])
+def test_vista_submission_email_options_without_cluster_setup(tmp_path, mail_user):
+    # Exercise the actual submission block independently of the launcher's
+    # Bash-4-only config preflight, so this test also runs on macOS Bash 3.2.
+    launcher = Path(__file__).resolve().parents[1] / "scripts/vista/train.sh"
+    source = launcher.read_text()
+    start = source.index('if [[ "$submit" -eq 1 ]]; then\n')
+    end = source.index('if [[ "$worker" -eq 1 &&', start)
+    sbatch = tmp_path / "sbatch"
+    sbatch.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$SUBMIT_CAPTURE"\nexit 23\n')
+    sbatch.chmod(0o755)
+    capture = tmp_path / "args.txt"
+    environment = os.environ.copy()
+    environment.update(PATH=f"{tmp_path}{os.pathsep}{environment['PATH']}",
+                       SUBMIT_CAPTURE=str(capture))
+    environment.pop("SLURM_MAIL_USER", None)
+    if mail_user is not None:
+        environment["SLURM_MAIL_USER"] = mail_user
+    setup = ('set -euo pipefail\nsubmit=1\nwalltime_set=0\n'
+             'script_path="/repo with spaces/scripts/vista/train.sh"\n'
+             'checkpoint_interval=""\nresume_checkpoint=""\n'
+             'config_paths=("/repo with spaces/config.toml")\n')
+    result = subprocess.run(["bash", "-c", setup + source[start:end]],
+                            env=environment, capture_output=True, text=True)
+    assert result.returncode == 23  # sbatch status is preserved, no real submission.
+    assert capture.read_text().splitlines() == [
+        *([f"--mail-user={mail_user}", "--mail-type=ALL"] if mail_user else []),
+        "/repo with spaces/scripts/vista/train.sh", "--worker", "--",
+        "/repo with spaces/config.toml",
     ]
 
 
