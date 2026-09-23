@@ -300,6 +300,9 @@ class MoE(nn.Module):
         self.moe_backend = moe_backend
         self.moe_parameter_layout = moe_parameter_layout
         self._routing_diagnostics = None  # Transient observer, never checkpointed.
+        # Offline-only observer. Normal training leaves this unset, so no
+        # diagnostic tensors or graph references are created on its hot path.
+        self._grad_em_diagnostics = None
         self.router = Linear(dim, num_experts)
         if moe_parameter_layout == "modulelist":
             self.experts = nn.ModuleList(MLP(dim, hidden_dim) for _ in range(num_experts))
@@ -362,12 +365,24 @@ class MoE(nn.Module):
         topk_weights = topk_weights.type_as(x)
 
         out = x.new_zeros(x.shape)
+        selected_outputs = (
+            x.new_empty((x.shape[0], self.top_k, D))
+            if self._grad_em_diagnostics is not None else None)
         for expert_idx, expert in enumerate(self.experts):
             token_idx, slot_idx = torch.where(topk_experts == expert_idx)
             if token_idx.numel() == 0:
                 continue
-            out.index_add_(0, token_idx, expert(x[token_idx]) * topk_weights[token_idx, slot_idx, None])
-        return out.view(B, T, D)
+            expert_output = expert(x[token_idx])
+            if selected_outputs is not None:
+                selected_outputs[token_idx, slot_idx] = expert_output.detach()
+            out.index_add_(
+                0, token_idx,
+                expert_output * topk_weights[token_idx, slot_idx, None])
+        out = out.view(B, T, D)
+        if self._grad_em_diagnostics is not None:
+            self._grad_em_diagnostics(
+                router_logits, topk_experts, selected_outputs, None, out)
+        return out
 
     def _forward_grouped_gemm(self, x: Tensor):
         """route -> pack assignments by expert -> grouped FC1 -> bias ->
@@ -474,6 +489,9 @@ class MoE(nn.Module):
                 out = GradEMCombine.apply(out_sorted, router_logits, topk_weights,
                                           topk_experts, order, self.grad_em_eta)
             out = out.view(B, T, D)
+        if self._grad_em_diagnostics is not None:
+            self._grad_em_diagnostics(
+                router_logits, topk_experts, out_sorted, order, out)
         if _moe_nsys_capture_active:
             _register_moe_backward_ranges(out, out_sorted, h_act, h_pre, x_sorted)
         return out
