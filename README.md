@@ -99,8 +99,11 @@ scripts/vista/train.sh configs/moe_e8k2_r2.toml
 It resolves the repository root from its location, uses that root as
 `DATA_ROOT`, clears inherited run state, and runs one GPU. `--steps` requires
 one config, cannot be combined with `--submit` or checkpoint controls, and
-disables TensorBoard and TOML checkpoint policy so a smoke run cannot claim or
-overwrite production artifacts. It does not modify the TOML or parent shell.
+preserves the config's full training/evaluation/LR schedule while stopping after
+the requested number of completed updates. It disables TensorBoard and periodic
+TOML checkpoint policy, then saves the early-stop checkpoint under a unique
+`$STOCKYARD/checkpoints/modded-nanogpt-moe/interactive-smoke/` directory rather
+than the production run directory. It does not modify the TOML or parent shell.
 
 Submit one config by adding `--submit`:
 

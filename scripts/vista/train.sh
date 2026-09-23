@@ -24,7 +24,7 @@ Options:
   --job-name NAME          Set the Slurm job name (requires --submit)
   --account ACCOUNT        Set the Slurm allocation account (requires --submit)
   --sbatch-arg OPTION      Forward one --option[=value] to sbatch (repeatable)
-  --steps N                Run N updates interactively (one config only)
+  --steps N                Stop after N completed updates; preserve configured schedule
   --checkpoint-interval N  Save per-run checkpoints every N updates (0 = final only)
   --resume PATH            Resume the first config from PATH
   -h, --help               Show this help
@@ -269,6 +269,13 @@ fi
 
 source "$repo_root/scripts/vista/env.sh"
 
+smoke_checkpoint_dir=""
+if [[ -n "$steps" ]]; then
+    smoke_checkpoint_dir="$STOCKYARD/checkpoints/modded-nanogpt-moe"
+    smoke_checkpoint_dir+="/interactive-smoke/${run_names[0]}"
+    smoke_checkpoint_dir+="/$(date '+%Y%m%d-%H%M%S')-$$"
+fi
+
 if [[ "$worker" -eq 1 ]]; then
     log_dir="$STOCKYARD/logs/modded-nanogpt-moe/vista/slurm"
     mkdir -p "$log_dir"
@@ -311,7 +318,8 @@ for index in "${!config_paths[@]}"; do
     )
     if [[ -n "$steps" ]]; then
         training_environment+=(
-            "TRAIN_STEPS_OVERRIDE=$steps"
+            "STOP_AFTER_COMPLETED_UPDATES=$steps"
+            "CHECKPOINT_DIR=$smoke_checkpoint_dir"
             CHECKPOINT_POLICY_DISABLED=1
             "TB_ROOT="
         )

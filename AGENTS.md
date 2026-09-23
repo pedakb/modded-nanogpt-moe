@@ -157,8 +157,10 @@ Vista `env.sh` establishes machine state only. Do not globally export
 `MOE_GMM_IMPLEMENTATION=torch`; `train.sh` scopes it to the GH200 trainer
 process and clears stale experiment/profile/checkpoint state. It defaults to
 `configs/moe_e64k8_r0.5.toml`; multiple configs run sequentially. The `--steps`
-validation path is current-node only and disables TensorBoard so it cannot
-claim the production run directory; it also disables TOML checkpoint policy.
+validation path is current-node only, preserves the configured schedule horizon,
+and stops through `STOP_AFTER_COMPLETED_UPDATES`. It disables TensorBoard and
+periodic TOML checkpoint policy, saving only to a unique `interactive-smoke`
+checkpoint directory outside the production run directory.
 
 Vista training-pipeline benchmarks reuse the same trainer and update loop,
 defaulting to 10 warmup plus 30 measured optimizer updates. They disable

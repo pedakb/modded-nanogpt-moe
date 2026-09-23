@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import subprocess
 import tomllib
 import types
@@ -411,23 +412,66 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path):
     environment["CHECKPOINT_POLICY_DISABLED"] = "0"
 
     subprocess.run(
-        ["bash", str(launcher), "--steps", "17", "configs/dense_baseline.toml"],
+        [
+            "bash", str(launcher), "--steps", "250",
+            "configs/moe_e64k8_r0.5.toml",
+        ],
         cwd=outside_repository,
         env=environment,
         check=True,
     )
 
     captured = capture.read_text().splitlines()
-    assert captured[:14] == [
-        str(repository_root), str(repository_root), "17", "torch",
-        "", "", "", "", "", "",
-        str(tmp_path / "stockyard/checkpoints/modded-nanogpt-moe"), "1", "", "vista",
+    assert captured[:8] == [
+        str(repository_root), str(repository_root), "", "torch",
+        "", "", "", "250",
+    ]
+    smoke_checkpoint_dir = Path(captured[8])
+    assert smoke_checkpoint_dir.parent == (
+        tmp_path / "stockyard/checkpoints/modded-nanogpt-moe"
+        / "interactive-smoke/moe-e64k8-r0.5")
+    assert re.fullmatch(r"\d{8}-\d{6}-\d+", smoke_checkpoint_dir.name)
+    assert captured[9:14] == [
+        "", str(tmp_path / "stockyard/checkpoints/modded-nanogpt-moe"),
+        "1", "", "vista",
     ]
     assert captured[14:] == [
         "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
         "--module", "modded_nanogpt_moe.train", "--config",
-        str(repository_root / "configs/dense_baseline.toml"),
+        str(repository_root / "configs/moe_e64k8_r0.5.toml"),
     ]
+    assert load_experiment_config(
+        repository_root / "configs/moe_e64k8_r0.5.toml"
+    )["training"]["total_steps"] == 3250
+
+
+@pytest.mark.parametrize(
+    "arguments,message",
+    [
+        (["--steps", "0"], "--steps must be a positive integer"),
+        (["--steps", "abc"], "--steps must be a positive integer"),
+        (["--steps", "1", "--submit"], "cannot be used with --submit"),
+        (["--steps", "1", "--checkpoint-interval", "1"],
+         "cannot be combined with checkpoint or resume options"),
+        (["--steps", "1", "--resume", "/unused/checkpoint.pt"],
+         "cannot be combined with checkpoint or resume options"),
+        (["--steps", "1", "configs/dense_baseline.toml",
+          "configs/moe_e8k2_r2.toml"], "--steps requires exactly one config"),
+    ],
+)
+def test_vista_launcher_rejects_invalid_step_options(arguments, message):
+    repository_root = Path(__file__).resolve().parents[1]
+    launcher = repository_root / "scripts/vista/train.sh"
+
+    result = subprocess.run(
+        ["bash", str(launcher), *arguments],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert message in result.stderr
 
 
 @pytest.mark.parametrize("mail_user", [None, "", "researcher@example.com"])
@@ -518,8 +562,10 @@ def test_vista_launcher_runs_configs_in_order_with_explicit_checkpoints(
     uv = fake_bin / "uv"
     uv.write_text(
         "#!/usr/bin/env bash\n"
-        "printf '%s|%s|%s|%s\\n' \"${CHECKPOINT_ROOT-}\" "
-        "\"${CHECKPOINT_INTERVAL-}\" \"${RESUME_CHECKPOINT-}\" \"$*\" "
+        "printf '%s|%s|%s|%s|%s|%s|%s\\n' \"${CHECKPOINT_ROOT-}\" "
+        "\"${CHECKPOINT_INTERVAL-}\" \"${RESUME_CHECKPOINT-}\" "
+        "\"${CHECKPOINT_DIR-}\" \"${TRAIN_STEPS_OVERRIDE-}\" "
+        "\"${STOP_AFTER_COMPLETED_UPDATES-}\" \"$*\" "
         ">> \"$LAUNCH_CAPTURE\"\n"
     )
     uv.chmod(0o755)
@@ -549,9 +595,9 @@ def test_vista_launcher_runs_configs_in_order_with_explicit_checkpoints(
     )
     assert capture.read_text().splitlines() == [
         f"{stockyard}/checkpoints/modded-nanogpt-moe|7|"
-        f"{resume}|{command_prefix}"
+        f"{resume}||||{command_prefix}"
         f"{repository_root / 'configs/dense_baseline.toml'}",
-        f"{stockyard}/checkpoints/modded-nanogpt-moe|7||"
+        f"{stockyard}/checkpoints/modded-nanogpt-moe|7|||||"
         f"{command_prefix}{repository_root / 'configs/moe_e8k2_r2.toml'}",
     ]
 
