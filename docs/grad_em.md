@@ -11,8 +11,12 @@ q = softmax(z_selected - eta * v)              # selected K only; detached
 p = softmax(z)                               # all E
 q_tilde[t, selected_idx[t,i]] = q[t,i]         # zero elsewhere
 grad_expert[t,i,d] = q[t,i] * g[t,d]
-grad_logits = q_tilde - p                     # this sign is intentional
+grad_logits = (p - q_tilde) / eta
 ```
+
+The router rule is the exact logits gradient of
+`(1 / eta) * KL(q_tilde || softmax(z))` with the E-step distribution detached.
+`p` remains the full-E router distribution; it is not renormalized on Top-K.
 
 Products are FP32 before summation, even for BF16 inputs. Results are FP32;
 the Stage-2A boundary casts gradients to their original activation dtypes.
@@ -20,16 +24,16 @@ No inactive expert outputs are evaluated. No gradient graph is retained.
 This replacement backward is not the derivative of the unchanged forward:
 numerical forward gradcheck is not its correctness oracle.
 
-At `eta=0`, q is the selected-logit softmax, but the router replacement is
-still `q_tilde-p`, not ordinary routing backward. At `g=0`, expert gradients
-are zero while router gradients generally remain nonzero. This is intentional.
+Eta must be strictly positive because the router gradient divides by eta. At
+`g=0`, expert gradients are zero while router gradients generally remain
+nonzero. This is intentional.
 Using selected logits avoids underflow from taking `log(topk_weights)`;
 in exact arithmetic `log(p_selected)` differs only by a common shift.
 
 ## Configuration and compatibility
 
 `[model].moe_backward` defaults to `"standard"`; `"grad_em"` is opt-in and
-requires MoE. `grad_em_eta` defaults to `0.1`, must be finite and nonnegative,
+requires MoE. `grad_em_eta` defaults to `0.1`, must be finite and positive,
 and is fixed (no schedule). Existing TOMLs remain unchanged. Stage 2A supports
 the grouped-GEMM combine boundary on CPU (tests supply a differentiable CPU
 GEMM double; the external CUDA extension itself has no CPU fallback).
@@ -54,7 +58,7 @@ inverse permutation. The forward uses exactly the existing mixing weights.
 Backward unsorts the selected expert outputs into `[T,K,D]`, invokes the
 Stage-1 FP32 oracle, and gathers q*g back to expert-sorted order. The existing
 FC2/activation/FC1 graph receives that gradient unchanged except for casting to
-the original output dtype. It returns q_tilde-p **directly to logits** (cast to
+the original output dtype. It returns `(p-q_tilde)/eta` **directly to logits** (cast to
 the logits dtype) and **None for mixing weights**: ordinary top-k, normalization
 and softmax gradients cannot be double-counted. The router linear remains
 connected to x, so expert and router input gradients both accumulate normally.
@@ -72,7 +76,7 @@ across D (unlike standard backward, no activation-dtype intermediate rounding).
 It computes v once, softmaxes selected logits minus eta*v, emits FP32 `[T,K]` q,
 and writes q*g directly into unique expert-sorted gradient rows. Second, one
 program per token softmaxes all E logits, matches selected IDs to q in
-registers, and writes q_tilde-p directly. No atomics, global q_tilde, global
+registers, and writes `(p-q_tilde)/eta` directly. No atomics, global q_tilde, global
 `[T,K,D]`, gathered incoming-gradient copy, or second expert execution.
 
 CUDA forward launches the **unchanged** `_combine_assignment_rows` and

@@ -51,7 +51,7 @@ def test_boundary_exact_forward_and_replacement_gradients(k, dtype):
 
 @pytest.mark.parametrize("layout", ["modulelist", "packed"])
 @pytest.mark.parametrize("experts,k", [(8, 1), (8, 2), (64, 8)])
-@pytest.mark.parametrize("variant", ["normal", "frozen_router", "frozen_experts", "eta_zero", "g_zero"])
+@pytest.mark.parametrize("variant", ["normal", "frozen_router", "frozen_experts", "g_zero"])
 def test_actual_moe_graph_matches_explicit_gradient_injection(cpu_gmm, monkeypatch, layout, experts, k, variant):
     torch.manual_seed(82)
     standard = MoE(4, experts, k, hidden_dim=3, moe_backend="grouped_gemm",
@@ -61,7 +61,7 @@ def test_actual_moe_graph_matches_explicit_gradient_injection(cpu_gmm, monkeypat
         standard.router.bias[-1] = -100  # guaranteed empty expert
     grad_em = copy.deepcopy(standard)
     grad_em.moe_backward = "grad_em"
-    grad_em.grad_em_eta = 0 if variant == "eta_zero" else 0.1
+    grad_em.grad_em_eta = 0.1
     if variant.startswith("frozen"):
         for module in (standard, grad_em):
             for name, parameter in module.named_parameters():

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from modded_nanogpt_moe.checkpoint import CHECKPOINT_FORMAT_VERSION, validate_checkpoint_config
 from modded_nanogpt_moe.config import load_experiment_config, validate_experiment_config
@@ -34,7 +35,7 @@ def test_exact_contract_and_support(k, dtype):
     q = torch.softmax(z.float().gather(1, idx) - 0.2 * v_fp32, -1)
     q_tilde = torch.zeros_like(z, dtype=torch.float32).scatter_(1, idx, q)
     expected = (v_fp32, q, q_tilde, q[..., None] * g[:, None, :].float(),
-                q_tilde - z.float().softmax(-1))
+                (z.float().softmax(-1) - q_tilde) / 0.2)
     for actual, wanted in zip(result, expected):
         assert actual.dtype == torch.float32
         torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
@@ -64,8 +65,13 @@ def test_logit_shift_invariance():
     z = z.round() / 4
     baseline = grad_em_reference(z, idx, h, g)
     shifted = grad_em_reference(z + torch.tensor([[4.], [-2.], [8.]]), idx, h, g)
-    for actual, expected in zip(shifted, baseline):
+    for actual, expected in zip(shifted[:-1], baseline[:-1]):
         torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+    # Compare the unscaled KL residual so the established softmax tolerance is
+    # not artificially magnified by the required 1 / eta factor.
+    torch.testing.assert_close(
+        0.1 * shifted.grad_logits, 0.1 * baseline.grad_logits,
+        rtol=1e-6, atol=1e-7)
 
 
 def test_selected_logits_equivalent_to_log_probabilities_in_high_precision():
@@ -77,11 +83,45 @@ def test_selected_logits_equivalent_to_log_probabilities_in_high_precision():
     torch.testing.assert_close(selected_q, log_p_q, rtol=1e-14, atol=1e-15)
 
 
-def test_eta_zero_is_selected_softmax_not_standard_router_backward():
+def test_full_kl_autograd_router_gradient_has_correct_sign_and_eta_scale():
+    eta = 0.2
+    z = torch.tensor([[0.3, -0.7, 1.1], [-0.2, 0.4, 0.8]],
+                     dtype=torch.float64, requires_grad=True)
+    q = torch.tensor([[0.2, 0.5, 0.3], [0.6, 0.1, 0.3]], dtype=torch.float64)
+    loss = F.kl_div(F.log_softmax(z, dim=-1), q.detach(), reduction="sum") / eta
+    (actual,) = torch.autograd.grad(loss, z)
+    p = torch.softmax(z.detach(), dim=-1)
+    expected = (p - q) / eta
+    old_wrong_sign = q - p
+    torch.testing.assert_close(actual, expected, rtol=1e-13, atol=1e-14)
+    assert not torch.allclose(actual, old_wrong_sign, rtol=1e-13, atol=1e-14)
+
+
+def test_sparse_router_gradient_scatter_includes_nonselected_experts():
+    eta = 0.25
+    z = torch.tensor([[1.2, -0.3, 0.4, 0.8]], dtype=torch.float64)
+    idx = torch.tensor([[0, 3]])
+    h = torch.tensor([[[0.5, -0.2], [1.1, 0.7]]], dtype=torch.float64)
+    g = torch.tensor([[0.4, -0.6]], dtype=torch.float64)
+    result = grad_em_reference(z, idx, h, g, eta)
+    p = torch.softmax(z.float(), dim=-1)
+    expected = (p - result.q_tilde) / eta
+    old_wrong_sign = result.q_tilde - p
+    torch.testing.assert_close(result.grad_logits, expected, rtol=0, atol=0)
+    assert not torch.allclose(result.grad_logits, old_wrong_sign)
+    inactive = torch.ones_like(z, dtype=torch.bool).scatter_(1, idx, False)
+    torch.testing.assert_close(result.grad_logits[inactive], p[inactive] / eta,
+                               rtol=0, atol=0)
+
+
+def test_router_gradient_inverse_eta_scaling_for_fixed_p_and_q():
     z, idx, h, g = inputs()
-    result = grad_em_reference(z, idx, h, g, eta=0)
-    assert torch.equal(result.q, z.gather(1, idx).softmax(-1))
-    assert torch.count_nonzero(result.grad_logits) > 0
+    zero_g = torch.zeros_like(g)
+    eta_01 = grad_em_reference(z, idx, h, zero_g, eta=0.1)
+    eta_02 = grad_em_reference(z, idx, h, zero_g, eta=0.2)
+    torch.testing.assert_close(eta_01.q, eta_02.q, rtol=0, atol=0)
+    torch.testing.assert_close(
+        eta_01.grad_logits, 2 * eta_02.grad_logits, rtol=1e-6, atol=1e-6)
 
 
 def test_zero_upstream_preserves_nonzero_router_gradient():
@@ -92,7 +132,9 @@ def test_zero_upstream_preserves_nonzero_router_gradient():
     assert torch.equal(result.q, z.gather(1, idx).softmax(-1))
     assert torch.count_nonzero(result.grad_logits) > 0
     inactive = torch.ones_like(z, dtype=torch.bool).scatter_(1, idx, False)
-    assert torch.equal(result.grad_logits[inactive], -z.softmax(-1)[inactive])
+    torch.testing.assert_close(
+        result.grad_logits[inactive], z.softmax(-1)[inactive] / 0.1,
+        rtol=1e-6, atol=1e-7)
 
 
 def test_extreme_logits_do_not_take_log_of_underflowed_probabilities():
@@ -118,32 +160,32 @@ def test_q_is_detached_without_higher_order_graph_or_input_mutation():
         assert torch.equal(actual, expected)
 
 
-@pytest.mark.parametrize("eta", [-0.1, float("nan"), float("inf"), -float("inf"), True, "0.1"])
+@pytest.mark.parametrize("eta", [0, -0.1, float("nan"), float("inf"), -float("inf"), True, "0.1"])
 def test_invalid_eta_rejected_by_reference_and_config(eta):
-    with pytest.raises(ValueError, match="finite and nonnegative"):
+    with pytest.raises(ValueError, match="finite and positive"):
         grad_em_reference(*inputs(), eta=eta)
     config = load_experiment_config()
     config["model"]["grad_em_eta"] = eta
-    with pytest.raises(ValueError, match="finite and nonnegative"):
+    with pytest.raises(ValueError, match="finite and positive"):
         validate_experiment_config(config)
 
 
 @pytest.mark.parametrize("path", sorted((Path(__file__).resolve().parents[1] / "configs").glob("*.toml")))
-def test_existing_configs_default_to_standard(path):
+def test_existing_configs_have_valid_backward_configuration(path):
     config = load_experiment_config(path)
-    assert config["model"]["moe_backward"] == "standard"
-    assert config["model"]["grad_em_eta"] == 0.1
+    assert config["model"]["moe_backward"] in ("standard", "grad_em")
+    assert config["model"]["grad_em_eta"] > 0
 
 
 def test_grad_em_toml_reaches_cuda_training_setup(tmp_path, monkeypatch):
     from modded_nanogpt_moe.train import main
     path = tmp_path / "grad_em.toml"
     path.write_text('run_name = "reference"\n[model]\nmlp_type = "moe"\n'
-                    'moe_backward = "grad_em"\ngrad_em_eta = 0.0\n'
+                    'moe_backward = "grad_em"\ngrad_em_eta = 0.2\n'
                     'moe_backend = "grouped_gemm"\n')
     config = load_experiment_config(path)
     assert config["model"]["moe_backward"] == "grad_em"
-    assert config["model"]["grad_em_eta"] == 0
+    assert config["model"]["grad_em_eta"] == 0.2
     monkeypatch.delenv("MLP_TYPE_OVERRIDE", raising=False)
     monkeypatch.setenv("LOCAL_RANK", "0")
     class SetupReached(Exception):

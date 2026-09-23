@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from ._combine import _combine_assignment_rows, _combine_forward
+from .config import validate_grad_em_eta
 
 
 @triton.jit
@@ -45,6 +46,7 @@ def _grad_em_expert_backward(X, Z, Indices, Rows, Grad, GradX, Q, V,
 
 @triton.jit
 def _grad_em_router_backward(Z, Indices, Q, GradZ,
+                             ETA: tl.constexpr,
                              E: tl.constexpr, K: tl.constexpr,
                              ZR: tl.constexpr, ZC: tl.constexpr,
                              IR: tl.constexpr, IC: tl.constexpr,
@@ -59,7 +61,7 @@ def _grad_em_router_backward(Z, Indices, Q, GradZ,
     q = tl.load(Q + token * K + slots, slots < K, other=0)
     # Register-local matching only; no global q_tilde and no scatter atomics.
     selected_q = tl.sum(tl.where(experts[:, None] == ids[None, :], q[None, :], 0.), axis=1)
-    tl.store(GradZ + token * E + experts, selected_q - p, experts < E)
+    tl.store(GradZ + token * E + experts, (p - selected_q) / ETA, experts < E)
 
 
 def cuda_forward(out_sorted, logits, weights, indices, order):
@@ -97,6 +99,7 @@ def cuda_forward(out_sorted, logits, weights, indices, order):
 def cuda_backward(out_sorted, logits, indices, rows, grad_output, eta,
                   need_x=True, need_logits=True, *, save_v=False):
     """Return gradients plus compact q (and optional test-only FP32 v)."""
+    validate_grad_em_eta(eta)
     n, k = indices.shape
     d, e = out_sorted.shape[1], logits.shape[1]
     gx = torch.empty(out_sorted.shape, device=out_sorted.device, dtype=out_sorted.dtype) if need_x else None
@@ -114,7 +117,7 @@ def cuda_backward(out_sorted, logits, indices, rows, grad_output, eta,
                 num_warps=4, enable_fp_fusion=False)
             if need_logits:
                 _grad_em_router_backward[(n,)](
-                    logits, indices, q, gz, e, k, *logits.stride(), *indices.stride(),
+                    logits, indices, q, gz, eta, e, k, *logits.stride(), *indices.stride(),
                     triton.next_power_of_2(e), triton.next_power_of_2(k),
                     num_warps=4, enable_fp_fusion=False)
     return gx, gz, q, v

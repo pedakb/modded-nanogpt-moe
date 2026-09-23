@@ -30,9 +30,9 @@ def tolerance(dtype):
 
 
 @CUDA
-@pytest.mark.parametrize("e,k", [(8, 1), (8, 2), (64, 8), (7, 3)])
+@pytest.mark.parametrize("e,k", [(1, 1), (8, 1), (8, 2), (64, 8), (7, 3)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("case", ["random", "imbalanced", "eta_zero", "g_zero"])
+@pytest.mark.parametrize("case", ["random", "imbalanced", "g_zero"])
 def test_cuda_oracle_and_direct_autograd(candidate, e, k, dtype, case):
     torch.manual_seed(41)
     n, d = 19, 768
@@ -48,7 +48,7 @@ def test_cuda_oracle_and_direct_autograd(candidate, e, k, dtype, case):
     g = torch.randn(n, d, device="cuda", dtype=dtype) * 0.1
     if case == "g_zero":
         g.zero_()
-    eta = 0 if case == "eta_zero" else 0.1
+    eta = 0.1
     selected = torch.empty_like(x)
     selected[order] = x.detach()
     ref = em.grad_em_reference(z, ids, selected.view(n, k, d), g, eta)
@@ -68,7 +68,11 @@ def test_cuda_oracle_and_direct_autograd(candidate, e, k, dtype, case):
     torch.testing.assert_close(z.grad, gz, rtol=0, atol=0)
     assert w.grad is None
     if case == "g_zero":
-        assert torch.count_nonzero(gx) == 0 and torch.count_nonzero(gz) > 0
+        assert torch.count_nonzero(gx) == 0
+        if e == 1:
+            assert torch.count_nonzero(gz) == 0
+        else:
+            assert torch.count_nonzero(gz) > 0
 
 
 @CUDA
@@ -175,6 +179,8 @@ def test_candidate_launches_and_compact_scratch(monkeypatch):
     x, z, w = fake((n*k, d), torch.bfloat16), fake((n, e)), fake((n, k), torch.bfloat16)
     ids, order = fake((n, k), torch.int64), fake((n*k,), torch.int64)
     _, rows = module.cuda_forward(x, z, w, ids, order)
+    with pytest.raises(ValueError, match="finite and positive"):
+        module.cuda_backward(x, z, ids, rows, fake((n, d)), 0.0)
     gx, gz, q, v = module.cuda_backward(x, z, ids, rows, fake((n, d)), 0.1)
     assert allocations == [((n*k,), torch.int64), ((n, d), torch.bfloat16),
                            ((n*k, d), torch.bfloat16), ((n, e), torch.float32), ((n, k), torch.float32)]

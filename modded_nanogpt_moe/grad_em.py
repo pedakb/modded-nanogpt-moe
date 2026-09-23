@@ -75,9 +75,10 @@ def grad_em_reference(router_logits, topk_idx, expert_outputs, grad_h, eta=0.1):
     """Evaluate the frozen replacement-gradient contract on fixed support.
 
     Inputs: logits [T,E], unique selected indices [T,K], selected expert
-    outputs [T,K,D], incoming output gradient [T,D], fixed finite eta >= 0.
+    outputs [T,K,D], incoming output gradient [T,D], fixed finite eta > 0.
     q = softmax(selected_logits - eta * <g,h_i>) is detached.
-    Return q*g for selected experts and q_tilde - softmax(logits) for logits.
+    Return q*g for selected experts and
+    (softmax(logits) - q_tilde) / eta for logits.
     This deliberately is NOT the derivative of the ordinary MoE forward.
     Validation is for the reference, not a GPU hot-path implementation.
     """
@@ -109,4 +110,4 @@ def grad_em_reference(router_logits, topk_idx, expert_outputs, grad_h, eta=0.1):
     q = torch.softmax(logits.gather(1, topk_idx) - eta * v, dim=-1)
     p = torch.softmax(logits, dim=-1)
     q_tilde = torch.zeros_like(p).scatter_(1, topk_idx, q)
-    return GradEMResult(v, q, q_tilde, q[..., None] * g, q_tilde - p)
+    return GradEMResult(v, q, q_tilde, q[..., None] * g, (p - q_tilde) / eta)

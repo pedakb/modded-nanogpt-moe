@@ -12,13 +12,14 @@ or push performed. Mac has no CUDA; do not call Stage 2B validated/enabled.
 ## Grad-EM Stage 2B candidate (current work)
 
 - `grad_em.py::grad_em_reference` computes detached FP32 v, q, q_tilde,
-  selected expert gradients q*g, and router gradients q_tilde-p. The sign is
-  frozen. Uses selected logits directly, never log(top-k weights). g=0 still
-  generally gives nonzero router gradients; eta=0 is not ordinary backward.
+  selected expert gradients q*g, and router gradients `(p-q_tilde)/eta`, the
+  exact logits gradient of `(1/eta) KL(q||p)` with detached q. Uses selected
+  logits directly, never log(top-k weights). Eta is strictly positive; g=0
+  still generally gives nonzero router gradients.
 - New lazy `_grad_em_cuda.py`: imports unchanged standard forward kernels,
   retains their inverse permutation once. Token-centric expert-backward kernel
   computes FP32 v/q once, writes q*g directly to sorted gradient rows and emits
-  only compact [T,K] q. Second token kernel builds q_tilde-p in registers and
+  only compact [T,K] q. Second token kernel builds `(p-q_tilde)/eta` in registers and
   writes logits gradients. No atomics, gathered activation/gradient copies,
   GEMM changes or q_tilde buffer. Optional compact v output is test-only.
 - CUDA Function branch saves out_sorted, logits, selected IDs and inverse rows,

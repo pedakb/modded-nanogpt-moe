@@ -94,8 +94,8 @@ def _positive_int(config, section, key):
 
 def validate_grad_em_eta(eta):
     if (isinstance(eta, bool) or not isinstance(eta, (int, float))
-            or not math.isfinite(eta) or eta < 0):
-        raise ValueError("model.grad_em_eta must be finite and nonnegative")
+            or not math.isfinite(eta) or eta <= 0):
+        raise ValueError("model.grad_em_eta must be finite and positive")
 
 
 def validate_experiment_config(config, require_run_name=False):
