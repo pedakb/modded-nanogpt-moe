@@ -1,0 +1,52 @@
+run_name = "moe-e64k8-r0.5-gradem-eta0.1"
+num_trials = 1
+seed = 1234
+
+[model]
+vocab_size = 50304
+num_layers = 12
+model_dim = 768
+mlp_type = "moe"
+mlp_ratio = 0.5
+num_experts = 64
+top_k = 8
+normalize_topk = true
+moe_backend = "grouped_gemm"
+moe_parameter_layout = "packed"
+
+moe_backward = "grad_em"
+grad_em_eta = 0.1
+[training]
+sequence_length = 1024
+global_batch_tokens = 524288
+microbatch_sequences = 64
+total_steps = 3250
+cooldown_fraction = 0.7
+training_shard_pattern = "data/fineweb10B/fineweb_train_*.bin"
+validation_shard_pattern = "data/fineweb10B/fineweb_val_*.bin"
+
+[evaluation]
+tokens = 10485760
+interval = 125
+final_fraction = 0.10
+final_interval = 25
+
+[optimizers.adamw]
+group_lrs = [0.7, 0.004, 0.015]
+betas = [0.8, 0.95]
+eps = 1e-10
+weight_decay = 0.001
+fused = true
+
+[optimizers.muon]
+lr = 0.025
+weight_decay = 0.05
+mu = 0.95
+
+[diagnostics]
+scalar_interval = 25
+histogram_interval = 0
+during_nsys = false
+
+[checkpoint]
+interval = 250
