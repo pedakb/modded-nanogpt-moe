@@ -1,4 +1,4 @@
-"""Experimental Grad-EM kernels. Public enablement awaits CUDA parity tests.
+"""Grad-EM kernels with selected-support KL router gradients.
 
 Imported lazily, never by standard mode or the CPU reference. No atomics,
 activation-sized scratch, or additional expert computation.
@@ -53,15 +53,18 @@ def _grad_em_router_backward(Z, Indices, Q, GradZ,
                              EXPERTS: tl.constexpr, SLOTS: tl.constexpr):
     token = tl.program_id(0)
     experts, slots = tl.arange(0, EXPERTS), tl.arange(0, SLOTS)
-    logits = tl.load(Z + token * ZR + experts * ZC, experts < E,
+    ids = tl.load(Indices + token * IR + slots * IC, slots < K, other=-1)
+    logits = tl.load(Z + token * ZR + ids * ZC, slots < K,
                      other=-float("inf")).to(tl.float32)
     exps = tl.exp(logits - tl.max(logits, axis=0))
-    p = exps / tl.sum(exps, axis=0)
-    ids = tl.load(Indices + token * IR + slots * IC, slots < K, other=-1)
+    a = exps / tl.sum(exps, axis=0)
     q = tl.load(Q + token * K + slots, slots < K, other=0)
-    # Register-local matching only; no global q_tilde and no scatter atomics.
-    selected_q = tl.sum(tl.where(experts[:, None] == ids[None, :], q[None, :], 0.), axis=1)
-    tl.store(GradZ + token * E + experts, (p - selected_q) / ETA, experts < E)
+    selected_grad = (a - q) / ETA
+    # Register-local matching gives exactly zero outside the unique support.
+    # One store per dense output entry; no overlapping zero/scatter writes,
+    # atomics, full-E softmax, or global dense intermediate.
+    grad_z = tl.sum(tl.where(experts[:, None] == ids[None, :], selected_grad[None, :], 0.), axis=1)
+    tl.store(GradZ + token * E + experts, grad_z, experts < E)
 
 
 def cuda_forward(out_sorted, logits, weights, indices, order):

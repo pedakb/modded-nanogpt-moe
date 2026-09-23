@@ -104,13 +104,18 @@ def test_actual_moe_graph_matches_explicit_gradient_injection(cpu_gmm, monkeypat
     # parameters are frozen. Neither branch is detached by the custom boundary.
     expert_dx = torch.autograd.grad(ref["sorted"], x_ref, grad_sorted, retain_graph=True)[0]
     router_dx = torch.autograd.grad(ref["logits"], x_ref, expected.grad_logits, retain_graph=True)[0]
-    assert torch.count_nonzero(router_dx) > 0
+    if k == 1 or variant == "g_zero":
+        assert torch.count_nonzero(router_dx) == 0
+    else:
+        assert torch.count_nonzero(router_dx) > 0
     if variant != "g_zero":
         assert torch.count_nonzero(expert_dx) > 0
     torch.autograd.backward((ref["sorted"], ref["logits"]), (grad_sorted, expected.grad_logits))
     out.backward(g)
     assert torch.equal(actual["sorted"].grad, grad_sorted)
     assert torch.equal(actual["logits"].grad, expected.grad_logits)
+    inactive = torch.ones_like(actual["logits"], dtype=torch.bool).scatter_(1, indices, False)
+    assert torch.count_nonzero(actual["logits"].grad[inactive]) == 0
     assert actual["weights"].grad is None
     torch.testing.assert_close(x.grad, expert_dx + router_dx, rtol=1e-6, atol=1e-7)
     torch.testing.assert_close(x.grad, x_ref.grad, rtol=1e-6, atol=1e-7)

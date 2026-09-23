@@ -1,46 +1,49 @@
 # Current handoff
 
-Updated: 2026-09-22
+Updated: 2026-09-23
 
 ## Current goal and state
 
-Current base on `cleanup-active-codebase`: `5577a69` (Grad-EM Stage 2A), initially
-clean. Uncommitted task: **Stage 2B CUDA candidate**, still gated pending GPU
-correctness. No installation, remote training, benchmark, submission, commit
-or push performed. Mac has no CUDA; do not call Stage 2B validated/enabled.
+Current base on `cleanup-active-codebase`: `d47819b` (eta sweep configs), initially
+clean. Uncommitted task: **correct Grad-EM to selected-support KL backward**.
+No installation, remote training, benchmark, submission, commit or push.
+Mac has no CUDA; the corrected kernel needs fresh GH200 acceptance testing.
 
-## Grad-EM Stage 2B candidate (current work)
+## Grad-EM selected-support correction (current work)
 
-- `grad_em.py::grad_em_reference` computes detached FP32 v, q, q_tilde,
-  selected expert gradients q*g, and router gradients `(p-q_tilde)/eta`, the
-  exact logits gradient of `(1/eta) KL(q||p)` with detached q. Uses selected
-  logits directly, never log(top-k weights). Eta is strictly positive; g=0
-  still generally gives nonzero router gradients.
-- New lazy `_grad_em_cuda.py`: imports unchanged standard forward kernels,
-  retains their inverse permutation once. Token-centric expert-backward kernel
-  computes FP32 v/q once, writes q*g directly to sorted gradient rows and emits
-  only compact [T,K] q. Second token kernel builds `(p-q_tilde)/eta` in registers and
-  writes logits gradients. No atomics, gathered activation/gradient copies,
-  GEMM changes or q_tilde buffer. Optional compact v output is test-only.
-- CUDA Function branch saves out_sorted, logits, selected IDs and inverse rows,
-  plus eta. No mixing-weight gradient; CPU branch/oracle remain intact. Public
-  `require_grad_em_cpu` guards in model/Function/trainer are retained: tests
-  monkeypatch the guard locally to validate CUDA, no runtime escape hatch.
-  Explicit candidate bounds: K<=32,D<=4096,E<=1024,rounded K*D<=32768; first-order
-  only. Standard kernels, model, optimizers and checkpoint format unchanged.
-- Combined requested regression + new CUDA file: **163 passed, 118 skipped,
-  6 failed** (all six existing Bash3.2 launcher errors). Includes CPU launch/
-  allocation checks but does NOT compile Triton or prove GPU correctness.
-  56 new CUDA cases skipped. `git diff --check` passed.
-- Dirty files: grad_em.py, new _grad_em_cuda.py, new tests/test_grad_em_cuda.py,
-  README.md, docs/grad_em.md, HANDOFF.md.
-- Next: on an existing Vista allocation run the exact CUDA acceptance and
-  regression commands in docs/grad_em.md (native grouped GEMM for full graph
-  tests). Investigate discrepancies, do not loosen tolerances. After passing
-  without relevant skips, review a guard-enablement patch and its tests; only
-  then run 2-step/5-step smokes and matched 10+30 standard/Grad-EM benchmarks.
-  Document mean/median, tokens/s, peak allocated/reserved and overhead. All GPU
-  results currently pending; no active Grad-EM run or checkpoint exists.
+- FP32 rule: v=<g,h_i>, a=softmax(z_selected), q=softmax(z_selected-eta*v).
+  Expert gradient remains q*g. Router gradient is `(a-q)/eta` on the selected
+  support, exactly zero elsewhere: gradient of KL(q.detach()||a)/eta. No full-E
+  softmax in Grad-EM backward. Forward routing still uses its existing full-E
+  softmax, selection and normalization. Reference result exposes a instead of
+  obsolete q_tilde. Strict positive/finite/numeric/non-bool eta validation was
+  already present and is preserved, with extra invalid-eta test cases.
+- At g=0 all router/expert task gradients are zero; K=1 router gradients are
+  zero. As eta approaches zero, router gradient recovers ordinary normalized
+  Top-K backward a*(v-sum(a*v)); expert gradient approaches a*g. FP64 regression
+  compares to actual normalized-forward autograd and checks convergence; FP32
+  reference limit also tested. Exact eta=0 is rejected (no approximation branch).
+- CUDA router kernel now loads/softmaxes K logits only; register-local matching
+  writes selected gradients and exact unselected zeros, each output entry once.
+  No new launches, buffers, transfers or atomics. Expert kernel, forward,
+  permutations, grouped GEMM, optimizers, configs and checkpoint format unchanged.
+  CPU/CUDA remain enabled by existing device guards; no test bypass.
+- Local reference/integration/CUDA selection: **84 passed, 62 CUDA skips**.
+  Full suite: **360 passed, 205 skipped, 6 failed** (all six pre-existing Mac
+  Bash3.2 launcher errors). Diff check passed. No GPU execution in this session.
+- Dirty files: grad_em.py, _grad_em_cuda.py, tests/test_grad_em.py,
+  tests/test_grad_em_integration.py, tests/test_grad_em_cuda.py,
+  docs/grad_em.md, HANDOFF.md.
+- Next: run GH200 commands in docs/grad_em.md, particularly CUDA g=0, exact
+  unselected-zero checks, K=E and full grouped model parity. Existing GPU test/
+  benchmark results predate this rule and do not validate the correction.
+  Preserve old results/checkpoints with code revisions: config mode/eta alone
+  cannot distinguish changed math. Do not resume older Grad-EM checkpoints as
+  if they were trained with this corrected rule. No checkpoint migration added.
+
+The earlier validation-script request was superseded by this correction;
+`scripts/vista/validate_grad_em.sh` is absent in the current base checkout.
+No validation workflow or unrelated diagnostics/notebooks/configs changed here.
 
 Checkpoint cadence remains **250 completed updates** for all three production
 configs; the stale checkpoint100 expectations were fixed in the base commit.

@@ -30,7 +30,7 @@ def tolerance(dtype):
 
 
 @CUDA
-@pytest.mark.parametrize("e,k", [(1, 1), (8, 1), (8, 2), (64, 8), (7, 3)])
+@pytest.mark.parametrize("e,k", [(1, 1), (8, 1), (8, 2), (64, 8), (7, 3), (8, 8)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("case", ["random", "imbalanced", "g_zero"])
 def test_cuda_oracle_and_direct_autograd(candidate, e, k, dtype, case):
@@ -59,6 +59,17 @@ def test_cuda_oracle_and_direct_autograd(candidate, e, k, dtype, case):
     assert q.dtype == v.dtype == torch.float32 and q.grad_fn is None
     torch.testing.assert_close(gx, ref.grad_expert.flatten(0, 1)[order].to(dtype), **tolerance(dtype))
     torch.testing.assert_close(gz, ref.grad_logits.to(dtype), **tolerance(dtype))
+    inactive = torch.ones_like(z, dtype=torch.bool).scatter_(1, ids, False)
+    assert torch.count_nonzero(gz[inactive]) == 0
+    kl_logits = z.detach().float().requires_grad_()
+    kl_loss = torch.nn.functional.kl_div(
+        kl_logits.gather(1, ids).log_softmax(-1), ref.q.detach(), reduction="sum") / eta
+    kl_grad, = torch.autograd.grad(kl_loss, kl_logits)
+    torch.testing.assert_close(gz, kl_grad.to(dtype), **tolerance(dtype))
+    if case == "random" and k < e:
+        p = z.detach().float().softmax(-1)
+        old_full_kl = (p - torch.zeros_like(p).scatter_(1, ids, ref.q)) / eta
+        assert not torch.allclose(gz.float(), old_full_kl, **tolerance(dtype))
     standard = model_module.combine_expert_outputs(x, w, order)
     torch.testing.assert_close(output, standard, rtol=0, atol=0)
     actual = em.GradEMCombine.apply(x, z, w, ids, order, eta)
@@ -69,10 +80,9 @@ def test_cuda_oracle_and_direct_autograd(candidate, e, k, dtype, case):
     assert w.grad is None
     if case == "g_zero":
         assert torch.count_nonzero(gx) == 0
-        if e == 1:
-            assert torch.count_nonzero(gz) == 0
-        else:
-            assert torch.count_nonzero(gz) > 0
+        assert torch.count_nonzero(gz) == 0
+    if k == 1:
+        assert torch.count_nonzero(gz) == 0
 
 
 @CUDA

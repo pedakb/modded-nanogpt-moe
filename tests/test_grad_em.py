@@ -21,7 +21,7 @@ def inputs(k=2, dtype=torch.float32):
     return logits, idx, outputs, g
 
 
-@pytest.mark.parametrize("k", [1, 2, 8])
+@pytest.mark.parametrize("k", [1, 2, 8, 12])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_exact_contract_and_support(k, dtype):
     z, idx, h, g = inputs(k, dtype)
@@ -33,22 +33,23 @@ def test_exact_contract_and_support(k, dtype):
     torch.testing.assert_close(result.v, v, rtol=2e-6, atol=1e-6)
     v_fp32 = (g[:, None, :].float() * h.float()).sum(-1)
     q = torch.softmax(z.float().gather(1, idx) - 0.2 * v_fp32, -1)
-    q_tilde = torch.zeros_like(z, dtype=torch.float32).scatter_(1, idx, q)
-    expected = (v_fp32, q, q_tilde, q[..., None] * g[:, None, :].float(),
-                (z.float().softmax(-1) - q_tilde) / 0.2)
+    a = torch.softmax(z.float().gather(1, idx), -1)
+    expected = (v_fp32, q, a, q[..., None] * g[:, None, :].float(),
+                torch.zeros_like(z, dtype=torch.float32).scatter_(1, idx, (a - q) / 0.2))
     for actual, wanted in zip(result, expected):
         assert actual.dtype == torch.float32
         torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
         assert torch.isfinite(actual).all()
     torch.testing.assert_close(result.q.sum(-1), torch.ones(3), rtol=0, atol=2e-7)
-    torch.testing.assert_close(result.q_tilde.sum(-1), torch.ones(3), rtol=0, atol=2e-7)
+    torch.testing.assert_close(result.a.sum(-1), torch.ones(3), rtol=0, atol=2e-7)
     inactive = torch.ones_like(z, dtype=torch.bool).scatter_(1, idx, False)
-    assert torch.count_nonzero(result.q_tilde[inactive]) == 0
+    assert torch.count_nonzero(result.grad_logits[inactive]) == 0
     full_expert_grads = torch.zeros(3, 12, 7).scatter_(
         1, idx[..., None].expand(-1, -1, 7), result.grad_expert)
     assert torch.count_nonzero(full_expert_grads[inactive]) == 0
     if k == 1:
         assert torch.equal(result.q, torch.ones_like(result.q))
+        assert torch.count_nonzero(result.grad_logits) == 0
 
 
 def test_hand_computed_dot_products():
@@ -83,58 +84,81 @@ def test_selected_logits_equivalent_to_log_probabilities_in_high_precision():
     torch.testing.assert_close(selected_q, log_p_q, rtol=1e-14, atol=1e-15)
 
 
-def test_full_kl_autograd_router_gradient_has_correct_sign_and_eta_scale():
+@pytest.mark.parametrize("k", [1, 2, 8, 12])
+def test_selected_kl_autograd_matches_reference_on_fixed_support(k):
     eta = 0.2
-    z = torch.tensor([[0.3, -0.7, 1.1], [-0.2, 0.4, 0.8]],
-                     dtype=torch.float64, requires_grad=True)
-    q = torch.tensor([[0.2, 0.5, 0.3], [0.6, 0.1, 0.3]], dtype=torch.float64)
-    loss = F.kl_div(F.log_softmax(z, dim=-1), q.detach(), reduction="sum") / eta
+    z, idx, h, g = inputs(k)
+    z.requires_grad_()
+    result = grad_em_reference(z, idx, h, g, eta)
+    loss = F.kl_div(F.log_softmax(z.gather(1, idx), dim=-1),
+                    result.q.detach(), reduction="sum") / eta
     (actual,) = torch.autograd.grad(loss, z)
-    p = torch.softmax(z.detach(), dim=-1)
-    expected = (p - q) / eta
-    old_wrong_sign = q - p
-    torch.testing.assert_close(actual, expected, rtol=1e-13, atol=1e-14)
-    assert not torch.allclose(actual, old_wrong_sign, rtol=1e-13, atol=1e-14)
+    # Independent log_softmax backward versus explicit FP32 softmax subtraction.
+    torch.testing.assert_close(actual, result.grad_logits, rtol=2e-6, atol=5e-7)
+    inactive = torch.ones_like(z, dtype=torch.bool).scatter_(1, idx, False)
+    assert torch.count_nonzero(actual[inactive]) == 0
 
 
-def test_sparse_router_gradient_scatter_includes_nonselected_experts():
+def test_selected_router_gradient_rejects_full_softmax_kl():
     eta = 0.25
-    z = torch.tensor([[1.2, -0.3, 0.4, 0.8]], dtype=torch.float64)
+    z = torch.tensor([[0.2, -0.1, 0., 0.1]], dtype=torch.float32)
     idx = torch.tensor([[0, 3]])
     h = torch.tensor([[[0.5, -0.2], [1.1, 0.7]]], dtype=torch.float64)
     g = torch.tensor([[0.4, -0.6]], dtype=torch.float64)
     result = grad_em_reference(z, idx, h, g, eta)
     p = torch.softmax(z.float(), dim=-1)
-    expected = (p - result.q_tilde) / eta
-    old_wrong_sign = result.q_tilde - p
+    assert p.gather(1, idx).sum() < 0.6
+    expected = torch.zeros_like(z).scatter_(1, idx, (result.a - result.q) / eta)
+    old_full_softmax = (p - torch.zeros_like(p).scatter_(1, idx, result.q)) / eta
     torch.testing.assert_close(result.grad_logits, expected, rtol=0, atol=0)
-    assert not torch.allclose(result.grad_logits, old_wrong_sign)
+    assert not torch.allclose(result.grad_logits, old_full_softmax)
     inactive = torch.ones_like(z, dtype=torch.bool).scatter_(1, idx, False)
-    torch.testing.assert_close(result.grad_logits[inactive], p[inactive] / eta,
-                               rtol=0, atol=0)
+    assert torch.count_nonzero(result.grad_logits[inactive]) == 0
 
 
-def test_router_gradient_inverse_eta_scaling_for_fixed_p_and_q():
-    z, idx, h, g = inputs()
-    zero_g = torch.zeros_like(g)
-    eta_01 = grad_em_reference(z, idx, h, zero_g, eta=0.1)
-    eta_02 = grad_em_reference(z, idx, h, zero_g, eta=0.2)
-    torch.testing.assert_close(eta_01.q, eta_02.q, rtol=0, atol=0)
-    torch.testing.assert_close(
-        eta_01.grad_logits, 2 * eta_02.grad_logits, rtol=1e-6, atol=1e-6)
+@pytest.mark.parametrize("k", [1, 2, 8, 12])
+def test_small_eta_recovers_normalized_topk_backward_in_high_precision(k):
+    z, idx, h, g = inputs(k, torch.float64)
+    selected = z.gather(1, idx).detach().requires_grad_()
+    v = (g[:, None, :] * h).sum(-1)
+    a = selected.softmax(-1)
+    # Ordinary normalized Top-K forward autograd, fixed support.
+    output = (a[..., None] * h).sum(1)
+    standard_z, = torch.autograd.grad(output, selected, g)
+    analytic = a * (v - (a * v).sum(-1, keepdim=True))
+    torch.testing.assert_close(standard_z, analytic, rtol=1e-13, atol=1e-14)
+    eta = 1e-5  # FP64 cancellation ~1e-11, well below the O(eta) truncation.
+    q = (selected.detach() - eta * v).softmax(-1)
+    torch.testing.assert_close((a.detach() - q) / eta, standard_z, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(q[..., None] * g[:, None, :],
+                               a.detach()[..., None] * g[:, None, :], rtol=2e-4, atol=2e-5)
+    if k > 1:
+        # Demonstrate convergence, not merely one within-tolerance sample.
+        errors = []
+        for step_eta in (1e-2, 1e-3, 1e-4):
+            step_q = (selected.detach() - step_eta * v).softmax(-1)
+            errors.append(((a.detach() - step_q) / step_eta - standard_z).norm())
+        assert errors[1] < errors[0] / 5
+        assert errors[2] < errors[1] / 5
 
 
-def test_zero_upstream_preserves_nonzero_router_gradient():
-    z, idx, h, g = inputs()
+def test_fp32_reference_small_eta_tracks_normalized_router_backward():
+    z, idx, h, g = inputs(8)
+    # A larger eta avoids dividing FP32 softmax roundoff by a tiny number.
+    result = grad_em_reference(z, idx, h, g, eta=1e-3)
+    standard = result.a * (result.v - (result.a * result.v).sum(-1, keepdim=True))
+    torch.testing.assert_close(result.grad_logits.gather(1, idx), standard,
+                               rtol=1e-2, atol=2e-3)
+
+
+@pytest.mark.parametrize("k", [1, 2, 8, 12])
+def test_zero_upstream_gives_zero_router_gradient(k):
+    z, idx, h, g = inputs(k)
     result = grad_em_reference(z, idx, h, torch.zeros_like(g))
     assert torch.count_nonzero(result.v) == 0
     assert torch.count_nonzero(result.grad_expert) == 0
     assert torch.equal(result.q, z.gather(1, idx).softmax(-1))
-    assert torch.count_nonzero(result.grad_logits) > 0
-    inactive = torch.ones_like(z, dtype=torch.bool).scatter_(1, idx, False)
-    torch.testing.assert_close(
-        result.grad_logits[inactive], z.softmax(-1)[inactive] / 0.1,
-        rtol=1e-6, atol=1e-7)
+    assert torch.count_nonzero(result.grad_logits) == 0
 
 
 def test_extreme_logits_do_not_take_log_of_underflowed_probabilities():
@@ -160,7 +184,7 @@ def test_q_is_detached_without_higher_order_graph_or_input_mutation():
         assert torch.equal(actual, expected)
 
 
-@pytest.mark.parametrize("eta", [0, -0.1, float("nan"), float("inf"), -float("inf"), True, "0.1"])
+@pytest.mark.parametrize("eta", [0, -0.1, float("nan"), float("inf"), -float("inf"), True, False, "0.1", None])
 def test_invalid_eta_rejected_by_reference_and_config(eta):
     with pytest.raises(ValueError, match="finite and positive"):
         grad_em_reference(*inputs(), eta=eta)
