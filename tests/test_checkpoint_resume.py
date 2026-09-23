@@ -1,4 +1,6 @@
+import os
 import random
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -92,17 +94,111 @@ def test_rng_state_round_trip_is_exact():
     torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
 
 
-def test_atomic_checkpoint_rotation_keeps_previous_completed_file(tmp_path):
-    first = {"format_version": CHECKPOINT_FORMAT_VERSION, "completed_updates": 1}
-    second = {"format_version": CHECKPOINT_FORMAT_VERSION, "completed_updates": 2}
+def test_atomic_checkpoint_retains_numbered_snapshots_and_hard_link_aliases(tmp_path):
+    first = {"format_version": CHECKPOINT_FORMAT_VERSION, "completed_updates": 250}
+    second = {"format_version": CHECKPOINT_FORMAT_VERSION, "completed_updates": 500}
+    third = {"format_version": CHECKPOINT_FORMAT_VERSION, "completed_updates": 750}
+
     atomic_save_checkpoint(first, tmp_path)
+    assert (tmp_path / "step_000250.pt").exists()
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)["completed_updates"] == 250
+    assert not (tmp_path / "previous.pt").exists()
+    assert os.stat(tmp_path / "latest.pt").st_ino == os.stat(
+        tmp_path / "step_000250.pt").st_ino
+
     atomic_save_checkpoint(second, tmp_path)
+    assert sorted(path.name for path in tmp_path.glob("step_*.pt")) == [
+        "step_000250.pt", "step_000500.pt"]
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)["completed_updates"] == 500
+    assert torch.load(tmp_path / "previous.pt", weights_only=False)["completed_updates"] == 250
+    assert os.stat(tmp_path / "latest.pt").st_ino == os.stat(
+        tmp_path / "step_000500.pt").st_ino
+    assert os.stat(tmp_path / "previous.pt").st_ino == os.stat(
+        tmp_path / "step_000250.pt").st_ino
+
+    atomic_save_checkpoint(third, tmp_path)
+    numbered_paths = sorted(tmp_path.glob("step_*.pt"))
+    assert [path.name for path in numbered_paths] == [
+        "step_000250.pt", "step_000500.pt", "step_000750.pt"]
+    assert [
+        torch.load(path, weights_only=False)["completed_updates"]
+        for path in numbered_paths
+    ] == [250, 500, 750]
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)["completed_updates"] == 750
+    assert torch.load(tmp_path / "previous.pt", weights_only=False)["completed_updates"] == 500
+    assert os.stat(tmp_path / "latest.pt").st_ino == os.stat(
+        tmp_path / "step_000750.pt").st_ino
+    assert os.stat(tmp_path / "previous.pt").st_ino == os.stat(
+        tmp_path / "step_000500.pt").st_ino
+    assert not list(tmp_path.glob(".*.tmp"))
+
+    with pytest.raises(FileExistsError, match="step_000250.pt"):
+        atomic_save_checkpoint(first, tmp_path)
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)["completed_updates"] == 750
+    assert torch.load(tmp_path / "previous.pt", weights_only=False)["completed_updates"] == 500
+
+
+def test_atomic_checkpoint_same_latest_step_is_idempotent(tmp_path):
+    checkpoint = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "completed_updates": 3250,
+    }
+    first_path = atomic_save_checkpoint(checkpoint, tmp_path)
+    first_inode = os.stat(first_path).st_ino
+
+    second_path = atomic_save_checkpoint(checkpoint, tmp_path)
+
+    assert second_path == first_path
+    assert os.stat(second_path).st_ino == first_inode
+    assert [path.name for path in tmp_path.glob("step_*.pt")] == [
+        "step_003250.pt"]
+    assert not (tmp_path / "previous.pt").exists()
+
+
+def test_atomic_checkpoint_alias_failure_preserves_last_good_rotation(
+        tmp_path, monkeypatch):
+    atomic_save_checkpoint({"completed_updates": 250}, tmp_path)
+    atomic_save_checkpoint({"completed_updates": 500}, tmp_path)
+    latest_inode = os.stat(tmp_path / "latest.pt").st_ino
+    previous_inode = os.stat(tmp_path / "previous.pt").st_ino
+    real_replace = os.replace
+
+    def fail_latest_alias(source, destination):
+        if Path(destination).name == "latest.pt":
+            raise OSError("injected latest-alias failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_latest_alias)
+    with pytest.raises(OSError, match="injected latest-alias failure"):
+        atomic_save_checkpoint({"completed_updates": 750}, tmp_path)
 
     latest = torch.load(tmp_path / "latest.pt", weights_only=False)
     previous = torch.load(tmp_path / "previous.pt", weights_only=False)
-    assert latest["completed_updates"] == 2
-    assert previous["completed_updates"] == 1
-    assert not list(tmp_path.glob(".checkpoint-*.tmp"))
+    assert latest["completed_updates"] == 500
+    assert previous["completed_updates"] == 250
+    assert os.stat(tmp_path / "latest.pt").st_ino == latest_inode
+    assert os.stat(tmp_path / "previous.pt").st_ino == previous_inode
+    assert sorted(path.name for path in tmp_path.glob("step_*.pt")) == [
+        "step_000250.pt", "step_000500.pt"]
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_legacy_alias_only_checkpoint_directory_remains_compatible(tmp_path):
+    torch.save({"completed_updates": 250}, tmp_path / "previous.pt")
+    torch.save({"completed_updates": 500}, tmp_path / "latest.pt")
+
+    assert torch.load(tmp_path / "previous.pt", weights_only=False)[
+        "completed_updates"] == 250
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)[
+        "completed_updates"] == 500
+
+    atomic_save_checkpoint({"completed_updates": 750}, tmp_path)
+
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)[
+        "completed_updates"] == 750
+    assert torch.load(tmp_path / "previous.pt", weights_only=False)[
+        "completed_updates"] == 500
+    assert (tmp_path / "step_000750.pt").exists()
 
 
 def test_checkpoint_config_requires_exact_schedule_and_model_match():

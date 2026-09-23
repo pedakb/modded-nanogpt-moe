@@ -72,7 +72,9 @@ trainer implementation or a legacy wrapper unless compatibility requires it.
 - Checkpoints are written only after completed optimizer updates with cleared
   gradients. They include unwrapped model state, both optimizers, schedule and
   counters, relocatable loader state, RNG state, timing, run identity, and
-  environment metadata. Saves atomically rotate `latest.pt` to `previous.pt`.
+  environment metadata. Each save retains `step_NNNNNN.pt`; `latest.pt` and
+  `previous.pt` are atomically updated hard-link aliases, avoiding duplicate
+  multi-GB payloads while keeping the existing resume paths.
 - Checkpoint/resume, reproducibility snapshots, and Nsight capture currently
   support one GPU and one trial. Reject unsupported combinations clearly.
 - TensorBoard is rank-zero only. A new run refuses to reuse an existing

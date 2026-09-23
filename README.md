@@ -187,7 +187,11 @@ scripts/vista/train.sh --submit \
   configs/moe_e64k8_r0.5.toml
 ```
 
-`latest.pt` and `previous.pt` rotate atomically. Resume restores the saved run
+Each successful save retains one `step_NNNNNN.pt` payload. `latest.pt` and
+`previous.pt` are atomically updated hard-link aliases to the newest two saved
+steps, so resume convenience does not duplicate multi-GB payloads. Resume can
+also use a numbered snapshot directly. Existing directories containing only
+`latest.pt` and `previous.pt` remain loadable. Resume restores the saved run
 identity, model, both optimizers, loader cursor, RNG, and timing. Resume is
 enabled only by `--resume`; stale checkpoint variables are not inherited from
 the parent shell. Effective cadence precedence is

@@ -57,12 +57,48 @@ def collect_environment_metadata():
     return metadata
 
 
+def _fsync_directory(path):
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _temporary_hard_link(source, checkpoint_dir, prefix):
+    descriptor, path = tempfile.mkstemp(
+        prefix=prefix, suffix=".tmp", dir=checkpoint_dir)
+    os.close(descriptor)
+    os.unlink(path)
+    os.link(source, path)
+    return Path(path)
+
+
 def atomic_save_checkpoint(payload, checkpoint_dir: str | Path):
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    completed_updates = payload.get("completed_updates")
+    if (isinstance(completed_updates, bool)
+            or not isinstance(completed_updates, int)
+            or completed_updates < 0):
+        raise ValueError("checkpoint completed_updates must be a nonnegative integer")
+    numbered = checkpoint_dir / f"step_{completed_updates:06d}.pt"
     latest = checkpoint_dir / "latest.pt"
     previous = checkpoint_dir / "previous.pt"
     temporary_path = None
+    temporary_links = []
+    numbered_created = False
+    previous_replaced = False
+    latest_replaced = False
+    old_latest_existed = latest.exists()
+    old_previous_existed = previous.exists()
+    old_latest_backup = None
+    old_previous_backup = None
+    if numbered.exists():
+        if latest.exists() and os.path.samefile(numbered, latest):
+            return latest
+        raise FileExistsError(
+            f"refusing to overwrite existing checkpoint snapshot: {numbered}")
     try:
         with tempfile.NamedTemporaryFile(
                 mode="w+b", prefix=".checkpoint-", suffix=".tmp",
@@ -71,18 +107,88 @@ def atomic_save_checkpoint(payload, checkpoint_dir: str | Path):
             torch.save(payload, temporary)
             temporary.flush()
             os.fsync(temporary.fileno())
-        if latest.exists():
-            os.replace(latest, previous)
-        os.replace(temporary_path, latest)
-        directory_fd = os.open(checkpoint_dir, os.O_RDONLY)
+        # Linking the fully flushed temporary file creates the persistent
+        # numbered snapshot atomically without copying its payload.
+        os.link(temporary_path, numbered)
+        numbered_created = True
+        temporary_path.unlink()
+        temporary_path = None
+        _fsync_directory(checkpoint_dir)
+
+        if old_latest_existed:
+            old_latest_backup = _temporary_hard_link(
+                latest, checkpoint_dir, ".latest-backup-")
+            temporary_links.append(old_latest_backup)
+        if old_previous_existed:
+            old_previous_backup = _temporary_hard_link(
+                previous, checkpoint_dir, ".previous-backup-")
+            temporary_links.append(old_previous_backup)
+
+        new_latest = _temporary_hard_link(
+            numbered, checkpoint_dir, ".latest-link-")
+        temporary_links.append(new_latest)
+        new_previous = None
+        if old_latest_existed:
+            new_previous = _temporary_hard_link(
+                latest, checkpoint_dir, ".previous-link-")
+            temporary_links.append(new_previous)
+
+        # Update previous first. Until latest is replaced, an interruption
+        # still leaves latest pointing to the last successfully saved payload.
+        if new_previous is not None:
+            os.replace(new_previous, previous)
+            temporary_links.remove(new_previous)
+            previous_replaced = True
+            _fsync_directory(checkpoint_dir)
+        os.replace(new_latest, latest)
+        temporary_links.remove(new_latest)
+        latest_replaced = True
+        _fsync_directory(checkpoint_dir)
+
+        # Backups are only needed to roll back a handled alias-update failure.
+        for backup in (old_latest_backup, old_previous_backup):
+            if backup is not None and backup.exists():
+                try:
+                    backup.unlink()
+                    temporary_links.remove(backup)
+                except OSError:
+                    # A stale hidden hard link is harmless; the checkpoint and
+                    # public aliases are already durable at this point.
+                    pass
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            _fsync_directory(checkpoint_dir)
+        except OSError:
+            pass
         return latest
     except BaseException:
+        # Best-effort rollback preserves the exact aliases when an ordinary
+        # Python/filesystem error interrupts their update. A process-level
+        # interruption still leaves every visible alias pointing to a fully
+        # materialized inode because each replacement is atomic.
+        if latest_replaced:
+            if old_latest_backup is not None and old_latest_backup.exists():
+                os.replace(old_latest_backup, latest)
+                if old_latest_backup in temporary_links:
+                    temporary_links.remove(old_latest_backup)
+            elif not old_latest_existed:
+                latest.unlink(missing_ok=True)
+        if previous_replaced:
+            if old_previous_backup is not None and old_previous_backup.exists():
+                os.replace(old_previous_backup, previous)
+                if old_previous_backup in temporary_links:
+                    temporary_links.remove(old_previous_backup)
+            elif not old_previous_existed:
+                previous.unlink(missing_ok=True)
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink()
+        for temporary_link in temporary_links:
+            temporary_link.unlink(missing_ok=True)
+        if numbered_created:
+            numbered.unlink(missing_ok=True)
+        try:
+            _fsync_directory(checkpoint_dir)
+        except OSError:
+            pass
         raise
 
 
