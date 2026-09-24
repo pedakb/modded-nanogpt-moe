@@ -517,10 +517,24 @@ def main(argv=None):
         # create the optimizer(s)
         optimizers = build_optimizers(model, optimizer_config)
         router_weights = moe_router_weights(model)
+        router_weight_lr = None
+        if optimizer_config["router_optimizer"] == "adamw" and router_weights:
+            router_weight_set = set(router_weights)
+            matching_groups = [
+                group for group in optimizers[0].param_groups
+                if router_weight_set and router_weight_set <= set(group["params"])
+            ]
+            assert len(matching_groups) == 1
+            router_weight_lr = matching_groups[0]["lr"]
+        router_lr_report = (
+            f"; router weight lr={router_weight_lr:g}"
+            if router_weight_lr is not None else ""
+        )
         print0(
             f"Router optimizer: {optimizer_config['router_optimizer']}; "
             f"router weight tensors={len(router_weights)}, "
-            f"elements={sum(p.numel() for p in router_weights)}; "
+            f"elements={sum(p.numel() for p in router_weights)}"
+            f"{router_lr_report}; "
             "optimizer parameter ownership verified exclusive",
             console=True,
         )

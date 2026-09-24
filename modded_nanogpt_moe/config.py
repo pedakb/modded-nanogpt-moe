@@ -51,6 +51,7 @@ DEFAULT_CONFIG = {
     },
     "optimizers": {
         "router_optimizer": "muon",
+        "router_adamw_lr": None,
         "adamw": {
             "group_lrs": [0.7, 0.004, 0.015],
             "betas": [0.8, 0.95],
@@ -189,6 +190,13 @@ def validate_experiment_config(config, require_run_name=False):
 
     if config["optimizers"]["router_optimizer"] not in ("muon", "adamw"):
         raise ValueError("optimizers.router_optimizer must be 'muon' or 'adamw'")
+    router_adamw_lr = config["optimizers"]["router_adamw_lr"]
+    if router_adamw_lr is not None and (
+            isinstance(router_adamw_lr, bool)
+            or not isinstance(router_adamw_lr, (int, float))
+            or not math.isfinite(router_adamw_lr)
+            or router_adamw_lr <= 0):
+        raise ValueError("optimizers.router_adamw_lr must be finite and positive")
     adamw = config["optimizers"]["adamw"]
     muon = config["optimizers"]["muon"]
     if len(adamw["group_lrs"]) != 3:

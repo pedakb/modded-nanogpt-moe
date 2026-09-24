@@ -58,10 +58,16 @@ def assert_exact(actual, expected):
 
 
 def test_default_and_toml_router_optimizer(tmp_path):
-    assert load_experiment_config()["optimizers"]["router_optimizer"] == "muon"
+    defaults = load_experiment_config()["optimizers"]
+    assert defaults["router_optimizer"] == "muon"
+    assert defaults["router_adamw_lr"] is None
     path = tmp_path / "router.toml"
-    path.write_text('run_name = "test"\n[optimizers]\nrouter_optimizer = "adamw"\n')
-    assert load_experiment_config(path)["optimizers"]["router_optimizer"] == "adamw"
+    path.write_text(
+        'run_name = "test"\n[optimizers]\n'
+        'router_optimizer = "adamw"\nrouter_adamw_lr = 0.003\n')
+    optimizers = load_experiment_config(path)["optimizers"]
+    assert optimizers["router_optimizer"] == "adamw"
+    assert optimizers["router_adamw_lr"] == 0.003
 
 
 @pytest.mark.parametrize("value", ['"sgd"', '"AdamW"', "true", "1", "[]"])
@@ -72,6 +78,64 @@ def test_invalid_router_optimizer(tmp_path, value):
         load_experiment_config(path)
     with pytest.raises(ValueError, match="optimizers.router_optimizer"):
         build_optimizers(make_model(), optimizer_config("sgd"))
+
+
+@pytest.mark.parametrize("value", ["0", "-0.1", "true", '"0.003"', "inf", "nan", "[]"])
+def test_invalid_router_adamw_lr(tmp_path, value):
+    path = tmp_path / "invalid.toml"
+    path.write_text(
+        f'run_name = "test"\n[optimizers]\nrouter_adamw_lr = {value}\n')
+    with pytest.raises(ValueError, match="optimizers.router_adamw_lr"):
+        load_experiment_config(path)
+
+    config = optimizer_config("adamw")
+    config["router_adamw_lr"] = 0
+    with pytest.raises(ValueError, match="optimizers.router_adamw_lr"):
+        build_optimizers(make_model(), config)
+
+
+def test_dedicated_router_adamw_lr_preserves_all_other_ownership_and_lrs():
+    model = make_model(layout="packed")
+    muon = build_optimizers(model, optimizer_config("muon"))
+    shared = build_optimizers(model, optimizer_config("adamw"))
+    dedicated_config = optimizer_config("adamw")
+    dedicated_config["router_adamw_lr"] = 0.003
+    dedicated = build_optimizers(model, dedicated_config)
+
+    routers = set(moe_router_weights(model))
+    biases = {module.router.bias for module in model.modules() if isinstance(module, MoE)}
+    assert len(shared[0].param_groups) == 3
+    assert routers <= set(shared[0].param_groups[2]["params"])
+    assert shared[0].param_groups[2]["lr"] == 0.015
+    assert len(dedicated[0].param_groups) == 4
+    assert set(dedicated[0].param_groups[3]["params"]) == routers
+    assert dedicated[0].param_groups[3]["lr"] == 0.003
+    assert biases <= set(dedicated[0].param_groups[2]["params"])
+    assert dedicated[0].param_groups[2]["lr"] == 0.015
+
+    muon_params = set(muon[1].param_groups[0]["params"])
+    dedicated_muon_params = set(dedicated[1].param_groups[0]["params"])
+    assert muon_params - routers == dedicated_muon_params
+    for group_index in (0, 1):
+        assert dedicated[0].param_groups[group_index]["params"] == muon[0].param_groups[group_index]["params"]
+        assert dedicated[0].param_groups[group_index]["lr"] == muon[0].param_groups[group_index]["lr"]
+    assert set(dedicated[0].param_groups[2]["params"]) == set(muon[0].param_groups[2]["params"])
+
+    for optimizers in (muon, shared, dedicated):
+        assigned = [p for opt in optimizers for group in opt.param_groups for p in group["params"]]
+        assert len(assigned) == len(set(assigned)) == len(list(model.parameters()))
+        assert set(assigned) == set(model.parameters())
+
+
+def test_router_adamw_lr_does_not_affect_muon_ownership():
+    model = make_model()
+    baseline = build_optimizers(model, optimizer_config("muon"))
+    configured = optimizer_config("muon")
+    configured["router_adamw_lr"] = 0.003
+    with_router_lr = build_optimizers(model, configured)
+    assert groups(baseline) == groups(with_router_lr)
+    for a, b in zip(baseline, with_router_lr):
+        assert_exact(a.state_dict(), b.state_dict())
 
 
 @pytest.mark.parametrize("layout", ["modulelist", "packed"])
@@ -136,6 +200,7 @@ def test_router_ownership_checkpoint_restore(tmp_path, saved_owner):
     config = optimizer_config(saved_owner or "muon")
     if saved_owner is None:
         del config["router_optimizer"]
+        del config["router_adamw_lr"]
     optimizers = build_optimizers(model, config)
     # Exercise real AdamW moments (including router weights in ablation mode).
     for group in optimizers[0].param_groups:
@@ -181,9 +246,30 @@ def test_resume_rejects_changed_ownership(saved_owner, current_owner):
     saved = {"optimizers": optimizer_config(saved_owner)}
     if saved_owner is None:
         del saved["optimizers"]["router_optimizer"]
+        del saved["optimizers"]["router_adamw_lr"]
     checkpoint = {"format_version": CHECKPOINT_FORMAT_VERSION, "resolved_config": saved}
     with pytest.raises(ValueError, match="configuration is incompatible"):
         validate_checkpoint_config(checkpoint, {"optimizers": optimizer_config(current_owner)})
+
+
+def test_legacy_checkpoint_without_router_adamw_lr_is_compatible():
+    saved = {"optimizers": optimizer_config("adamw")}
+    del saved["optimizers"]["router_adamw_lr"]
+    checkpoint = {"format_version": CHECKPOINT_FORMAT_VERSION, "resolved_config": saved}
+    validate_checkpoint_config(
+        checkpoint, {"optimizers": optimizer_config("adamw")})
+
+
+def test_resume_rejects_changed_dedicated_router_lr():
+    saved = optimizer_config("adamw")
+    saved["router_adamw_lr"] = 0.003
+    checkpoint = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "resolved_config": {"optimizers": saved},
+    }
+    with pytest.raises(ValueError, match="configuration is incompatible"):
+        validate_checkpoint_config(
+            checkpoint, {"optimizers": optimizer_config("adamw")})
 
 
 def test_ablation_config_changes_only_requested_settings():
@@ -197,3 +283,15 @@ def test_ablation_config_changes_only_requested_settings():
     actual = load_experiment_config(root / "moe_e64k8_r0.5_gradem_eta0.01_router_adamw.toml")
     assert actual == expected
     assert actual["training"]["total_steps"] == 3250
+
+
+def test_dedicated_lr_config_changes_only_router_lr_and_run_name():
+    root = Path(__file__).resolve().parents[1] / "configs"
+    reference = load_experiment_config(
+        root / "moe_e64k8_r0.5_gradem_eta0.01_router_adamw.toml")
+    expected = copy.deepcopy(reference)
+    expected["run_name"] = "ge-eta01-adamw-lr003"
+    expected["optimizers"]["router_adamw_lr"] = 0.003
+    actual = load_experiment_config(
+        root / "moe_e64k8_r0.5_gradem_eta0.01_router_adamw_lr0.003.toml")
+    assert actual == expected

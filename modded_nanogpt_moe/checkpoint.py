@@ -200,6 +200,7 @@ def _with_legacy_defaults(config):
         config["model"].setdefault("grad_em_eta", 0.1)
     if isinstance(config, dict) and isinstance(config.get("optimizers"), dict):
         config["optimizers"].setdefault("router_optimizer", "muon")
+        config["optimizers"].setdefault("router_adamw_lr", None)
     return config
 
 

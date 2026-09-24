@@ -1,5 +1,7 @@
 """Muon and the active trainer's optimizer construction."""
 
+import math
+
 import torch
 import torch.distributed as dist
 from torch import Tensor
@@ -129,6 +131,13 @@ def build_optimizers(model, config=None):
     router_optimizer = config.get("router_optimizer", "muon")
     if router_optimizer not in ("muon", "adamw"):
         raise ValueError("optimizers.router_optimizer must be 'muon' or 'adamw'")
+    router_adamw_lr = config.get("router_adamw_lr")
+    if router_adamw_lr is not None and (
+            isinstance(router_adamw_lr, bool)
+            or not isinstance(router_adamw_lr, (int, float))
+            or not math.isfinite(router_adamw_lr)
+            or router_adamw_lr <= 0):
+        raise ValueError("optimizers.router_adamw_lr must be finite and positive")
     adamw_router_weights = set(moe_router_weights(model)) if router_optimizer == "adamw" else set()
     embed_lr, head_lr, scalar_lr = adamw["group_lrs"]
     packed_experts = [module for module in model.modules()
@@ -137,11 +146,20 @@ def build_optimizers(model, config=None):
                      for p in (module.fc_bias, module.proj_bias)}
     packed_weights = {p for module in packed_experts
                       for p in (module.fc_weight, module.proj_weight)}
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=embed_lr),
-                        dict(params=[model.proj.weight], lr=head_lr),
-                        dict(params=[p for p in model.parameters()
-                                     if p.ndim < 2 or p in packed_biases
-                                     or p in adamw_router_weights], lr=scalar_lr)],
+    adamw_groups = [
+        dict(params=[model.embed.weight], lr=embed_lr),
+        dict(params=[model.proj.weight], lr=head_lr),
+        dict(params=[p for p in model.parameters()
+                     if p.ndim < 2 or p in packed_biases
+                     or (p in adamw_router_weights and router_adamw_lr is None)],
+             lr=scalar_lr),
+    ]
+    if adamw_router_weights and router_adamw_lr is not None:
+        adamw_groups.append(dict(
+            params=[p for p in model.parameters() if p in adamw_router_weights],
+            lr=router_adamw_lr,
+        ))
+    optimizer1 = AdamW(adamw_groups,
                        betas=tuple(adamw["betas"]), eps=adamw["eps"],
                        weight_decay=adamw["weight_decay"], fused=adamw["fused"])
     optimizer2 = Muon([p for p in model.blocks.parameters()

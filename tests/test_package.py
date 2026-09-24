@@ -810,6 +810,7 @@ def test_production_configs_share_training_policy(filename, run_name, ratio, exp
     }
     assert config["optimizers"] == {
         "router_optimizer": "muon",
+        "router_adamw_lr": None,
         "adamw": dict(group_lrs=[0.7, 0.004, 0.015], betas=[0.8, 0.95],
                       eps=1e-10, weight_decay=0.001, fused=True),
         "muon": dict(lr=0.025, weight_decay=0.05, mu=0.95),

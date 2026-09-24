@@ -55,7 +55,10 @@ to existing AdamW group 2, with its unchanged LR 0.015, betas (0.8, 0.95),
 epsilon 1e-10, weight decay 0.001, and shared LR schedule. Router biases already
 belong to that group. Experts, other parameters, and both standard/Grad-EM
 backward rules are unchanged. Startup reports router weight tensor/element
-counts; construction checks exclusive and complete optimizer ownership.
+counts and the resolved router-weight LR; construction checks exclusive and
+complete optimizer ownership. Setting the optional `router_adamw_lr` creates a
+dedicated AdamW group for router weights at that LR. Omitting it preserves the
+existing scalar-group behavior exactly.
 
 For example (within the corresponding TOML tables):
 
@@ -66,11 +69,14 @@ grad_em_eta = 0.01
 
 [optimizers]
 router_optimizer = "adamw"
+router_adamw_lr = 0.003
 ```
 
 `configs/moe_e64k8_r0.5_gradem_eta0.01_router_adamw.toml` supplies the full
 E64/K8 packed experiment, with a unique run name, 3250-update horizon and
-checkpoint interval 50. For a 500-update prefix, use the package entry point
+checkpoint interval 50. The corresponding dedicated-LR experiment is
+`configs/moe_e64k8_r0.5_gradem_eta0.01_router_adamw_lr0.003.toml`. For a
+500-update prefix, use the package entry point
 with `STOP_AFTER_COMPLETED_UPDATES=500` and a Stockyard `CHECKPOINT_DIR`.
 Do not use `TRAIN_STEPS_OVERRIDE=500` (changes the schedule) or Vista
 `train.sh --steps` (disables periodic checkpoints). Vista package launches
