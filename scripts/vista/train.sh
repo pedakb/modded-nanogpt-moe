@@ -7,10 +7,6 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-script_path="$repo_root/scripts/vista/train.sh"
-cd "$repo_root"
-
 usage() {
     cat >&2 <<'EOF'
 Usage: scripts/vista/train.sh [options] [CONFIG ...]
@@ -33,6 +29,7 @@ EOF
 
 submit=0
 worker=0
+worker_repo_root=""
 benchmark_worker=0
 walltime=""
 walltime_set=0
@@ -105,6 +102,14 @@ while [[ $# -gt 0 ]]; do
             worker=1
             shift
             ;;
+        --worker-repo-root)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "Error: --worker-repo-root requires a nonempty path" >&2
+                exit 2
+            fi
+            worker_repo_root="$2"
+            shift 2
+            ;;
         --benchmark-worker)
             benchmark_worker=1
             shift
@@ -129,6 +134,26 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -n "$worker_repo_root" && "$worker" -ne 1 ]]; then
+    echo "Error: --worker-repo-root requires internal worker mode" >&2
+    exit 2
+fi
+if [[ -n "$worker_repo_root" ]]; then
+    if [[ ! -d "$worker_repo_root" ]]; then
+        echo "Error: worker repository root not found: $worker_repo_root" >&2
+        exit 2
+    fi
+    repo_root="$(cd "$worker_repo_root" && pwd)"
+else
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fi
+script_path="$repo_root/scripts/vista/train.sh"
+if [[ ! -f "$script_path" || ! -f "$repo_root/scripts/vista/env.sh" ]]; then
+    echo "Error: invalid repository root: $repo_root" >&2
+    exit 2
+fi
+cd "$repo_root"
 
 if [[ "$submit" -eq 1 && "$worker" -eq 1 ]]; then
     echo "Error: --submit and internal worker mode cannot be combined" >&2
@@ -247,7 +272,7 @@ if [[ "$submit" -eq 1 ]]; then
     if [[ ${#sbatch_options[@]} -gt 0 ]]; then
         submission+=("${sbatch_options[@]}")
     fi
-    submission+=("$script_path" --worker)
+    submission+=("$script_path" --worker --worker-repo-root "$repo_root")
     if [[ -n "$checkpoint_interval" ]]; then
         submission+=(--checkpoint-interval "$checkpoint_interval")
     fi

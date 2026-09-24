@@ -512,9 +512,60 @@ def test_vista_launcher_submits_itself_as_nonrecursive_worker(tmp_path, mail_use
         "--job-name=dense-moe comparison", "--account=allocation", "--partition=gh", "--exclusive",
         str(launcher),
         "--worker",
+        "--worker-repo-root",
+        str(repository_root),
         "--",
         str(repository_root / "configs/dense_baseline.toml"),
         str(repository_root / "configs/moe_e8k2_r2.toml"),
+    ]
+
+
+def test_vista_worker_uses_submit_side_root_when_slurm_copies_script(tmp_path):
+    repository_root = Path(__file__).resolve().parents[1]
+    launcher = repository_root / "scripts/vista/train.sh"
+    spool_script = tmp_path / "var/spool/slurmd/job123/slurm_script"
+    spool_script.parent.mkdir(parents=True)
+    spool_script.write_text(launcher.read_text())
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    module = fake_bin / "module"
+    module.write_text("#!/usr/bin/env bash\nexit 0\n")
+    module.chmod(0o755)
+    uv = fake_bin / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$PWD\" \"${DATA_ROOT-}\" \"$@\" "
+        "> \"$LAUNCH_CAPTURE\"\n"
+    )
+    uv.chmod(0o755)
+
+    capture = tmp_path / "worker-launch.txt"
+    environment = os.environ.copy()
+    environment.update(
+        PATH=f"{fake_bin}{os.pathsep}{environment['PATH']}",
+        LAUNCH_CAPTURE=str(capture),
+        SLURM_JOB_ID="123",
+        STOCKYARD=str(tmp_path / "stockyard"),
+    )
+
+    subprocess.run(
+        [
+            "bash", str(spool_script), "--worker", "--worker-repo-root",
+            str(repository_root), "--",
+            str(repository_root / "configs/dense_baseline.toml"),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+    )
+
+    captured = capture.read_text().splitlines()
+    assert captured[:2] == [str(repository_root), str(repository_root)]
+    assert captured[2:] == [
+        "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
+        "--module", "modded_nanogpt_moe.train", "--config",
+        str(repository_root / "configs/dense_baseline.toml"),
     ]
 
 
@@ -538,6 +589,7 @@ def test_vista_submission_email_options_without_cluster_setup(tmp_path, mail_use
         environment["SLURM_MAIL_USER"] = mail_user
     setup = ('set -euo pipefail\nsubmit=1\nwalltime_set=0\nsbatch_options=()\n'
              'script_path="/repo with spaces/scripts/vista/train.sh"\n'
+             'repo_root="/repo with spaces"\n'
              'checkpoint_interval=""\nresume_checkpoint=""\n'
              'config_paths=("/repo with spaces/config.toml")\n')
     result = subprocess.run(["bash", "-c", setup + source[start:end]],
@@ -545,7 +597,8 @@ def test_vista_submission_email_options_without_cluster_setup(tmp_path, mail_use
     assert result.returncode == 23  # sbatch status is preserved, no real submission.
     assert capture.read_text().splitlines() == [
         *([f"--mail-user={mail_user}", "--mail-type=ALL"] if mail_user else []),
-        "/repo with spaces/scripts/vista/train.sh", "--worker", "--",
+        "/repo with spaces/scripts/vista/train.sh", "--worker",
+        "--worker-repo-root", "/repo with spaces", "--",
         "/repo with spaces/config.toml",
     ]
 
