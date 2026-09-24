@@ -50,6 +50,7 @@ DEFAULT_CONFIG = {
         "validation_shard_pattern": "data/fineweb10B/fineweb_val_*.bin",
     },
     "optimizers": {
+        "router_optimizer": "muon",
         "adamw": {
             "group_lrs": [0.7, 0.004, 0.015],
             "betas": [0.8, 0.95],
@@ -186,6 +187,8 @@ def validate_experiment_config(config, require_run_name=False):
         if not isinstance(config["training"][key], str) or not config["training"][key]:
             raise ValueError(f"training.{key} must be a nonempty string")
 
+    if config["optimizers"]["router_optimizer"] not in ("muon", "adamw"):
+        raise ValueError("optimizers.router_optimizer must be 'muon' or 'adamw'")
     adamw = config["optimizers"]["adamw"]
     muon = config["optimizers"]["muon"]
     if len(adamw["group_lrs"]) != 3:

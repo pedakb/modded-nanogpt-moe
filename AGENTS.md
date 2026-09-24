@@ -67,6 +67,10 @@ trainer implementation or a legacy wrapper unless compatibility requires it.
   `[out,in]` orientation, including its aspect-ratio scale and 12 Newton--Schulz
   iterations. Muon momentum is persistent checkpoint state. Reconstruct packed
   orientation metadata through `build_optimizers` when loading a checkpoint.
+  `optimizers.router_optimizer` defaults to `"muon"`; the `"adamw"` ablation
+  moves only MoE router weights into existing AdamW group 2. Router biases
+  remain there in both modes. Ownership is exclusive; legacy checkpoint
+  metadata defaults to Muon, and changing ownership on resume is rejected.
 - Attention defaults to `head_dim=128` and must reject configurations that
   produce zero heads before scaled-dot-product attention executes.
 - Checkpoints are written only after completed optimizer updates with cleared

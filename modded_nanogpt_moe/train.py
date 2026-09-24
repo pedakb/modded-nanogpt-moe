@@ -31,7 +31,7 @@ from .model import (
     GPT, eager_prefix, initialize_model_parameters, make_head_loss, nsys_range, resolve_mlp_hidden_dim,
     set_moe_nsys_capture_active,
 )
-from .optim import build_optimizers
+from .optim import build_optimizers, moe_router_weights
 
 
 def benchmark_settings_from_environment(environment=None):
@@ -516,6 +516,14 @@ def main(argv=None):
     
         # create the optimizer(s)
         optimizers = build_optimizers(model, optimizer_config)
+        router_weights = moe_router_weights(model)
+        print0(
+            f"Router optimizer: {optimizer_config['router_optimizer']}; "
+            f"router weight tensors={len(router_weights)}, "
+            f"elements={sum(p.numel() for p in router_weights)}; "
+            "optimizer parameter ownership verified exclusive",
+            console=True,
+        )
     
         # learning rate schedule: stable then decay
         def set_hparams(step, cooldown_frac=training_config["cooldown_fraction"]):

@@ -47,6 +47,42 @@ relative; the application does not depend on the symlink's physical target.
 
 ## Training
 
+### Router optimizer ablation
+
+`[optimizers] router_optimizer = "muon"` is the default. Selecting `"adamw"`
+moves only MoE router weights (`blocks.<layer>.mlp.router.weight`) from Muon
+to existing AdamW group 2, with its unchanged LR 0.015, betas (0.8, 0.95),
+epsilon 1e-10, weight decay 0.001, and shared LR schedule. Router biases already
+belong to that group. Experts, other parameters, and both standard/Grad-EM
+backward rules are unchanged. Startup reports router weight tensor/element
+counts; construction checks exclusive and complete optimizer ownership.
+
+For example (within the corresponding TOML tables):
+
+```toml
+[model]
+moe_backward = "grad_em"
+grad_em_eta = 0.01
+
+[optimizers]
+router_optimizer = "adamw"
+```
+
+`configs/moe_e64k8_r0.5_gradem_eta0.01_router_adamw.toml` supplies the full
+E64/K8 packed experiment, with a unique run name, 3250-update horizon and
+checkpoint interval 50. For a 500-update prefix, use the package entry point
+with `STOP_AFTER_COMPLETED_UPDATES=500` and a Stockyard `CHECKPOINT_DIR`.
+Do not use `TRAIN_STEPS_OVERRIDE=500` (changes the schedule) or Vista
+`train.sh --steps` (disables periodic checkpoints). Vista package launches
+need `MOE_GMM_IMPLEMENTATION=torch` scoped to the training process.
+
+Legacy checkpoints missing this setting mean `"muon"`. Resume restores the
+existing optimizer state and original schedule; a different router optimizer
+is rejected rather than silently migrating state. Dense models accept either
+setting without changing their grouping.
+
+### Launching training
+
 Run from the repository root. A single-GPU dense baseline is:
 
 ```bash

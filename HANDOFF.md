@@ -1,15 +1,41 @@
 # Current handoff
 
-Updated: 2026-09-23
+Updated: 2026-09-24
 
 ## Current goal and state
 
-Current base on `cleanup-active-codebase`: `d47819b` (eta sweep configs), initially
-clean. Uncommitted task: **correct Grad-EM to selected-support KL backward**.
-No installation, remote training, benchmark, submission, commit or push.
-Mac has no CUDA; the corrected kernel needs fresh GH200 acceptance testing.
+Current base on `cleanup-active-codebase`: `0c019c3` (selected-support Grad-EM
+correction), initially clean. Uncommitted task: **router optimizer ablation**.
+No installation, remote training, submission, commit or push.
 
-## Grad-EM selected-support correction (current work)
+- New `optimizers.router_optimizer = "muon" | "adamw"`, default Muon. AdamW
+  mode moves only `blocks.<layer>.mlp.router.weight` into existing AdamW group 2
+  (LR .015, betas .8/.95, eps 1e-10, decay .001, existing schedule). Router
+  biases stay there; experts and all other grouping/order remain unchanged.
+  Builder checks complete/exclusive ownership. Startup logs owner, weight
+  tensor count and element count. Dense models retain the same grouping.
+- Grad-EM math/kernels, model, schedules, loader and optimizer step code were
+  not changed. Checkpoints record ownership in resolved optimizer config;
+  legacy absent fields mean Muon; differing ownership is rejected on resume.
+- Added `configs/moe_e64k8_r0.5_gradem_eta0.01_router_adamw.toml`: E64/K8 packed,
+  eta .01, unique run name, horizon 3250, checkpoint interval 50. No run started.
+  For the requested 500-update prefix use the package entry point with
+  `STOP_AFTER_COMPLETED_UPDATES=500`, Stockyard `CHECKPOINT_DIR`, and scoped
+  `MOE_GMM_IMPLEMENTATION=torch`. Do not set TRAIN_STEPS_OVERRIDE; Vista
+  `train.sh --steps` disables periodic checkpoints and is unsuitable here.
+- Focused config/optimizer/checkpoint/package checks: **53 passed**, 15 Vista
+  tests deselected. Full local suite: **384 passed, 205 CUDA skips, 6 failed**;
+  failures are the existing Mac Bash 3.2 `declare -A` launcher limitation.
+  New tests check E8/E64, both layouts/backwards, exact default grouping,
+  exclusive assignment, dense, invalid values, unchanged hyperparameters,
+  checkpoint state/LR restoration and rejection of changed ownership.
+- Task files: config.py, optim.py, train.py, checkpoint.py, tests/test_package.py,
+  new tests/test_router_optimizer.py and ablation TOML; README/AGENTS/HANDOFF.
+  Dependencies untouched. Next: review diff, run CUDA regressions on Vista,
+  then explicitly authorize/run the 500-update experiment. CUDA correctness
+  and run outcomes cannot be established on this Mac.
+
+## Grad-EM selected-support correction (historical notes; landed in 0c019c3)
 
 - FP32 rule: v=<g,h_i>, a=softmax(z_selected), q=softmax(z_selected-eta*v).
   Expert gradient remains q*g. Router gradient is `(a-q)/eta` on the selected

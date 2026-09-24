@@ -108,6 +108,11 @@ class Muon(torch.optim.Optimizer):
                 )
 
 
+def moe_router_weights(model):
+    """Identify router weights by module identity, not a parameter-name substring."""
+    return [module.router.weight for module in model.modules() if isinstance(module, MoE)]
+
+
 def build_optimizers(model, config=None):
     config = config or {
         "adamw": {
@@ -121,6 +126,10 @@ def build_optimizers(model, config=None):
     }
     adamw = config["adamw"]
     muon = config["muon"]
+    router_optimizer = config.get("router_optimizer", "muon")
+    if router_optimizer not in ("muon", "adamw"):
+        raise ValueError("optimizers.router_optimizer must be 'muon' or 'adamw'")
+    adamw_router_weights = set(moe_router_weights(model)) if router_optimizer == "adamw" else set()
     embed_lr, head_lr, scalar_lr = adamw["group_lrs"]
     packed_experts = [module for module in model.modules()
                       if isinstance(module, MoE) and module.moe_parameter_layout == "packed"]
@@ -131,16 +140,19 @@ def build_optimizers(model, config=None):
     optimizer1 = AdamW([dict(params=[model.embed.weight], lr=embed_lr),
                         dict(params=[model.proj.weight], lr=head_lr),
                         dict(params=[p for p in model.parameters()
-                                     if p.ndim < 2 or p in packed_biases], lr=scalar_lr)],
+                                     if p.ndim < 2 or p in packed_biases
+                                     or p in adamw_router_weights], lr=scalar_lr)],
                        betas=tuple(adamw["betas"]), eps=adamw["eps"],
                        weight_decay=adamw["weight_decay"], fused=adamw["fused"])
     optimizer2 = Muon([p for p in model.blocks.parameters()
-                       if p.ndim >= 2 and p not in packed_biases],
+                       if p.ndim >= 2 and p not in packed_biases
+                       and p not in adamw_router_weights],
                       lr=muon["lr"], weight_decay=muon["weight_decay"], mu=muon["mu"],
                       transposed_params=packed_weights)
     optimizers = [optimizer1, optimizer2]
-    assert set(p for opt in optimizers for group in opt.param_groups
-               for p in group["params"]) == set(model.parameters())
+    assigned = [p for opt in optimizers for group in opt.param_groups for p in group["params"]]
+    assert len(assigned) == len(set(assigned)), "optimizer parameter ownership must be exclusive"
+    assert set(assigned) == set(model.parameters()), "optimizers must cover every model parameter"
     for optimizer in optimizers:
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
