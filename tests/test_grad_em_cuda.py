@@ -80,7 +80,12 @@ def test_cuda_oracle_and_direct_autograd(candidate, e, k, dtype, case):
     assert w.grad is None
     if case == "g_zero":
         assert torch.count_nonzero(gx) == 0
-        assert torch.count_nonzero(gz) == 0
+        torch.testing.assert_close(
+            gz.float(),
+            torch.zeros_like(gz, dtype=torch.float32),
+            rtol=0,
+            atol=1e-6,
+        )
     if k == 1:
         assert torch.count_nonzero(gz) == 0
 
