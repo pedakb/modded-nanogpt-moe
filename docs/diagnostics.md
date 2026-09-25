@@ -46,13 +46,13 @@ Heavy diagnostics are sampled on completed updates divisible by
 Only representative transformer layers `l00`, `l05`, and `l11` emit per-layer
 heavy metrics. Each emits:
 
-- `opt/router/lXX/{param_rms,grad_rms,update_rms,update_ratio,dlogit_rms}`
+- `opt/router/lXX/{param_rms,grad_rms,update_rms,update_ratio,dlogit_rms,sens_range_med}`
 - `opt/expert/lXX/{param_rms_med,grad_rms_med,update_rms_med,update_ratio_med}`
-- `router/lXX/{entropy_norm,topk_margin_med}`
+- `router/lXX/{entropy_norm,entropy_post_norm,logit_range_med,topk_margin_med}`
 - `router/lXX/load/{cv,zero}`
 
-The standard 12-layer, three-AdamW-group run therefore has exactly 51 unique
-scalar series: 8 ordinary series, 4 global diagnostics, and 13 diagnostics for
+The standard 12-layer, three-AdamW-group run therefore has exactly 60 unique
+scalar series: 8 ordinary series, 4 global diagnostics, and 16 diagnostics for
 each of three representative layers. No legacy aliases are emitted and old
 event files are not migrated.
 
@@ -97,12 +97,16 @@ to ModuleList and packed layouts; it is not an average of FC1 and FC2 RMS values
 
 ## Routing definitions
 
-Routing observes the existing full FP32 probabilities and actual selected IDs
-before optional selected-probability renormalization. It does not replace or
+Routing observes the existing full FP32 probabilities, selected IDs, and
+selected weights after optional Top-K renormalization. It does not replace or
 modify routing tensors.
 
-- `entropy_norm` is full routing entropy divided by `log(E)`; it is zero for
-  `E=1`.
+- `entropy_norm` is the mean per-token entropy of the full E-way routing
+  probabilities divided by `log(E)`; it is zero for `E=1`.
+- `entropy_post_norm` is the mean per-token entropy of the normalized selected
+  Top-K weights divided by `log(K)`; it is zero for `K=1`.
+- `logit_range_med` is the midpoint median across tokens of each token's
+  maximum router logit minus its minimum router logit.
 - `topk_margin_med` is the midpoint median of the `k` versus `k+1` logit
   boundary. It uses `topk(k+1)`, not a full sort, and is omitted for `k=E`.
 - `load/cv` is the population standard deviation of assignment fractions divided
@@ -112,9 +116,15 @@ modify routing tensors.
   sampled microbatches. Temporary hooks retain scalar sums and counts, not logits,
   gradients, or autograd graphs. The tag is omitted if backward never reaches the
   logits.
+- `sens_range_med` is the midpoint median across tokens of
+  `max_i(dL/da_i)-min_i(dL/da_i)` on the selected support. Standard backprop
+  observes the gradient already produced for normalized Top-K weights. Grad-EM
+  records its already-computed FP32 `v` from the custom backward kernel/reference;
+  neither path performs a second backward or recomputes expert dot products.
 
-Counts, entropy sums, margins, and gradient sums combine all microbatches in the
-sampled optimizer update. Routing and logit-gradient metrics are rank-local.
+Counts, entropy sums, ranges, margins, and gradient sums combine all
+microbatches in the sampled optimizer update. Routing and gradient metrics are
+rank-local.
 
 ## Cost and state
 

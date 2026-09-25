@@ -12,6 +12,7 @@ from torch import nn
 
 from modded_nanogpt_moe import diagnostics as diag, optim, train
 from modded_nanogpt_moe.config import load_experiment_config, validate_experiment_config
+from modded_nanogpt_moe.grad_em import GradEMCombine
 from modded_nanogpt_moe.model import MoE
 
 
@@ -29,7 +30,7 @@ class Writer:
         self.histograms[tag] = (values.copy(), step)
 
 
-def toy_model(monkeypatch, layout="modulelist", layers=1):
+def toy_model(monkeypatch, layout="modulelist", layers=1, moe_backward="standard"):
     def gmm(a, w, counts, trans_b=False):
         return torch.cat([
             segment @ matrix for segment, matrix in zip(a.split(counts.tolist()), w)])
@@ -44,7 +45,7 @@ def toy_model(monkeypatch, layout="modulelist", layers=1):
         block.attn = nn.Linear(8, 8)
         block.mlp = MoE(
             8, 4, 2, hidden_dim=8, moe_backend="grouped_gemm",
-            moe_parameter_layout=layout)
+            moe_parameter_layout=layout, moe_backward=moe_backward)
         blocks.append(block)
     model.blocks = nn.ModuleList(blocks)
     model.embed = nn.Embedding(8, 8)
@@ -64,15 +65,22 @@ def expert_weights(moe, expert):
 def test_router_statistics_compute_only_retained_behavior_metrics():
     p = torch.tensor([[0.6, 0.3, 0.1], [0.1, 0.3, 0.6]])
     stats = diag.RoutingStatistics(3, 2)
-    stats.observe(p[:1].log(), p[:1], torch.tensor([[0, 1]]))
-    stats.observe(p[1:].log(), p[1:], torch.tensor([[2, 1]]))
+    selected = torch.tensor([[0, 1]])
+    stats.observe(p[:1].log(), p[:1], selected, torch.tensor([[2 / 3, 1 / 3]]))
+    stats.observe(p[1:].log(), p[1:], torch.tensor([[2, 1]]),
+                  torch.tensor([[2 / 3, 1 / 3]]))
     values = stats.finish()
-    expected_entropy = -sum(value * math.log(value) for value in (0.6, 0.3, 0.1))
+    expected_pre = -sum(value * math.log(value) for value in (0.6, 0.3, 0.1))
+    expected_post = -sum(value * math.log(value) for value in (2 / 3, 1 / 3))
     q = torch.tensor([0.25, 0.5, 0.25])
     assert set(values) == {
-        "normalized_entropy", "topk_margin_median", "load_cv", "zero_experts"}
+        "normalized_entropy", "entropy_post_norm", "logit_range_median",
+        "topk_margin_median", "load_cv", "zero_experts"}
     assert values["normalized_entropy"].item() == pytest.approx(
-        expected_entropy / math.log(3))
+        expected_pre / math.log(3))
+    assert values["entropy_post_norm"].item() == pytest.approx(
+        expected_post / math.log(2))
+    assert values["logit_range_median"].item() == pytest.approx(math.log(6))
     assert values["topk_margin_median"].item() == pytest.approx(math.log(3))
     assert values["load_cv"].item() == pytest.approx(
         q.std(correction=0).item() / q.mean().item())
@@ -86,11 +94,15 @@ def test_k_equals_e_omits_boundary_margin(experts):
     stats = diag.RoutingStatistics(experts, experts)
     stats.observe(
         torch.zeros(2, experts), torch.full((2, experts), 1 / experts),
-        torch.arange(experts).expand(2, experts))
+        torch.arange(experts).expand(2, experts),
+        torch.full((2, experts), 1 / experts))
     metrics = stats.finish()
     assert "topk_margin_median" not in metrics
     assert metrics["normalized_entropy"].item() == pytest.approx(
         1 if experts > 1 else 0)
+    assert metrics["entropy_post_norm"].item() == pytest.approx(
+        1 if experts > 1 else 0)
+    assert metrics["logit_range_median"] == 0
 
 
 def test_margin_median_and_empty_experts_preserve_definitions():
@@ -98,7 +110,11 @@ def test_margin_median_and_empty_experts_preserve_definitions():
         [0.4, 0.2, 0.2], [0.4, 0.2, 0.18],
         [0.4, 0.2, 0.12], [0.4, 0.2, 0.]])
     stats = diag.RoutingStatistics(3, 2)
-    stats.observe(logits, logits.softmax(-1), torch.tensor([[0, 1]] * 4))
+    probabilities = logits.softmax(-1)
+    selected = torch.tensor([[0, 1]] * 4)
+    selected_weights = probabilities.gather(1, selected)
+    selected_weights /= selected_weights.sum(dim=-1, keepdim=True)
+    stats.observe(logits, probabilities, selected, selected_weights)
     values = stats.finish()
     assert values["topk_margin_median"].item() == pytest.approx(0.05)
     assert values["zero_experts"] == 1
@@ -108,6 +124,34 @@ def test_midpoint_median_selection():
     assert diag.midpoint_median(torch.tensor([1., 4., 2., 3.])) == 2.5
     assert diag.midpoint_median(torch.tensor([1., 9., 7.])) == 7
     assert torch.isnan(diag.midpoint_median(torch.tensor([1., float("nan")])))
+
+
+def test_standard_and_grad_em_sensitivity_use_existing_backward_values():
+    standard = diag.RoutingStatistics(4, 2)
+    weights = torch.tensor([[0.7, 0.3], [0.4, 0.6]], requires_grad=True)
+    sensitivity = torch.tensor([[3., -1.], [2., 8.]])
+    standard.attach_sensitivity_gradient(weights)
+    (weights * sensitivity).sum().backward()
+    assert standard.finish() == {}  # Routing state has not been observed.
+    assert diag.midpoint_median(torch.cat(standard.sensitivity_ranges)) == 5
+
+    grad_em = diag.RoutingStatistics(4, 2)
+    logits = torch.tensor([[2., 1., 0., -1.], [0., 1., 2., 3.]], requires_grad=True)
+    indices = torch.tensor([[0, 1], [3, 2]])
+    selected_logits = logits.gather(1, indices)
+    topk_weights = selected_logits.softmax(-1)
+    selected_outputs = torch.tensor([
+        [[1., 2.], [3., 4.]], [[-1., 2.], [2., -2.]]], requires_grad=True)
+    incoming = torch.tensor([[2., -1.], [3., 4.]])
+    order = torch.arange(4)
+    output = GradEMCombine.apply(
+        selected_outputs.flatten(0, 1), logits, topk_weights, indices, order,
+        0.1, grad_em.observe_sensitivity)
+    output.backward(incoming)
+    expected_v = (incoming[:, None, :] * selected_outputs.detach()).sum(-1)
+    expected_range = expected_v.amax(-1) - expected_v.amin(-1)
+    torch.testing.assert_close(
+        torch.cat(grad_em.sensitivity_ranges), expected_range, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("layout", ["modulelist", "packed"])
@@ -254,9 +298,10 @@ def test_bf16_actual_delta_uses_stored_values(monkeypatch):
 
 
 @pytest.mark.parametrize("layout", ["modulelist", "packed"])
+@pytest.mark.parametrize("moe_backward", ["standard", "grad_em"])
 def test_routing_observer_preserves_outputs_gradients_rng_and_cleanup(
-        monkeypatch, layout):
-    model = toy_model(monkeypatch, layout)
+        monkeypatch, layout, moe_backward):
+    model = toy_model(monkeypatch, layout, moe_backward=moe_backward)
     moe = model.blocks[0].mlp
     observer = diag.TrainingDiagnostics(model, SETTINGS)
     x = torch.randn(1, 7, 8, requires_grad=True)
@@ -270,6 +315,7 @@ def test_routing_observer_preserves_outputs_gradients_rng_and_cleanup(
     for value, expected_value in zip(actual, expected):
         torch.testing.assert_close(value, expected_value, atol=0, rtol=0)
     assert observer.routing["l00"].tokens == 7
+    assert "sensitivity_range_median" in observer.routing["l00"].finish()
     assert moe._routing_diagnostics is None
     assert not moe.router._forward_hooks
     torch.testing.assert_close(torch.get_rng_state(), rng, atol=0, rtol=0)
@@ -297,7 +343,9 @@ def test_logit_gradient_rms_retains_no_graph_and_has_no_normal_hooks(
             logits = moe.router(torch.ones(tokens, 8, dtype=dtype))
             refs.append(weakref.ref(logits))
             probabilities = logits.float().softmax(-1)
-            stats.observe(logits, probabilities, probabilities.topk(2, dim=-1).indices)
+            weights, indices = probabilities.topk(2, dim=-1)
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+            stats.observe(logits, probabilities, indices, weights)
             (logits * magnitude).sum().backward()
             expected_squares += tokens * 4 * magnitude**2
             del logits, probabilities
@@ -332,15 +380,17 @@ def test_only_representative_layers_emit_compact_heavy_surface(monkeypatch, layo
         "param_rms", "grad_rms", "update_rms", "update_ratio"))
     for layer in ("l00", "l05", "l11"):
         expected.update(f"opt/router/{layer}/{metric}" for metric in (
-            "param_rms", "grad_rms", "update_rms", "update_ratio", "dlogit_rms"))
+            "param_rms", "grad_rms", "update_rms", "update_ratio", "dlogit_rms",
+            "sens_range_med"))
         expected.update(f"opt/expert/{layer}/{metric}_med" for metric in (
             "param_rms", "grad_rms", "update_rms", "update_ratio"))
         expected.update({
-            f"router/{layer}/entropy_norm", f"router/{layer}/topk_margin_med",
+            f"router/{layer}/entropy_norm", f"router/{layer}/entropy_post_norm",
+            f"router/{layer}/logit_range_med", f"router/{layer}/topk_margin_med",
             f"router/{layer}/load/cv", f"router/{layer}/load/zero",
         })
     assert set(writer.scalars) == expected
-    assert len(writer.scalars) == 44
+    assert len(writer.scalars) == 53
     assert not writer.histograms
     discarded = (
         "/fc1/", "/fc2/", "param_norm", "grad_norm", "update_norm",
@@ -356,7 +406,7 @@ def test_only_representative_layers_emit_compact_heavy_surface(monkeypatch, layo
                        if index not in (0, 5, 11)), tag
 
 
-def test_expected_production_scalar_surface_has_exactly_51_series():
+def test_expected_production_scalar_surface_has_exactly_60_series():
     tags = {
         "metric/loss/train", "metric/loss/val", "perf/step_ms", "perf/tok_s",
         "opt/lr/adamw/g0", "opt/lr/adamw/g1", "opt/lr/adamw/g2", "opt/lr/muon",
@@ -365,14 +415,16 @@ def test_expected_production_scalar_surface_has_exactly_51_series():
         "param_rms", "grad_rms", "update_rms", "update_ratio"))
     for layer in ("l00", "l05", "l11"):
         tags.update(f"opt/router/{layer}/{metric}" for metric in (
-            "param_rms", "grad_rms", "update_rms", "update_ratio", "dlogit_rms"))
+            "param_rms", "grad_rms", "update_rms", "update_ratio", "dlogit_rms",
+            "sens_range_med"))
         tags.update(f"opt/expert/{layer}/{metric}_med" for metric in (
             "param_rms", "grad_rms", "update_rms", "update_ratio"))
         tags.update({
-            f"router/{layer}/entropy_norm", f"router/{layer}/topk_margin_med",
+            f"router/{layer}/entropy_norm", f"router/{layer}/entropy_post_norm",
+            f"router/{layer}/logit_range_med", f"router/{layer}/topk_margin_med",
             f"router/{layer}/load/cv", f"router/{layer}/load/zero",
         })
-    assert len(tags) == 51
+    assert len(tags) == 60
 
 
 def test_sampling_cadence_uses_completed_updates(monkeypatch):

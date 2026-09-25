@@ -27,10 +27,12 @@ class GradEMCombine(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, out_sorted, router_logits, topk_weights, topk_experts, order, eta):
+    def forward(ctx, out_sorted, router_logits, topk_weights, topk_experts, order, eta,
+                sensitivity_observer=None):
         require_grad_em_device(out_sorted.device)
         validate_grad_em_eta(eta)
         ctx.is_cuda = out_sorted.is_cuda
+        ctx.sensitivity_observer = sensitivity_observer
         if ctx.is_cuda:
             from ._grad_em_cuda import cuda_forward
             output, rows = cuda_forward(out_sorted, router_logits, topk_weights, topk_experts, order)
@@ -50,16 +52,23 @@ class GradEMCombine(torch.autograd.Function):
         out_sorted, logits, indices, order = ctx.saved_tensors
         if ctx.is_cuda:
             from ._grad_em_cuda import cuda_backward
-            gx, gz, _, _ = cuda_backward(out_sorted, logits, indices, order, grad_output,
-                                         ctx.eta, *ctx.needs_input_grad[:2])
-            return gx, gz, None, None, None, None
+            gx, gz, _, v = cuda_backward(
+                out_sorted, logits, indices, order, grad_output, ctx.eta,
+                *ctx.needs_input_grad[:2], save_v=ctx.sensitivity_observer is not None)
+            if ctx.sensitivity_observer is not None:
+                ctx.sensitivity_observer(v)
+            gradients = (gx, gz, None, None, None, None)
+            return gradients + ((None,) if len(ctx.needs_input_grad) == 7 else ())
         selected = torch.empty_like(out_sorted)
         selected[order] = out_sorted
         selected = selected.view(*indices.shape, out_sorted.shape[-1])
         result = grad_em_reference(logits, indices, selected, grad_output, ctx.eta)
+        if ctx.sensitivity_observer is not None:
+            ctx.sensitivity_observer(result.v)
         grad_sorted = result.grad_expert.flatten(0, 1)[order].to(out_sorted.dtype)
         # Direct edge to original logits; NO edge through forward mixing weights.
-        return grad_sorted, result.grad_logits.to(logits.dtype), None, None, None, None
+        gradients = (grad_sorted, result.grad_logits.to(logits.dtype), None, None, None, None)
+        return gradients + ((None,) if len(ctx.needs_input_grad) == 7 else ())
 
 
 class GradEMResult(NamedTuple):

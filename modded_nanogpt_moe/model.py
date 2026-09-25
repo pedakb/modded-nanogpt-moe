@@ -358,10 +358,12 @@ class MoE(nn.Module):
         router_logits = self.router(x)
         routing_weights = F.softmax(router_logits.float(), dim=-1)
         topk_weights, topk_experts = routing_weights.topk(self.top_k, dim=-1)
-        if self._routing_diagnostics is not None:
-            self._routing_diagnostics(router_logits.detach(), routing_weights.detach(), topk_experts.detach())
         if self.normalize_topk:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        if self._routing_diagnostics is not None:
+            self._routing_diagnostics.observe(
+                router_logits, routing_weights, topk_experts, topk_weights)
+            self._routing_diagnostics.attach_sensitivity_gradient(topk_weights)
         topk_weights = topk_weights.type_as(x)
 
         out = x.new_zeros(x.shape)
@@ -414,10 +416,13 @@ class MoE(nn.Module):
             router_logits = self.router(x)
             routing_weights = F.softmax(router_logits.float(), dim=-1)
             topk_weights, topk_experts = routing_weights.topk(self.top_k, dim=-1)
-            if self._routing_diagnostics is not None:
-                self._routing_diagnostics(router_logits.detach(), routing_weights.detach(), topk_experts.detach())
             if self.normalize_topk:
                 topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            if self._routing_diagnostics is not None:
+                self._routing_diagnostics.observe(
+                    router_logits, routing_weights, topk_experts, topk_weights)
+                if self.moe_backward == "standard":
+                    self._routing_diagnostics.attach_sensitivity_gradient(topk_weights)
             topk_weights = topk_weights.type_as(x)
 
         # ---- pack assignments by expert ----
@@ -487,7 +492,9 @@ class MoE(nn.Module):
             else:
                 from .grad_em import GradEMCombine
                 out = GradEMCombine.apply(out_sorted, router_logits, topk_weights,
-                                          topk_experts, order, self.grad_em_eta)
+                                          topk_experts, order, self.grad_em_eta,
+                                          (self._routing_diagnostics.observe_sensitivity
+                                           if self._routing_diagnostics is not None else None))
             out = out.view(B, T, D)
         if self._grad_em_diagnostics is not None:
             self._grad_em_diagnostics(

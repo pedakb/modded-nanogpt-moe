@@ -37,14 +37,18 @@ def _ratio_from_squares(numerator, denominator):
 
 
 class RoutingStatistics:
-    """Accumulate only the four retained routing metrics and logit-gradient RMS."""
+    """Accumulate compact router state and gradient metrics for one layer."""
 
-    def __init__(self, experts, top_k):
+    def __init__(self, experts, top_k, normalize_topk=True):
         self.experts, self.top_k = experts, top_k
+        self.normalize_topk = normalize_topk
         self.tokens = 0
         self.entropy_sum = None
+        self.entropy_post_sum = None
         self.counts = None
         self.margins = []
+        self.logit_ranges = []
+        self.sensitivity_ranges = []
         self.logit_grad_squares = None
         self.logit_grad_elements = 0
         self.gradient_handles = []
@@ -68,16 +72,40 @@ class RoutingStatistics:
         self.gradient_handles.clear()
 
     @torch.no_grad()
-    def observe(self, logits, probabilities, selected):
-        logits, probabilities, selected = logits.detach(), probabilities.detach(), selected.detach()
+    def observe_sensitivity(self, sensitivity):
+        sensitivity = sensitivity.detach().float()
+        self.sensitivity_ranges.append(
+            sensitivity.amax(dim=-1) - sensitivity.amin(dim=-1))
+        # Returning None from a tensor hook leaves its gradient untouched.
+
+    def attach_sensitivity_gradient(self, weights):
+        if weights.requires_grad:
+            self.gradient_handles.append(
+                weights.register_hook(self.observe_sensitivity))
+
+    @torch.no_grad()
+    def observe(self, logits, probabilities, selected, selected_weights):
+        logits = logits.detach().float()
+        probabilities = probabilities.detach().float()
+        selected = selected.detach()
+        selected_weights = selected_weights.detach().float()
         if not logits.shape[0]:
             return
         self.tokens += logits.shape[0]
         entropy = -(probabilities * probabilities.clamp_min(
             torch.finfo(probabilities.dtype).tiny).log()).sum(-1).sum()
         self.entropy_sum = entropy if self.entropy_sum is None else self.entropy_sum + entropy
+        if not self.normalize_topk:
+            selected_weights = selected_weights / selected_weights.sum(
+                dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+        entropy_post = -(selected_weights * selected_weights.clamp_min(
+            torch.finfo(selected_weights.dtype).tiny).log()).sum(-1).sum()
+        self.entropy_post_sum = (entropy_post if self.entropy_post_sum is None
+                                 else self.entropy_post_sum + entropy_post)
         counts = torch.bincount(selected.reshape(-1), minlength=self.experts)
         self.counts = counts if self.counts is None else self.counts + counts
+        minimum, maximum = torch.aminmax(logits, dim=-1)
+        self.logit_ranges.append(maximum - minimum)
         if self.top_k < self.experts:
             # Only sampled monitored layers: top-k+1, never a full expert sort.
             boundary = logits.float().topk(self.top_k + 1, dim=-1).values
@@ -87,10 +115,13 @@ class RoutingStatistics:
     def finish(self):
         if self.tokens == 0:
             return {}
-        normalizer = math.log(self.experts) if self.experts > 1 else 1.0
+        pre_normalizer = math.log(self.experts) if self.experts > 1 else 1.0
+        post_normalizer = math.log(self.top_k) if self.top_k > 1 else 1.0
         q = self.counts.float() / (self.tokens * self.top_k)
         metrics = {
-            "normalized_entropy": self.entropy_sum / self.tokens / normalizer,
+            "normalized_entropy": self.entropy_sum / self.tokens / pre_normalizer,
+            "entropy_post_norm": self.entropy_post_sum / self.tokens / post_normalizer,
+            "logit_range_median": midpoint_median(torch.cat(self.logit_ranges)),
             "load_cv": q.std(correction=0) / q.mean(),
             "zero_experts": (self.counts == 0).sum(),
         }
@@ -99,6 +130,9 @@ class RoutingStatistics:
         if self.logit_grad_elements:
             metrics["dL_dlogits_rms"] = _rms(
                 self.logit_grad_squares, self.logit_grad_elements)
+        if self.sensitivity_ranges:
+            metrics["sensitivity_range_median"] = midpoint_median(
+                torch.cat(self.sensitivity_ranges))
         return metrics
 
 
@@ -186,9 +220,10 @@ class TrainingDiagnostics:
         router_handles = []
         try:
             for layer, moe in self.layers.items():
-                stats = RoutingStatistics(moe.num_experts, moe.top_k)
+                stats = RoutingStatistics(
+                    moe.num_experts, moe.top_k, moe.normalize_topk)
                 self.routing[layer] = stats
-                moe._routing_diagnostics = stats.observe
+                moe._routing_diagnostics = stats
                 router_handles.append(moe.router.register_forward_hook(
                     stats.attach_logit_gradient))
             yield
@@ -285,6 +320,8 @@ class TrainingDiagnostics:
             routing = self.routing[layer].finish()
             for old, new in (
                     ("normalized_entropy", "entropy_norm"),
+                    ("entropy_post_norm", "entropy_post_norm"),
+                    ("logit_range_median", "logit_range_med"),
                     ("topk_margin_median", "topk_margin_med"),
                     ("load_cv", "load/cv"),
                     ("zero_experts", "load/zero")):
@@ -292,6 +329,9 @@ class TrainingDiagnostics:
                     scalars[f"router/{layer}/{new}"] = routing[old]
             if "dL_dlogits_rms" in routing:
                 scalars[f"opt/router/{layer}/dlogit_rms"] = routing["dL_dlogits_rms"]
+            if "sensitivity_range_median" in routing:
+                scalars[f"opt/router/{layer}/sens_range_med"] = routing[
+                    "sensitivity_range_median"]
         # One batched device-to-host transfer, including the ordinary training
         # loss on sampled steps when the trainer supplies it.
         values = torch.stack([value.float() for value in scalars.values()]).cpu().tolist()
