@@ -70,10 +70,9 @@ DEFAULT_CONFIG = {
 def _merge_known(defaults, supplied, location=""):
     if not isinstance(supplied, dict):
         raise ValueError(f"{location or 'config'} must be a TOML table")
-    # Optional optimizer: absent means identical legacy resolved/checkpoint config.
-    if location == "optimizers" and "expert_muon" in supplied:
-        defaults = {**defaults, "expert_muon": {
-            "lr": 0.0005, "momentum": 0.95, "weight_decay": 0.01}}
+    # Omission preserves the legacy resolved config and checkpoint compatibility.
+    if location == "optimizers.muon" and "compass" in supplied:
+        defaults = {**defaults, "compass": False}
     unknown = sorted(set(supplied) - set(defaults))
     if unknown:
         prefix = f"{location}." if location else ""
@@ -193,10 +192,12 @@ def validate_experiment_config(config, require_run_name=False):
 
     if config["optimizers"]["router_optimizer"] not in ("muon", "adamw"):
         raise ValueError("optimizers.router_optimizer must be 'muon' or 'adamw'")
-    if "expert_muon" in config["optimizers"]:
-        validate_expert_muon_config(**config["optimizers"]["expert_muon"])
     adamw = config["optimizers"]["adamw"]
     muon = config["optimizers"]["muon"]
+    if not isinstance(muon.get("compass", False), bool):
+        raise ValueError("optimizers.muon.compass must be a boolean")
+    if not muon.get("compass", False):
+        muon.pop("compass", None)  # Explicit false and omission mean the same baseline.
     if len(adamw["group_lrs"]) != 3:
         raise ValueError("optimizers.adamw.group_lrs must contain exactly three values")
     if len(adamw["betas"]) != 2:
@@ -216,15 +217,10 @@ def validate_experiment_config(config, require_run_name=False):
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not math.isfinite(value)):
             raise ValueError(f"{name} values must be finite numbers")
+    if muon.get("compass", False):
+        if muon["lr"] <= 0 or not 0 <= muon["mu"] < 1 or muon["weight_decay"] < 0:
+            raise ValueError("Muon Compass requires lr > 0, 0 <= mu < 1, weight_decay >= 0")
     return config
-
-
-def validate_expert_muon_config(lr=0.0005, momentum=0.95, weight_decay=0.01):
-    for name, value in (("lr", lr), ("momentum", momentum), ("weight_decay", weight_decay)):
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-            raise ValueError(f"optimizers.expert_muon.{name} must be a finite number")
-    if lr <= 0 or not 0 <= momentum < 1 or weight_decay < 0:
-        raise ValueError("ExpertMuon requires lr > 0, 0 <= momentum < 1, weight_decay >= 0")
 
 
 def load_experiment_config(path=None):

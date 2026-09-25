@@ -36,16 +36,55 @@ def muon_update(grad, momentum, mu=0.95, nesterov=True):
     return update
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, transposed_params=()):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, transposed_params=(),
+                 compass_families=()):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
         super().__init__(params, defaults)
         # Layout metadata comes from model construction, not optimizer state.
         self.transposed_params = set(transposed_params)
+        # Optional factors only: retain Muon's parameter order, buckets and state.
+        self.compass_families = tuple(tuple(family) for family in compass_families)
+        self.compass_parameters = {p for family in self.compass_families for p in family}
+        if self.compass_families:
+            self._require_compass_single_rank()
+            if not math.isfinite(lr) or lr <= 0:
+                raise ValueError("Muon Compass requires a finite positive base learning rate")
+            self.param_groups[0]["initial_lr"] = lr
+
+    @staticmethod
+    def _require_compass_single_rank():
+        if dist.is_initialized() and dist.get_world_size() != 1:
+            raise ValueError("Muon Compass currently supports one rank; ownership logic is unchanged")
+
+    def _apply_compass(self, parameters, updates, gradients, group):
+        """Scale only expert updates, preserving the baseline update dtype."""
+        ratio = group["lr"] / group["initial_lr"]
+        if not math.isfinite(ratio) or not 0 <= ratio <= 1:
+            raise ValueError("Muon Compass cooldown multiplier must be in [0, 1]")
+        indices = {p: i for i, p in enumerate(parameters)}
+        for family in self.compass_families:
+            if family[0] not in indices:
+                continue
+            if not all(p in indices for p in family):
+                raise ValueError("a Compass family must share a Muon shape/dtype/device bucket")
+            directions, raw = [], []
+            for p in family:
+                i = indices[p]
+                g = gradients[i].mT.contiguous() if p in self.transposed_params else gradients[i]
+                directions.extend(updates[i].unbind() if p.ndim == 3 else [updates[i]])
+                raw.extend(g.unbind() if p.ndim == 3 else [g])
+            factors = _compass_factors([u.float() for u in directions], raw, ratio)
+            for update, (gate, radius) in zip(directions, factors):
+                # FP32 factor arithmetic, then baseline BF16 update storage.
+                # Unit factors leave every stored update bit unchanged.
+                update.copy_((update.float() * radius * gate).to(update.dtype))
 
     @torch.no_grad()
     def step(self):
+        if self.compass_families:
+            self._require_compass_single_rank()
         world_size = dist.get_world_size()
         rank = dist.get_rank()
         for group in self.param_groups:
@@ -58,6 +97,11 @@ class Muon(torch.optim.Optimizer):
                     local_params_by_shape.setdefault(bucket, []).append(p)
 
             for same_shape_params in local_params_by_shape.values():
+                # muon_update may mutate its gradient input. Capture raw evidence
+                # first, only for experts, and release it after this shape bucket.
+                raw_gradients = ([p.grad.detach().float().clone() if p in self.compass_parameters
+                                  else None for p in same_shape_params]
+                                 if self.compass_families else None)
                 momentums = []
                 for p in same_shape_params:
                     state = self.state[p]
@@ -71,13 +115,15 @@ class Muon(torch.optim.Optimizer):
                     # [out,in] orientation for Muon's asymmetric aspect-ratio
                     # scale and BF16 reduction order. These optimizer workspaces
                     # also keep muon_update's in-place lerp off packed gradients.
-                    for p, momentum in zip(same_shape_params, momentums):
+                    for index, (p, momentum) in enumerate(zip(same_shape_params, momentums)):
                         transposed = p in self.transposed_params
                         grad = p.grad.mT.contiguous() if transposed else p.grad
                         momentum_batch = momentum.mT.contiguous() if transposed else momentum
                         update = muon_update(grad, momentum_batch, mu=group["mu"])
                         if transposed:
                             momentum.copy_(momentum_batch.mT)
+                        if p in self.compass_parameters:
+                            self._apply_compass([p], [update], [raw_gradients[index]], group)
                         p.mul_(1 - group["lr"] * group["weight_decay"])
                         p.add_(update.mT if transposed else update, alpha=-group["lr"])
                     continue
@@ -85,6 +131,8 @@ class Muon(torch.optim.Optimizer):
                 if len(same_shape_params) == 1:
                     p = same_shape_params[0]
                     update = muon_update(p.grad, momentums[0], mu=group["mu"])
+                    if p in self.compass_parameters:
+                        self._apply_compass([p], [update], raw_gradients, group)
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
                     continue
@@ -94,6 +142,8 @@ class Muon(torch.optim.Optimizer):
                 update_batch = muon_update(
                     grad_batch, momentum_batch, mu=group["mu"])
                 torch._foreach_copy_(momentums, momentum_batch.unbind())
+                if self.compass_families:
+                    self._apply_compass(same_shape_params, update_batch.unbind(), raw_gradients, group)
                 torch._foreach_mul_(
                     same_shape_params,
                     1 - group["lr"] * group["weight_decay"],
@@ -110,8 +160,8 @@ class Muon(torch.optim.Optimizer):
                 )
 
 
-# Compass arithmetic adapted from ExpertMuon-Compass, commit f829248,
-# optim/literal_reference.py and optim/golden.py.
+# Compass factors adapted from ExpertMuon-Compass, commit f829248,
+# optim/literal_reference.py. The baseline Muon update above is unchanged.
 # MIT License
 # Copyright (c) 2026 ExpertMuon-Compass contributors
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -131,110 +181,33 @@ class Muon(torch.optim.Optimizer):
 # SOFTWARE.
 
 
-def _expert_muon_direction(source):
-    """Original Compass five-step FP32 map (not this project's Muon map)."""
-    if not torch.isfinite(source).all():
-        raise FloatingPointError("Nonfinite ExpertMuon matrix direction")
-    x = source / (source.norm() + 1e-7)
-    transposed = source.size(0) > source.size(1)
-    if transposed:
-        x = x.mT
-    for _ in range(5):
-        gram = x @ x.mT
-        x = 3.4445 * x + (-4.7750 * gram + 2.0315 * (gram @ gram)) @ x
-    return x.mT if transposed else x
-
-
-class ExpertMuon(torch.optim.Optimizer):
-    """Original Compass on expert families; each group is one layer/projection.
-
-    A group has either ordered [out,in] parameters or one packed parameter with
-    transposed=True for this project's [E,in,out] storage. No expert flattening.
-    Scalar reductions intentionally follow the literal reference's host order.
-    """
-    def __init__(self, families, lr=0.0005, momentum=0.95, weight_decay=0.01):
-        from .config import validate_expert_muon_config
-        validate_expert_muon_config(lr, momentum, weight_decay)
-        self._require_single_rank()
-        super().__init__(families, dict(lr=lr, initial_lr=lr, momentum=momentum,
-                                       weight_decay=weight_decay, transposed=False))
-
-    @staticmethod
-    def _require_single_rank():
-        if dist.is_initialized() and dist.get_world_size() != 1:
-            raise ValueError("ExpertMuon currently supports one rank; distributed ownership is unchanged")
-
-    def load_state_dict(self, state_dict):
-        # Optimizer.load_state_dict would otherwise round FP32 state to BF16
-        # parameter dtype. Preserve original momentum values before that cast.
-        momentums = [state_dict["state"].get(index, {}).get("momentum_buffer")
-                     for group in state_dict["param_groups"] for index in group["params"]]
-        super().load_state_dict(state_dict)
-        parameters = [p for group in self.param_groups for p in group["params"]]
-        for p, momentum in zip(parameters, momentums):
-            if momentum is not None:
-                self.state[p]["momentum_buffer"] = momentum.to(device=p.device, dtype=torch.float32).clone()
-
-    @torch.no_grad()
-    def step(self):
-        self._require_single_rank()
-        for group in self.param_groups:
-            lr = group["lr"]
-            ratio = lr / group["initial_lr"]
-            if not math.isfinite(ratio) or not 0 <= ratio <= 1:
-                raise ValueError("ExpertMuon cooldown multiplier must be finite and in [0, 1]")
-            pending = []
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                if p.ndim not in (2, 3):
-                    raise ValueError("ExpertMuon requires 2D matrices or 3D packed experts")
-                gradient = p.grad.detach().float()
-                if group["transposed"]:
-                    gradient = gradient.mT.contiguous()
-                if not torch.isfinite(gradient).all():
-                    raise FloatingPointError("Nonfinite ExpertMuon gradient")
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(gradient, dtype=torch.float32)
-                momentum = state["momentum_buffer"]
-                if momentum.dtype != torch.float32:
-                    raise TypeError("ExpertMuon momentum must remain FP32")
-                momentum.mul_(group["momentum"]).add_(gradient)
-                source = gradient.add(momentum, alpha=group["momentum"])
-                weight = p.mT if group["transposed"] else p
-                matrices = [(weight, gradient, source)] if p.ndim == 2 else zip(weight, gradient, source)
-                for w, g, value in matrices:
-                    pending.append((w, g, _expert_muon_direction(value)))
-            if not pending:
-                continue
-            scalars = torch.stack([v for _, g, o in pending
-                                   for v in ((o * g).sum(), o.norm(), g.norm())]).tolist()
-            raw = [max(0.0, scalars[i] / (scalars[i + 1] * scalars[i + 2] + 1e-12)) + 1e-6
-                   for i in range(0, len(scalars), 3)]
-            mean = sum(raw) / len(raw)
-            capped = [min(1.0, a / mean) for a in raw]
-            capped_mean = sum(capped) / len(capped)
-            gates = [a / capped_mean for a in capped]
-            for (w, g, o), gate in zip(pending, gates):
-                alignment = ((o * g).sum(dim=1) /
-                             (o.norm(dim=1) * g.norm(dim=1) + 1e-12)).clamp_min(0.0)
-                rows = alignment + 1e-6
-                rows = (rows / rows.mean()).clamp_max(1.0)
-                if ratio == 1.0:
-                    effective = rows
-                elif ratio == 0.0:
-                    effective = torch.ones_like(rows)
-                else:
-                    effective = torch.lerp(torch.ones_like(rows), rows, float(ratio))
-                energy = o.square().sum()
-                selective = (o.square() * effective.square().unsqueeze(1)).sum()
-                radius = torch.where(energy > 0, (selective / energy.clamp_min(1e-30)).sqrt(),
-                                     torch.ones_like(energy))
-                update = o * radius
-                scale = 0.2 * math.sqrt(max(w.shape))
-                w.mul_(1.0 - lr * group["weight_decay"])
-                w.add_(update.to(w.dtype), alpha=-(lr * gate) * scale)
+def _compass_factors(directions, gradients, ratio):
+    """Family gates and row radii on FP32 baseline Muon updates/gradients."""
+    scalars = torch.stack([v for o, g in zip(directions, gradients)
+                           for v in ((o * g).sum(), o.norm(), g.norm())]).tolist()
+    raw = [max(0.0, scalars[i] / (scalars[i + 1] * scalars[i + 2] + 1e-12)) + 1e-6
+           for i in range(0, len(scalars), 3)]
+    mean = sum(raw) / len(raw)
+    capped = [min(1.0, a / mean) for a in raw]
+    capped_mean = sum(capped) / len(capped)
+    factors = []
+    for o, g, cap in zip(directions, gradients, capped):
+        alignment = ((o * g).sum(dim=1) /
+                     (o.norm(dim=1) * g.norm(dim=1) + 1e-12)).clamp_min(0.0)
+        rows = alignment + 1e-6
+        rows = (rows / rows.mean()).clamp_max(1.0)
+        if ratio == 1.0:
+            effective = rows
+        elif ratio == 0.0:
+            effective = torch.ones_like(rows)
+        else:
+            effective = torch.lerp(torch.ones_like(rows), rows, float(ratio))
+        energy = o.square().sum()
+        selective = (o.square() * effective.square().unsqueeze(1)).sum()
+        radius = torch.where(energy > 0, (selective / energy.clamp_min(1e-30)).sqrt(),
+                             torch.ones_like(energy))
+        factors.append((cap / capped_mean, radius))
+    return factors
 
 
 def moe_router_weights(model):
@@ -266,22 +239,21 @@ def build_optimizers(model, config=None):
                      for p in (module.fc_bias, module.proj_bias)}
     packed_weights = {p for module in packed_experts
                       for p in (module.fc_weight, module.proj_weight)}
-    expert_optimizer = None
-    expert_weights = set()
     if "expert_muon" in config:
-        families = []
+        raise ValueError("reference ExpertMuon was removed; use optimizers.muon.compass = true")
+    compass = muon.get("compass", False)
+    if not isinstance(compass, bool):
+        raise ValueError("optimizers.muon.compass must be a boolean")
+    families = []
+    if compass:
         for module in model.modules():
             if not isinstance(module, MoE):
                 continue
             if module.moe_parameter_layout == "packed":
-                families.extend(dict(params=[p], transposed=True)
-                                for p in (module.fc_weight, module.proj_weight))
+                families.extend([p] for p in (module.fc_weight, module.proj_weight))
             else:
-                families.extend(dict(params=[getattr(expert, role).weight for expert in module.experts])
+                families.extend([getattr(expert, role).weight for expert in module.experts]
                                 for role in ("fc", "proj"))
-        if families:
-            expert_optimizer = ExpertMuon(families, **config["expert_muon"])
-            expert_weights = {p for family in families for p in family["params"]}
     optimizer1 = AdamW([dict(params=[model.embed.weight], lr=embed_lr),
                         dict(params=[model.proj.weight], lr=head_lr),
                         dict(params=[p for p in model.parameters()
@@ -291,12 +263,10 @@ def build_optimizers(model, config=None):
                        weight_decay=adamw["weight_decay"], fused=adamw["fused"])
     optimizer2 = Muon([p for p in model.blocks.parameters()
                        if p.ndim >= 2 and p not in packed_biases
-                       and p not in adamw_router_weights and p not in expert_weights],
+                       and p not in adamw_router_weights],
                       lr=muon["lr"], weight_decay=muon["weight_decay"], mu=muon["mu"],
-                      transposed_params=packed_weights - expert_weights)
+                      transposed_params=packed_weights, compass_families=families)
     optimizers = [optimizer1, optimizer2]
-    if expert_optimizer is not None:
-        optimizers.append(expert_optimizer)
     assigned = [p for opt in optimizers for group in opt.param_groups for p in group["params"]]
     assert len(assigned) == len(set(assigned)), "optimizer parameter ownership must be exclusive"
     assert set(assigned) == set(model.parameters()), "optimizers must cover every model parameter"
