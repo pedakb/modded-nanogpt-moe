@@ -201,8 +201,10 @@ def create_evaluation_batch(resolved_config, data_root):
 
 
 def load_or_create_evaluation_batch(output_dir, resolved_config, data_root,
-                                    create_fn=create_evaluation_batch):
-    path = Path(output_dir) / "eval_batch.pt"
+                                    create_fn=create_evaluation_batch,
+                                    eval_batch_path=None):
+    path = (Path(eval_batch_path).expanduser().resolve()
+            if eval_batch_path is not None else Path(output_dir) / "eval_batch.pt")
     expected = evaluation_batch_spec(resolved_config, data_root)
     if path.exists():
         payload = _torch_load(path)
@@ -240,13 +242,24 @@ def selected_dot_products(incoming_gradient, expert_outputs, order, top_k):
 
 
 @contextmanager
-def capture_moe_intermediates(model):
+def capture_moe_intermediates(model, layer_indices=None, *, include_routing_state=False):
     captures = {}
-    modules = [(index, block.mlp) for index, block in enumerate(model.blocks)
-               if isinstance(block.mlp, MoE)]
+    all_modules = [(index, block.mlp) for index, block in enumerate(model.blocks)
+                   if isinstance(block.mlp, MoE)]
+    if layer_indices is None:
+        modules = all_modules
+    else:
+        requested = set(layer_indices)
+        available = {index for index, _ in all_modules}
+        missing = sorted(requested - available)
+        if missing:
+            raise ValueError(f"requested layers are not MoE layers: {missing}")
+        modules = [(index, module) for index, module in all_modules
+                   if index in requested]
 
     def make_callback(layer_index):
-        def callback(router_logits, topk_experts, expert_outputs, order, combined_output):
+        def callback(router_logits, topk_experts, topk_weights, expert_outputs,
+                     order, combined_output, router_input):
             logits = router_logits.detach().float()
             captures[layer_index] = {
                 "selected_logits": logits.gather(1, topk_experts.detach()),
@@ -256,6 +269,12 @@ def capture_moe_intermediates(model):
                 "order": None if order is None else order.detach(),
                 "combined_output": combined_output,
             }
+            if include_routing_state:
+                captures[layer_index].update({
+                    "logits": logits,
+                    "topk_weights": topk_weights.detach(),
+                    "router_input": router_input.detach(),
+                })
         return callback
 
     try:
@@ -319,9 +338,10 @@ def finish_captured_layers(loss, captures, top_k):
     return layers
 
 
-def replay_diagnostics(model, inputs, targets, analysis_microbatch_sequences=None,
-                       compile_head=True):
-    """Replay a complete saved batch, optionally in contiguous sequence chunks."""
+def replay_fixed_batch_chunks(model, inputs, targets, process_chunk,
+                              analysis_microbatch_sequences=None,
+                              compile_head=True, return_token_loss=False):
+    """Shared fixed-batch replay driver for offline checkpoint extractors."""
     if inputs.ndim != 2 or targets.shape != inputs.shape:
         raise ValueError("diagnostic inputs and targets must have equal [B,T] shape")
     total_sequences = inputs.shape[0]
@@ -331,18 +351,29 @@ def replay_diagnostics(model, inputs, targets, analysis_microbatch_sequences=Non
         raise ValueError(
             "analysis_microbatch_sequences must be between 1 and the saved batch size")
 
-    head_loss = make_head_loss(model)
+    head_loss = make_head_loss(model, return_token_loss=return_token_loss)
     if compile_head:
         # This is the exact production MoE head/loss path. Compilation fuses
         # the full-vocabulary float/softcap/CE work that OOMs in eager mode.
         head_loss = torch.compile(head_loss, fullgraph=True, dynamic=False)
     device = next(model.parameters()).device
-    chunks = {}
-    expected_layers = None
+    results = []
     for start in range(0, total_sequences, chunk_sequences):
         stop = min(start + chunk_sequences, total_sequences)
         chunk_inputs = inputs[start:stop].to(device, non_blocking=True)
         chunk_targets = targets[start:stop].to(device, non_blocking=True)
+        results.append(process_chunk(model, head_loss, chunk_inputs, chunk_targets))
+        del chunk_inputs, chunk_targets
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    return results
+
+
+def replay_diagnostics(model, inputs, targets, analysis_microbatch_sequences=None,
+                       compile_head=True):
+    """Replay a complete saved batch, optionally in contiguous sequence chunks."""
+    def process_chunk(model, head_loss, chunk_inputs, chunk_targets):
         with capture_moe_intermediates(model) as (captures, chunk_expected_layers):
             prefix_output = eager_prefix(model, chunk_inputs)
             loss = head_loss(prefix_output, chunk_targets)
@@ -350,6 +381,16 @@ def replay_diagnostics(model, inputs, targets, analysis_microbatch_sequences=Non
                 raise RuntimeError("not every MoE layer produced an offline capture")
             chunk_layers = finish_captured_layers(
                 loss, captures, model.blocks[0].mlp.top_k)
+        del captures, prefix_output, loss
+        return chunk_layers, chunk_expected_layers
+
+    chunk_results = replay_fixed_batch_chunks(
+        model, inputs, targets, process_chunk,
+        analysis_microbatch_sequences=analysis_microbatch_sequences,
+        compile_head=compile_head)
+    chunks = {}
+    expected_layers = None
+    for chunk_layers, chunk_expected_layers in chunk_results:
         if expected_layers is None:
             expected_layers = chunk_expected_layers
         elif chunk_expected_layers != expected_layers:
@@ -361,10 +402,6 @@ def replay_diagnostics(model, inputs, targets, analysis_microbatch_sequences=Non
             })
             for name, tensor in layer.items():
                 destination[name].append(tensor)
-        del captures, chunk_layers, prefix_output, loss, chunk_inputs, chunk_targets
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     layers = {
         layer_index: {

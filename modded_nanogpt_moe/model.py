@@ -383,7 +383,8 @@ class MoE(nn.Module):
         out = out.view(B, T, D)
         if self._grad_em_diagnostics is not None:
             self._grad_em_diagnostics(
-                router_logits, topk_experts, selected_outputs, None, out)
+                router_logits, topk_experts, topk_weights, selected_outputs,
+                None, out, x)
         return out
 
     def _forward_grouped_gemm(self, x: Tensor):
@@ -498,7 +499,8 @@ class MoE(nn.Module):
             out = out.view(B, T, D)
         if self._grad_em_diagnostics is not None:
             self._grad_em_diagnostics(
-                router_logits, topk_experts, out_sorted, order, out)
+                router_logits, topk_experts, topk_weights, out_sorted, order,
+                out, x)
         if _moe_nsys_capture_active:
             _register_moe_backward_ranges(out, out_sorted, h_act, h_pre, x_sorted)
         return out
@@ -629,17 +631,23 @@ def eager_prefix(model: "GPT", inputs: Tensor) -> Tensor:
     return x
 
 
-def make_head_loss(model: "GPT"):
+def make_head_loss(model: "GPT", *, return_token_loss: bool = False):
     """GPT.forward's tail -- norm2 -> proj -> float -> softcap ->
     cross_entropy(reduction="sum") -- as a standalone callable closing over
     model.norm2/model.proj directly (the same nn.Parameter objects; no
     duplication), meant to be wrapped in torch.compile(fullgraph=True) and
-    called on eager_prefix's output. Byte-for-byte the same computation,
-    dtype casts, and loss reduction/scaling as GPT.forward -- this function
-    exists so the tail can be compiled independently of the (uncompiled)
-    block loop, not to change what is computed."""
+    called on eager_prefix's output. The default path is byte-for-byte the
+    same computation, dtype casts, and loss reduction/scaling as GPT.forward.
+    The offline-analysis-only option also returns the unreduced token losses,
+    whose sum is the ordinary loss. This function exists so the tail can be
+    compiled independently of the (uncompiled) block loop, not to change what
+    training computes."""
     def head_loss(x: Tensor, targets: Tensor) -> Tensor:
         logits = model.proj(model.norm2(x)).float()
         logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        if return_token_loss:
+            token_loss = F.cross_entropy(
+                logits.view(targets.numel(), -1), targets.view(-1), reduction="none")
+            return token_loss.sum(), token_loss
         return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
     return head_loss
