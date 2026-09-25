@@ -9,3 +9,6 @@ logs/
 slurm-*.out
 slurm-*.err
 data/
+
+# Local temporary configs
+/configs/*_tmp.toml
