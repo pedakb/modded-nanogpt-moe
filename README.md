@@ -16,10 +16,15 @@ its license and attribution.
 - `scripts/`: data download and LS6/Vista launchers.
 - `docs/`: system-specific implementation notes.
 
-Grad-EM has a CPU reference/autograd integration and a guarded CUDA candidate.
-CUDA training remains disabled pending GPU parity validation. See
-[`docs/grad_em.md`](docs/grad_em.md) for the contract and validation workflow;
-existing runs stay standard.
+Grad-EM supports global and local-BP modes. Local-BP supports both the loop
+reference and grouped-GEMM packed experts, keeping ordinary BP at each MoE
+input boundary. See [`docs/grad_em.md`](docs/grad_em.md) for the contract and
+[`docs/grouped_local_bp.md`](docs/grouped_local_bp.md) for GH200 parity results,
+timings, and the E8/K2 smoke command. Existing runs keep their configured mode.
+
+The [config catalog](configs/README.md) lists the standard BP, global Grad-EM,
+and local-BP comparison configs, resolved run identities, and Vista run-length
+and TensorBoard behavior.
 
 ## Environment
 

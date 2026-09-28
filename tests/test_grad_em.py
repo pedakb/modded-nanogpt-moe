@@ -239,8 +239,9 @@ def test_backward_mode_validation():
     config["model"].update(
         mlp_type="moe", moe_backward="grad_em", grad_em_mode="local_bp",
         moe_backend="grouped_gemm")
-    with pytest.raises(ValueError, match="loop MoE with modulelist"):
-        validate_experiment_config(config)
+    validate_experiment_config(config)
+    config["model"]["moe_parameter_layout"] = "packed"
+    validate_experiment_config(config)
 
 
 def test_checkpoint_backward_metadata_legacy_defaults_and_incompatibility():

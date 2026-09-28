@@ -164,13 +164,6 @@ def validate_experiment_config(config, require_run_name=False):
     if (config["model"]["moe_backward"] == "grad_em"
             and config["model"]["mlp_type"] != "moe"):
         raise ValueError("model.moe_backward='grad_em' requires MoE")
-    if (config["model"]["moe_backward"] == "grad_em"
-            and config["model"]["grad_em_mode"] == "local_bp"
-            and (config["model"]["moe_backend"] != "loop"
-                 or config["model"]["moe_parameter_layout"] != "modulelist")):
-        raise ValueError(
-            "model.grad_em_mode='local_bp' currently requires loop MoE with "
-            "modulelist parameters")
     layout = config["model"]["moe_parameter_layout"]
     if layout not in ("modulelist", "packed"):
         raise ValueError("model.moe_parameter_layout must be 'modulelist' or 'packed'")

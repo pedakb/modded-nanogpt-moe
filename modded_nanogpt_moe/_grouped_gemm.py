@@ -83,6 +83,16 @@ def native_gmm(a, b, offsets, phase):
     return _NativeGroupedGemm.apply(a, b, offsets, phase)
 
 
+def expert_dgrad(grad, weight, counts, offsets, implementation, phase):
+    """Input VJP only, using weights/metadata validated by the original forward."""
+    grad = grad.contiguous()
+    with _range(phase, "dx_bp"):
+        if implementation == "torch":
+            return native_phase(None, weight, offsets, "dx", grad)
+        from grouped_gemm import backend
+        return backend.gmm(grad, weight, counts, trans_a=False, trans_b=True)
+
+
 class _ProfiledExtensionGemm(torch.autograd.Function):
     """Exact trans_b=False ops.py call sequence, with separate enqueue ranges.
 

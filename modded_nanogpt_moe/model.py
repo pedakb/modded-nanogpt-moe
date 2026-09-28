@@ -288,10 +288,6 @@ class MoE(nn.Module):
             raise ValueError("grad_em_mode must be 'global' or 'local_bp'")
         if moe_backward == "grad_em" and grad_em_mode == "global" and moe_backend != "grouped_gemm":
             raise NotImplementedError("Grad-EM Stage 2A requires the grouped_gemm combine boundary")
-        if (moe_backward == "grad_em" and grad_em_mode == "local_bp"
-                and (moe_backend != "loop" or moe_parameter_layout != "modulelist")):
-            raise NotImplementedError(
-                "local-BP Grad-EM currently requires loop MoE with modulelist parameters")
         self.moe_backward = moe_backward
         self.grad_em_mode = grad_em_mode
         self.grad_em_eta = grad_em_eta
@@ -351,7 +347,8 @@ class MoE(nn.Module):
             self._gmm = grouped_gemm.ops.gmm
 
     def forward(self, x: Tensor):
-        if self.moe_backward == "grad_em" and self.grad_em_mode == "local_bp":
+        if (self.moe_backward == "grad_em" and self.grad_em_mode == "local_bp"
+                and self.moe_backend == "loop"):
             from .grad_em import LocalBPGradEM
             parameters = tuple(parameter for parameter in self.parameters()
                                if parameter.requires_grad)
@@ -428,10 +425,20 @@ class MoE(nn.Module):
         x = x.view(-1, D)
         N = x.shape[0]
         device = x.device
+        local_bp = self.moe_backward == "grad_em" and self.grad_em_mode == "local_bp"
+        bp_x = x if local_bp and torch.is_grad_enabled() and x.requires_grad else None
+        if local_bp:
+            # Only the input-only branch below may cross this MoE boundary.
+            x = x.detach()
 
         with nsys_range(_moe_nsys_capture_active, "moe.router_topk"):
             router_logits = self.router(x)
-            routing_weights = F.softmax(router_logits.float(), dim=-1)
+            routing_logits = router_logits
+            if bp_x is not None:
+                from ._local_bp import RouterInputOnly
+                routing_logits = RouterInputOnly.apply(
+                    bp_x, router_logits.detach(), self.router.weight.detach().type_as(x))
+            routing_weights = F.softmax(routing_logits.float(), dim=-1)
             topk_weights, topk_experts = routing_weights.topk(self.top_k, dim=-1)
             if self.normalize_topk:
                 topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -512,6 +519,14 @@ class MoE(nn.Module):
                                           topk_experts, order, self.grad_em_eta,
                                           (self._routing_diagnostics.observe_sensitivity
                                            if self._routing_diagnostics is not None else None))
+                if bp_x is not None:
+                    from ._local_bp import ExpertInputOnly, LocalBPOutput
+                    bp_experts = ExpertInputOnly.apply(
+                        bp_x, out_sorted.detach(), h_pre.detach(), fc_w.detach(),
+                        proj_w.detach(), batch_sizes, offsets, order, self.top_k,
+                        self.gmm_implementation)
+                    bp_out = combine_expert_outputs(bp_experts, topk_weights, order)
+                    out = LocalBPOutput.apply(out, bp_out)
             out = out.view(B, T, D)
         if self._grad_em_diagnostics is not None:
             self._grad_em_diagnostics(

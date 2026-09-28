@@ -182,10 +182,10 @@ def test_two_moe_local_mode_anchors_each_layer_to_standard_bp(cpu_gmm):
             rtol=1e-6, atol=1e-7, msg=name)
 
 
-def test_local_mode_rejects_optimized_layouts_until_implemented(cpu_gmm):
-    with pytest.raises(NotImplementedError, match="loop MoE with modulelist"):
-        MoE(4, 3, 2, hidden_dim=5, moe_backend="grouped_gemm",
-            moe_backward="grad_em", grad_em_mode="local_bp")
+@pytest.mark.parametrize("layout", ["modulelist", "packed"])
+def test_local_mode_accepts_grouped_layouts(cpu_gmm, layout):
+    MoE(4, 3, 2, hidden_dim=5, moe_backend="grouped_gemm",
+        moe_parameter_layout=layout, moe_backward="grad_em", grad_em_mode="local_bp")
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires Apple MPS")

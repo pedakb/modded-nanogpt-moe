@@ -46,9 +46,10 @@ requires MoE. `grad_em_mode` defaults to `"global"`; `"local_bp"` selects the
 BP-anchored variant below. `grad_em_eta` defaults to `0.1`, must be finite and
 positive, and is fixed (no schedule). Existing TOMLs therefore retain global
 behavior. Global mode supports the grouped-GEMM combine boundary on CPU (tests
-supply a differentiable CPU GEMM double) and CUDA. Local-BP initially supports
-the device-agnostic eager loop with ModuleList experts, including CPU and MPS;
-grouped-GEMM and packed parameters are rejected clearly.
+supply a differentiable CPU GEMM double) and CUDA. Local-BP supports the
+device-agnostic eager loop with ModuleList experts, including CPU and MPS,
+and grouped-GEMM with packed or ModuleList parameters. The grouped path uses
+the same CPU/CUDA device and backend dtype restrictions as global mode.
 
 Resolved experiment/checkpoint configs record all three fields. Compatibility
 checks interpret missing legacy fields as `"standard"` / `"global"` / `0.1`, without
@@ -93,12 +94,18 @@ differentiated only with respect to MoE parameters using `q*g` and
 `(a-q)/eta`. Thus expert/router replacement gradients remain local and cannot
 change the signal passed to an earlier block. No expert forward is repeated.
 
-The first correctness implementation intentionally uses PyTorch autograd rather
-than grouped-GEMM, Triton, or custom CUDA. It is once-differentiable and is not
-presented as a performance implementation. The portable smoke configuration is
-`configs/moe_e8k2_r2_gradem_local_bp.toml`.
+This loop reference is once-differentiable. Its portable smoke configuration
+remains `configs/moe_e8k2_r2_gradem_local_bp.toml`.
 
-## CUDA implementation (correction needs GPU validation)
+The grouped implementation records the existing Grad-EM parameter graph on
+detached inputs. Input-only forward identities reuse the router logits and
+expert activations to supply a separate standard-BP input VJP, with direct
+dgrad-only backend calls and the existing softmax/top-k/normalization backward.
+There is no repeated expert forward or wgrad. See
+[`grouped_local_bp.md`](grouped_local_bp.md) for the derivation, precise costs,
+validation results, and `configs/moe_e8k2_r2_gradem_local_bp_packed.toml`.
+
+## CUDA implementation
 
 `_grad_em_cuda.py` adds two backward kernels. First, one program per token loads
 K sorted rows via the compact inverse permutation and reduces FP32 products
@@ -119,16 +126,18 @@ Expected launches with both gradients: two forward + two backward. Tests can
 optionally emit a compact FP32 v buffer; normal backward does not allocate it.
 Normal scratch is inverse rows (8*T*K bytes, saved) and q (4*T*K bytes,
 backward only), besides required outputs/gradients. At T=65536,K=8 these are
-4 MiB and 2 MiB, respectively; measured peak memory is still unknown.
+4 MiB and 2 MiB, respectively. Full E8/K2 layer memory measurements are in
+[`grouped_local_bp.md`](grouped_local_bp.md).
 
 Candidate supports FP32/BF16/FP16, strided inputs, expanded incoming gradients,
 and empty token batches. Current explicit tile bounds: K<=32, D<=4096, E<=1024,
 rounded K*D<=32768. Higher-order backward remains unsupported. No performance
 claim: register pressure and the extra router kernel must be measured on GH200.
 
-Tests use the public CUDA path without a guard bypass. Re-run acceptance for
-this mathematical correction before training; old GPU results do not validate
-the new rule. This Mac cannot compile/execute Triton CUDA or establish correctness.
+Tests use the public CUDA path without a guard bypass. On 2026-09-28, all 63
+tests in `tests/test_grad_em_cuda.py` passed on GH200 with the native grouped
+backend, including the corrected selected-support rule. Local-BP parity and
+layer timings are recorded in [`grouped_local_bp.md`](grouped_local_bp.md).
 
 On an existing Vista GH200 allocation, from the repository root:
 
@@ -144,8 +153,8 @@ uv run --no-sync python -m pytest -q -rs \
 ```
 
 Inspect any skip reasons, especially missing grouped GEMM. Record device,
-PyTorch/Triton versions and results. No GPU tests/smokes/benchmarks have been run
-for this selected-support correction in the current local session.
+PyTorch/Triton versions and results. Dataset training smokes remain separate
+from the completed layer/kernel validation and timing measurements.
 
 ### Smokes and benchmark (only AFTER validation of the current rule)
 
