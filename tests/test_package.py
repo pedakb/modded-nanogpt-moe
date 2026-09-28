@@ -389,6 +389,7 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path, steps, smok
         "\"${CHECKPOINT_DIR-}\" \"${CHECKPOINT_INTERVAL-}\" "
         "\"${CHECKPOINT_ROOT-}\" \"${CHECKPOINT_POLICY_DISABLED-}\" "
         "\"${TB_ROOT-}\" \"${TB_SYSTEM-}\" "
+        "\"${CC-}\" \"${CXX-}\" \"${CUDAHOSTCXX-}\" "
         "> \"$LAUNCH_CAPTURE\"\n"
         "printf '%s\\n' \"$@\" >> \"$LAUNCH_CAPTURE\"\n"
     )
@@ -411,6 +412,9 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path, steps, smok
     environment["CHECKPOINT_INTERVAL"] = "99"
     environment["CHECKPOINT_ROOT"] = "/stale/checkpoint-root"
     environment["CHECKPOINT_POLICY_DISABLED"] = "1"
+    environment["CC"] = "/stale/cc"
+    environment["CXX"] = "/stale/cxx"
+    environment["CUDAHOSTCXX"] = "/stale/cuda-host-cxx"
 
     config_path = repository_root / "configs/moe_e64k8_r0.5_gradem_local_bp_eta0.01.toml"
     step_arguments = [] if steps is None else ["--steps", str(steps)]
@@ -432,7 +436,8 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path, steps, smok
         "", "", str(tmp_path / "stockyard/checkpoints/modded-nanogpt-moe"),
         "1" if smoke else "", "" if smoke else str(tmp_path / "stockyard/tensorboard"), "vista",
     ]
-    assert captured[14:] == [
+    assert captured[14:17] == ["/usr/bin/gcc", "/usr/bin/g++", "/usr/bin/g++"]
+    assert captured[17:] == [
         "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
         "--module", "modded_nanogpt_moe.train", "--config",
         str(config_path),
