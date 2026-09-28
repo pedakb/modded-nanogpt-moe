@@ -21,6 +21,7 @@ Options:
   --account ACCOUNT        Set the Slurm allocation account (requires --submit)
   --sbatch-arg OPTION      Forward one --option[=value] to sbatch (repeatable)
   --steps N                Stop after N completed updates; preserve configured schedule
+  --smoke                  Disable TensorBoard and all checkpoints (requires --steps)
   --checkpoint-interval N  Save per-run checkpoints every N updates (0 = final only)
   --resume PATH            Resume the first config from PATH
   -h, --help               Show this help
@@ -35,6 +36,7 @@ walltime=""
 walltime_set=0
 sbatch_options=()
 steps=""
+smoke=0
 checkpoint_interval=""
 resume_checkpoint=""
 config_arguments=()
@@ -61,6 +63,10 @@ while [[ $# -gt 0 ]]; do
             fi
             steps="$2"
             shift 2
+            ;;
+        --smoke)
+            smoke=1
+            shift
             ;;
         --job-name|--account|--sbatch-arg)
             if [[ $# -lt 2 || -z "$2" ]]; then
@@ -179,6 +185,10 @@ if [[ ${#sbatch_options[@]} -gt 0 ]]; then
         fi
     done
 fi
+if [[ "$smoke" -eq 1 && -z "$steps" ]]; then
+    echo "Error: --smoke requires --steps N" >&2
+    exit 2
+fi
 if [[ -n "$steps" && ! "$steps" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: --steps must be a positive integer, got: $steps" >&2
     exit 2
@@ -188,7 +198,7 @@ if [[ -n "$checkpoint_interval" && ! "$checkpoint_interval" =~ ^[0-9]+$ ]]; then
     exit 2
 fi
 if [[ "$submit" -eq 1 && -n "$steps" ]]; then
-    echo "Error: --steps is for current-node smoke tests and cannot be used with --submit" >&2
+    echo "Error: --steps is for current-node runs and cannot be used with --submit" >&2
     exit 2
 fi
 if [[ -n "$steps" && ( -n "$checkpoint_interval" || -n "$resume_checkpoint" ) ]]; then
@@ -294,13 +304,6 @@ fi
 
 source "$repo_root/scripts/vista/env.sh"
 
-smoke_checkpoint_dir=""
-if [[ -n "$steps" ]]; then
-    smoke_checkpoint_dir="$STOCKYARD/checkpoints/modded-nanogpt-moe"
-    smoke_checkpoint_dir+="/interactive-smoke/${run_names[0]}"
-    smoke_checkpoint_dir+="/$(date '+%Y%m%d-%H%M%S')-$$"
-fi
-
 if [[ "$worker" -eq 1 ]]; then
     log_dir="$STOCKYARD/logs/modded-nanogpt-moe/vista/slurm"
     mkdir -p "$log_dir"
@@ -342,12 +345,10 @@ for index in "${!config_paths[@]}"; do
         MOE_GMM_IMPLEMENTATION=torch
     )
     if [[ -n "$steps" ]]; then
-        training_environment+=(
-            "STOP_AFTER_COMPLETED_UPDATES=$steps"
-            "CHECKPOINT_DIR=$smoke_checkpoint_dir"
-            CHECKPOINT_POLICY_DISABLED=1
-            "TB_ROOT="
-        )
+        training_environment+=("STOP_AFTER_COMPLETED_UPDATES=$steps")
+    fi
+    if [[ "$smoke" -eq 1 ]]; then
+        training_environment+=(CHECKPOINT_POLICY_DISABLED=1 "TB_ROOT=")
     fi
     if [[ "$benchmark_worker" -eq 1 ]]; then
         training_environment+=(TRAINING_BENCHMARK=1 "TB_ROOT=")

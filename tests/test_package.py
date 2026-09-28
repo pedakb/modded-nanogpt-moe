@@ -1,6 +1,5 @@
 import io
 import os
-import re
 import subprocess
 import tomllib
 import types
@@ -371,7 +370,8 @@ def test_olmoe_style_production_config_changes_only_controlled_geometry():
     ) == 384
 
 
-def test_vista_launcher_scopes_machine_and_run_environment(tmp_path):
+@pytest.mark.parametrize("steps,smoke", [(None, False), (250, False), (500, False), (2, True)])
+def test_vista_launcher_scopes_machine_and_run_environment(tmp_path, steps, smoke):
     repository_root = Path(__file__).resolve().parents[1]
     launcher = repository_root / "scripts/vista/train.sh"
     fake_bin = tmp_path / "bin"
@@ -410,13 +410,14 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path):
     environment["CHECKPOINT_DIR"] = "/stale/checkpoints"
     environment["CHECKPOINT_INTERVAL"] = "99"
     environment["CHECKPOINT_ROOT"] = "/stale/checkpoint-root"
-    environment["CHECKPOINT_POLICY_DISABLED"] = "0"
+    environment["CHECKPOINT_POLICY_DISABLED"] = "1"
 
+    config_path = repository_root / "configs/moe_e64k8_r0.5_gradem_local_bp_eta0.01.toml"
+    step_arguments = [] if steps is None else ["--steps", str(steps)]
+    if smoke:
+        step_arguments.insert(0, "--smoke")
     subprocess.run(
-        [
-            "bash", str(launcher), "--steps", "250",
-            "configs/moe_e64k8_r0.5.toml",
-        ],
+        ["bash", str(launcher), *step_arguments, str(config_path.relative_to(repository_root))],
         cwd=outside_repository,
         env=environment,
         check=True,
@@ -425,33 +426,33 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path):
     captured = capture.read_text().splitlines()
     assert captured[:8] == [
         str(repository_root), str(repository_root), "", "torch",
-        "", "", "", "250",
+        "", "", "", "" if steps is None else str(steps),
     ]
-    smoke_checkpoint_dir = Path(captured[8])
-    assert smoke_checkpoint_dir.parent == (
-        tmp_path / "stockyard/checkpoints/modded-nanogpt-moe"
-        / "interactive-smoke/moe-e64k8-r0.5")
-    assert re.fullmatch(r"\d{8}-\d{6}-\d+", smoke_checkpoint_dir.name)
-    assert captured[9:14] == [
-        "", str(tmp_path / "stockyard/checkpoints/modded-nanogpt-moe"),
-        "1", "", "vista",
+    assert captured[8:14] == [
+        "", "", str(tmp_path / "stockyard/checkpoints/modded-nanogpt-moe"),
+        "1" if smoke else "", "" if smoke else str(tmp_path / "stockyard/tensorboard"), "vista",
     ]
     assert captured[14:] == [
         "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
         "--module", "modded_nanogpt_moe.train", "--config",
-        str(repository_root / "configs/moe_e64k8_r0.5.toml"),
+        str(config_path),
     ]
-    assert load_experiment_config(
-        repository_root / "configs/moe_e64k8_r0.5.toml"
-    )["training"]["total_steps"] == 3250
+    config = load_experiment_config(config_path)
+    assert config["training"]["total_steps"] == 3250
+    assert config["checkpoint"]["interval"] == 250
+    assert not (tmp_path / "stockyard").exists()  # The launcher creates no output directories.
 
 
 @pytest.mark.parametrize(
     "arguments,message",
     [
+        (["--smoke"], "Error: --smoke requires --steps N"),
         (["--steps", "0"], "--steps must be a positive integer"),
         (["--steps", "abc"], "--steps must be a positive integer"),
         (["--steps", "1", "--submit"], "cannot be used with --submit"),
+        (["--smoke", "--steps", "2", "--submit"], "cannot be used with --submit"),
+        (["--benchmark-worker", "--smoke", "--steps", "2"],
+         "benchmark worker mode cannot use step, checkpoint, or resume options"),
         (["--steps", "1", "--checkpoint-interval", "1"],
          "cannot be combined with checkpoint or resume options"),
         (["--steps", "1", "--resume", "/unused/checkpoint.pt"],

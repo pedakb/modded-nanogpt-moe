@@ -189,14 +189,17 @@ def main(argv=None):
         explicit_checkpoint_dir or checkpoint_interval is not None
         or resume_checkpoint_path
         or stop_after_updates is not None)
+    # All save paths require a directory, including final and early-stop saves.
+    # Keep the requested controls above for validation even when writes are disabled.
     checkpoint_dir = checkpoint_directory_from_environment(
-        requested_run_name, checkpointing_requested)
+        requested_run_name,
+        checkpointing_requested and checkpoint_policy_disabled_value != "1")
     if checkpointing_requested:
         if dist.get_world_size() != 1:
             raise ValueError("checkpoint/resume currently requires exactly one GPU")
         if num_trials != 1:
             raise ValueError("checkpoint/resume currently requires exactly one trial")
-        if not checkpoint_dir:
+        if not checkpoint_dir and checkpoint_policy_disabled_value != "1":
             raise ValueError(
                 "CHECKPOINT_DIR is required when checkpointing, resuming, or stopping early")
     if benchmark["enabled"] and checkpointing_requested:
@@ -264,7 +267,7 @@ def main(argv=None):
     print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
            + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
     print0("="*100)
-    if checkpointing_requested:
+    if checkpoint_dir:
         print0(
             f"checkpointing: directory={checkpoint_dir} interval={checkpoint_interval or 0} "
             f"resume={resume_checkpoint_path or 'none'} "
@@ -404,7 +407,7 @@ def main(argv=None):
             ),
         },
         "checkpoint": {
-            "enabled": checkpointing_requested,
+            "enabled": bool(checkpoint_dir),
             "directory": (
                 str(Path(checkpoint_dir).expanduser().resolve())
                 if checkpoint_dir else None
@@ -482,7 +485,7 @@ def main(argv=None):
         raise ValueError(f"unknown mlp_type: {mlp_type!r}")
     
     environment_metadata = None
-    if checkpointing_requested:
+    if checkpoint_dir:
         environment_metadata = dict(startup_environment)
         environment_metadata["runtime"] = runtime_config
     stopped_early = False
