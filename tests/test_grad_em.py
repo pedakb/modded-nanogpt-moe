@@ -198,6 +198,7 @@ def test_invalid_eta_rejected_by_reference_and_config(eta):
 def test_existing_configs_have_valid_backward_configuration(path):
     config = load_experiment_config(path)
     assert config["model"]["moe_backward"] in ("standard", "grad_em")
+    assert config["model"]["grad_em_mode"] in ("global", "local_bp")
     assert config["model"]["grad_em_eta"] > 0
 
 
@@ -209,6 +210,7 @@ def test_grad_em_toml_reaches_cuda_training_setup(tmp_path, monkeypatch):
                     'moe_backend = "grouped_gemm"\n')
     config = load_experiment_config(path)
     assert config["model"]["moe_backward"] == "grad_em"
+    assert config["model"]["grad_em_mode"] == "global"
     assert config["model"]["grad_em_eta"] == 0.2
     monkeypatch.delenv("MLP_TYPE_OVERRIDE", raising=False)
     monkeypatch.setenv("LOCAL_RANK", "0")
@@ -230,22 +232,35 @@ def test_backward_mode_validation():
     config["model"]["moe_backward"] = "grad_em"
     with pytest.raises(ValueError, match="requires MoE"):
         validate_experiment_config(config)
+    config = load_experiment_config()
+    config["model"]["grad_em_mode"] = "unknown"
+    with pytest.raises(ValueError, match="global.*local_bp"):
+        validate_experiment_config(config)
+    config["model"].update(
+        mlp_type="moe", moe_backward="grad_em", grad_em_mode="local_bp",
+        moe_backend="grouped_gemm")
+    with pytest.raises(ValueError, match="loop MoE with modulelist"):
+        validate_experiment_config(config)
 
 
 def test_checkpoint_backward_metadata_legacy_defaults_and_incompatibility():
     legacy = {"model": {"mlp_type": "moe"}, "training": {"total_steps": 20}}
     current = copy.deepcopy(legacy)
-    current["model"].update(moe_backward="standard", grad_em_eta=0.1)
+    current["model"].update(
+        moe_backward="standard", grad_em_mode="global", grad_em_eta=0.1)
     checkpoint = {"format_version": CHECKPOINT_FORMAT_VERSION, "resolved_config": legacy}
     validate_checkpoint_config(checkpoint, current)
     validate_checkpoint_config({**checkpoint, "resolved_config": current}, legacy)
-    for key, value in [("moe_backward", "grad_em"), ("grad_em_eta", 0.2)]:
+    for key, value in [
+            ("moe_backward", "grad_em"), ("grad_em_mode", "local_bp"),
+            ("grad_em_eta", 0.2)]:
         changed = copy.deepcopy(current)
         changed["model"][key] = value
         with pytest.raises(ValueError, match="incompatible"):
             validate_checkpoint_config(checkpoint, changed)
         validate_checkpoint_config({**checkpoint, "resolved_config": changed}, changed)
     assert "moe_backward" not in legacy["model"]  # no checkpoint mutation
+    assert "grad_em_mode" not in legacy["model"]
     assert "grad_em_eta" not in legacy["model"]
 
 

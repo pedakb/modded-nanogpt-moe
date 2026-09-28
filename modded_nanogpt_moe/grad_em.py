@@ -19,6 +19,73 @@ def require_grad_em_device(device):
             "Grad-EM supports only CPU and CUDA devices")
 
 
+class LocalBPGradEM(torch.autograd.Function):
+    """Use ordinary BP at the MoE input and Grad-EM for local parameters.
+
+    The eager ModuleList forward is recorded once behind this boundary. Its
+    ordinary output graph supplies only the input VJP. Separate VJPs from the
+    same saved router logits and selected expert outputs supply parameter
+    gradients, so replacement signals never cross the MoE input boundary.
+    """
+
+    @staticmethod
+    def forward(ctx, x, module, *parameters):
+        validate_grad_em_eta(module.grad_em_eta)
+        # A fresh local leaf prevents the graph recorded inside the custom
+        # Function from reaching upstream. backward() explicitly returns its
+        # ordinary VJP to the original x input.
+        inner_x = x.detach().requires_grad_(x.requires_grad)
+        with torch.enable_grad():
+            output, logits, indices, selected_outputs = module._forward_loop(
+                inner_x, return_local_components=True)
+        # Keep the inner graph tensors as Python attributes: saving the tensor
+        # returned by this Function would expose its outer custom grad_fn in
+        # backward instead of the ordinary graph recorded above.
+        ctx.inner_x = inner_x
+        ctx.output = output
+        ctx.logits = logits
+        ctx.indices = indices
+        ctx.selected_outputs = selected_outputs
+        ctx.parameters = parameters
+        ctx.eta = module.grad_em_eta
+        ctx.sensitivity_observer = (
+            module._routing_diagnostics.observe_sensitivity
+            if module._routing_diagnostics is not None else None)
+        ctx.logit_gradient_observer = (
+            module._routing_diagnostics.observe_logit_gradient
+            if module._routing_diagnostics is not None else None)
+        return output.detach()
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output):
+        inner_x, output = ctx.inner_x, ctx.output
+        logits, indices = ctx.logits, ctx.indices
+        selected_outputs, parameters = ctx.selected_outputs, ctx.parameters
+        result = grad_em_reference(
+            logits, indices, selected_outputs, grad_output.flatten(0, 1), ctx.eta)
+        if ctx.sensitivity_observer is not None:
+            ctx.sensitivity_observer(result.v)
+        if ctx.logit_gradient_observer is not None:
+            ctx.logit_gradient_observer(result.grad_logits.to(logits.dtype))
+
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            grad_x, = torch.autograd.grad(
+                output, inner_x, grad_output, retain_graph=True,
+                create_graph=False, allow_unused=False)
+
+        parameter_grads = torch.autograd.grad(
+            (selected_outputs, logits), parameters,
+            (result.grad_expert.to(selected_outputs.dtype),
+             result.grad_logits.to(logits.dtype)),
+            create_graph=False, allow_unused=True)
+        parameter_grads = tuple(
+            torch.zeros_like(parameter) if gradient is None else gradient
+            for parameter, gradient in zip(parameters, parameter_grads))
+        return (grad_x, None, *parameter_grads)
+
+
 class GradEMCombine(torch.autograd.Function):
     """Leave the expert graph intact with CPU reference and CUDA execution.
 

@@ -331,6 +331,7 @@ def test_dense_example_config_resolves_current_training_defaults():
         "moe_backend": "loop",
         "moe_parameter_layout": "modulelist",
         "moe_backward": "standard",
+        "grad_em_mode": "global",
         "grad_em_eta": 0.1,
     }
     assert config["training"]["global_batch_tokens"] == 524288

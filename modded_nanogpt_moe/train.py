@@ -444,6 +444,7 @@ def main(argv=None):
                 moe_backend=moe_backend, mlp_ratio=mlp_ratio,
                 moe_parameter_layout=model_config["moe_parameter_layout"],
                 moe_backward=model_config["moe_backward"],
+                grad_em_mode=model_config["grad_em_mode"],
                 grad_em_eta=model_config["grad_em_eta"])
     assert model.hidden_dim == hidden_dim
     gmm_implementation = (model.blocks[0].mlp.gmm_implementation if mlp_type == "moe" else "n/a")
@@ -564,6 +565,7 @@ def main(argv=None):
                 "normalize_topk": normalize_topk,
                 "moe_backend": moe_backend,
                 "moe_backward": model_config["moe_backward"],
+                "grad_em_mode": model_config["grad_em_mode"],
                 "grad_em_eta": model_config["grad_em_eta"],
             },
             "training": {

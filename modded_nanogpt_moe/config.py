@@ -38,6 +38,7 @@ DEFAULT_CONFIG = {
         "moe_backend": "loop",
         "moe_parameter_layout": "modulelist",
         "moe_backward": "standard",
+        "grad_em_mode": "global",
         "grad_em_eta": 0.1,
     },
     "training": {
@@ -157,10 +158,19 @@ def validate_experiment_config(config, require_run_name=False):
         raise ValueError("model.moe_backend must be 'loop' or 'grouped_gemm'")
     if config["model"]["moe_backward"] not in ("standard", "grad_em"):
         raise ValueError("model.moe_backward must be 'standard' or 'grad_em'")
+    if config["model"]["grad_em_mode"] not in ("global", "local_bp"):
+        raise ValueError("model.grad_em_mode must be 'global' or 'local_bp'")
     validate_grad_em_eta(config["model"]["grad_em_eta"])
     if (config["model"]["moe_backward"] == "grad_em"
             and config["model"]["mlp_type"] != "moe"):
         raise ValueError("model.moe_backward='grad_em' requires MoE")
+    if (config["model"]["moe_backward"] == "grad_em"
+            and config["model"]["grad_em_mode"] == "local_bp"
+            and (config["model"]["moe_backend"] != "loop"
+                 or config["model"]["moe_parameter_layout"] != "modulelist")):
+        raise ValueError(
+            "model.grad_em_mode='local_bp' currently requires loop MoE with "
+            "modulelist parameters")
     layout = config["model"]["moe_parameter_layout"]
     if layout not in ("modulelist", "packed"):
         raise ValueError("model.moe_parameter_layout must be 'modulelist' or 'packed'")

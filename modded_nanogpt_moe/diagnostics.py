@@ -224,8 +224,10 @@ class TrainingDiagnostics:
                     moe.num_experts, moe.top_k, moe.normalize_topk)
                 self.routing[layer] = stats
                 moe._routing_diagnostics = stats
-                router_handles.append(moe.router.register_forward_hook(
-                    stats.attach_logit_gradient))
+                if not (moe.moe_backward == "grad_em"
+                        and moe.grad_em_mode == "local_bp"):
+                    router_handles.append(moe.router.register_forward_hook(
+                        stats.attach_logit_gradient))
             yield
         finally:
             for handle in router_handles:

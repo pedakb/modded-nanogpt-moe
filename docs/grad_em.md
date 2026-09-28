@@ -42,16 +42,16 @@ in exact arithmetic `log(p_selected)` differs only by a common shift.
 ## Configuration and compatibility
 
 `[model].moe_backward` defaults to `"standard"`; `"grad_em"` is opt-in and
-requires MoE. `grad_em_eta` defaults to `0.1`, must be finite and positive,
-and is fixed (no schedule). Existing TOMLs remain unchanged. Stage 2A supports
-the grouped-GEMM combine boundary on CPU (tests supply a differentiable CPU
-GEMM double; the external CUDA extension itself has no CPU fallback).
-The loop backend explicitly rejects Grad-EM. CPU/CUDA devices are supported;
-the prior CUDA implementation was enabled after user-reported GH200 validation.
-This selected-support correction needs fresh GH200 validation.
+requires MoE. `grad_em_mode` defaults to `"global"`; `"local_bp"` selects the
+BP-anchored variant below. `grad_em_eta` defaults to `0.1`, must be finite and
+positive, and is fixed (no schedule). Existing TOMLs therefore retain global
+behavior. Global mode supports the grouped-GEMM combine boundary on CPU (tests
+supply a differentiable CPU GEMM double) and CUDA. Local-BP initially supports
+the device-agnostic eager loop with ModuleList experts, including CPU and MPS;
+grouped-GEMM and packed parameters are rejected clearly.
 
-Resolved experiment/checkpoint configs record both fields. Compatibility
-checks interpret missing legacy fields as `"standard"` / `0.1`, without
+Resolved experiment/checkpoint configs record all three fields. Compatibility
+checks interpret missing legacy fields as `"standard"` / `"global"` / `0.1`, without
 mutating the checkpoint. Explicit mode/eta mismatches are rejected. No model
 state keys or checkpoint format version change.
 
@@ -82,6 +82,21 @@ The backward is explicitly once-differentiable; q has no higher-order graph.
 Standard mode keeps its existing combine call, with no new autograd boundary,
 saved tensors or tensor operations. GEMM, routing, bias, optimizer, kernels and
 compilation boundaries are unchanged. No checkpoint keys change.
+
+## Local-BP boundary
+
+`LocalBPGradEM` records one ordinary eager MoE forward behind a custom autograd
+boundary. In backward, the ordinary output graph is differentiated only with
+respect to a detached local copy of the MoE input, producing the exact standard
+BP input VJP. The same forward's selected expert outputs and router logits are
+differentiated only with respect to MoE parameters using `q*g` and
+`(a-q)/eta`. Thus expert/router replacement gradients remain local and cannot
+change the signal passed to an earlier block. No expert forward is repeated.
+
+The first correctness implementation intentionally uses PyTorch autograd rather
+than grouped-GEMM, Triton, or custom CUDA. It is once-differentiable and is not
+presented as a performance implementation. The portable smoke configuration is
+`configs/moe_e8k2_r2_gradem_local_bp.toml`.
 
 ## CUDA implementation (correction needs GPU validation)
 

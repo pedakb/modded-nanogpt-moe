@@ -154,7 +154,9 @@ def test_default_standard_never_calls_custom_boundary(cpu_gmm, monkeypatch):
 def test_config_reaches_each_moe_block(cpu_gmm):
     model = GPT(37, 2, 128, mlp_type="moe", num_experts=8, top_k=2,
                 moe_backend="grouped_gemm", moe_backward="grad_em", grad_em_eta=0.7)
-    assert all(block.mlp.moe_backward == "grad_em" and block.mlp.grad_em_eta == 0.7
+    assert all(block.mlp.moe_backward == "grad_em"
+               and block.mlp.grad_em_mode == "global"
+               and block.mlp.grad_em_eta == 0.7
                for block in model.blocks)
 
 
