@@ -171,12 +171,13 @@ From the repository root on an existing Vista GPU allocation:
 
 ```bash
 source scripts/vista/env.sh
-scripts/vista/train.sh --steps 2 configs/moe_e8k2_r2_gradem_local_bp_packed.toml
+scripts/vista/train.sh --smoke --steps 2 configs/moe_e8k2_r2_gradem_local_bp_packed.toml
 ```
 
-The launcher scopes native GEMM to the trainer, disables TensorBoard and
-periodic checkpoints for this smoke, preserves the schedule horizon, and saves
-completion state under its separate interactive-smoke directory. This session
+The launcher scopes native GEMM to the trainer and stops after two completed
+updates while preserving the full schedule horizon. `--smoke` disables
+TensorBoard and all checkpoint writes without creating a checkpoint directory;
+omit it to retain normal logging and checkpointing. The validation session
 validated the layer/backward and ran benchmarks; it did not launch a dataset
 training smoke or a production training run.
 

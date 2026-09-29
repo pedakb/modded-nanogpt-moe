@@ -175,9 +175,9 @@ PY
 log_dir="$STOCKYARD/logs/modded-nanogpt-moe/vista/grad-em-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$log_dir"
 set -o pipefail
-scripts/vista/train.sh --steps 2 "$grad_em_config" 2>&1 | tee "$log_dir/smoke-2.log"
+scripts/vista/train.sh --smoke --steps 2 "$grad_em_config" 2>&1 | tee "$log_dir/smoke-2.log"
 # Run the next command only if the two-step run succeeds with finite loss.
-scripts/vista/train.sh --steps 5 "$grad_em_config" 2>&1 | tee "$log_dir/smoke-5.log"
+scripts/vista/train.sh --smoke --steps 5 "$grad_em_config" 2>&1 | tee "$log_dir/smoke-5.log"
 grep -E 'val_loss|step:|mem_alloc_peak|mem_reserved_peak|Traceback|Error' "$log_dir"/smoke-*.log
 
 BENCHMARK_WARMUP_UPDATES=10 BENCHMARK_MEASURED_UPDATES=30 \

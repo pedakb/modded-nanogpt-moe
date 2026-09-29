@@ -27,6 +27,15 @@ moe_e8k2_r2_gradem_local_bp_eta0.01.toml | moe-e8k2-r2-gradem-local-bp-eta0.01 |
 moe_e64k8_r0.5.toml | moe-e64k8-r0.5 | 64 | 8 | grouped_gemm | packed | standard | global | 0.1 | muon | None | 3250
 moe_e64k8_r0.5_gradem_global_eta0.01.toml | moe-e64k8-r0.5-gradem-global-eta0.01 | 64 | 8 | grouped_gemm | packed | grad_em | global | 0.01 | muon | None | 3250
 moe_e64k8_r0.5_gradem_local_bp_eta0.01.toml | moe-e64k8-r0.5-gradem-local-bp-eta0.01 | 64 | 8 | grouped_gemm | packed | grad_em | local_bp | 0.01 | muon | None | 3250
+moe_e64k8_r0.5_gradem_local_bp_eta0.001.toml | moe-e64k8-r0.5-gradem-local-bp-eta0.001 | 64 | 8 | grouped_gemm | packed | grad_em | local_bp | 0.001 | muon | None | 3250
+moe_e64k8_r0.5_gradem_local_bp_eta0.003.toml | moe-e64k8-r0.5-gradem-local-bp-eta0.003 | 64 | 8 | grouped_gemm | packed | grad_em | local_bp | 0.003 | muon | None | 3250
+moe_e64k8_r0.5_gradem_local_bp_eta0.03.toml | moe-e64k8-r0.5-gradem-local-bp-eta0.03 | 64 | 8 | grouped_gemm | packed | grad_em | local_bp | 0.03 | muon | None | 3250
+moe_e64k8_r0.5_gradem_local_bp_eta0.1.toml | moe-e64k8-r0.5-gradem-local-bp-eta0.1 | 64 | 8 | grouped_gemm | packed | grad_em | local_bp | 0.1 | muon | None | 3250
+
+The four additional E64/K8 local-BP eta sweep configs differ from the eta=0.01
+reference only in `run_name` and `model.grad_em_eta`. Use `--steps 500` for
+500 completed updates with the original 3250-update LR schedule and normal
+TensorBoard/checkpoint behavior.
 
 For the requested local-BP runs, use:
 
@@ -79,23 +88,22 @@ From the repository root, on an existing Vista allocation:
 ```bash
 source scripts/vista/env.sh
 scripts/vista/train.sh --steps 2 configs/moe_e8k2_r2_gradem_local_bp_packed.toml
+scripts/vista/train.sh --smoke --steps 2 configs/moe_e8k2_r2_gradem_local_bp_packed.toml
 ```
 
-The launcher's `--steps` path is a smoke/recovery facility: it clears
-`TB_ROOT`, disables the periodic TOML checkpoint policy, writes completion
-state to a separate interactive-smoke directory, and preserves the configured
-training schedule horizon. It does not create a TensorBoard production run.
+The launcher's `--steps N` sets only `STOP_AFTER_COMPLETED_UPDATES=N`.
+TensorBoard logging, the normal run checkpoint directory and TOML checkpoint
+policy are retained, while the configured training/LR schedule horizon remains
+unchanged. For example, `--steps 500` on any main comparison config stops after
+update 500 with a 3250-update schedule and normal logging/checkpointing.
+Do not use `TRAIN_STEPS_OVERRIDE` to cap such a run: it changes the schedule
+horizon. See the root [README](../README.md) for launcher option restrictions
+and checkpoint conventions. No permanent `_500.toml` config is needed.
 
-For a shortened run that should retain TensorBoard and the full schedule,
-use the existing package entry point with a per-command
-`STOP_AFTER_COMPLETED_UPDATES` and an explicit durable `CHECKPOINT_DIR`,
-leaving the `TB_ROOT` established by `scripts/vista/env.sh` intact. Do not
-use `TRAIN_STEPS_OVERRIDE` to cap such a run: that changes the schedule horizon.
-The launcher's normal path clears inherited stop controls, so those controls
-must be passed to the package entry point directly. See the root
-[README](../README.md) for the command and checkpoint conventions.
-
-No launcher change or permanent `_500.toml` config was introduced.
+Add `--smoke` when the short run should produce no TensorBoard events or
+checkpoints. It requires `--steps`, keeps the full LR schedule, clears
+`TB_ROOT`, and sets `CHECKPOINT_POLICY_DISABLED=1`. No checkpoint directory
+is created, and neither periodic nor final/early-stop checkpoints are saved.
 
 ## Validation
 

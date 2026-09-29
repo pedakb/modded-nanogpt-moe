@@ -81,10 +81,9 @@ router_adamw_lr = 0.003
 E64/K8 packed experiment, with a unique run name, 3250-update horizon and
 checkpoint interval 50. The corresponding dedicated-LR experiment is
 `configs/moe_e64k8_r0.5_gradem_eta0.01_router_adamw_lr0.003.toml`. For a
-500-update prefix, use the package entry point
-with `STOP_AFTER_COMPLETED_UPDATES=500` and a Stockyard `CHECKPOINT_DIR`.
-Do not use `TRAIN_STEPS_OVERRIDE=500` (changes the schedule) or Vista
-`train.sh --steps` (disables periodic checkpoints). Vista package launches
+500-update prefix, use `scripts/vista/train.sh --steps 500 CONFIG`; normal
+TensorBoard logging and checkpointing remain enabled. Do not use
+`TRAIN_STEPS_OVERRIDE=500` (changes the schedule). Vista package launches
 need `MOE_GMM_IMPLEMENTATION=torch` scoped to the training process.
 
 Legacy checkpoints missing this setting mean `"muon"`. Resume restores the
@@ -128,6 +127,12 @@ source scripts/vista/env.sh
 uv run --no-sync python -m pytest -q
 ```
 
+The Vista launcher sources `env.sh` automatically; training commands need no
+manual setup. It requires the TACC module environment, loads `nvidia/25.3` and
+`cuda/12.9`, and sets `CC=/usr/bin/gcc`, `CXX=/usr/bin/g++`, and
+`CUDAHOSTCXX=/usr/bin/g++`. Repeated sourcing preserves PATH entries and the
+existing Stockyard TensorBoard defaults.
+
 Do **not** globally export `MOE_GMM_IMPLEMENTATION=torch`; it is specific to
 GH200 training and breaks CPU unit tests. The Vista training launchers scope it
 only to the trainer process.
@@ -137,6 +142,7 @@ Slurm submissions. It defaults to the production E64/K8 config when no path is
 supplied. Short runs stay on an already allocated node:
 
 ```bash
+scripts/vista/train.sh --smoke --steps 2 configs/moe_e64k8_r0.5.toml
 scripts/vista/train.sh --steps 30 configs/moe_e64k8_r0.5.toml
 scripts/vista/train.sh --steps 100 configs/moe_e64k8_r0.5.toml
 scripts/vista/train.sh configs/moe_e64k8_r0.5.toml
@@ -147,10 +153,16 @@ It resolves the repository root from its location, uses that root as
 `DATA_ROOT`, clears inherited run state, and runs one GPU. `--steps` requires
 one config, cannot be combined with `--submit` or checkpoint controls, and
 preserves the config's full training/evaluation/LR schedule while stopping after
-the requested number of completed updates. It disables TensorBoard and periodic
-TOML checkpoint policy, then saves the early-stop checkpoint under a unique
-`$STOCKYARD/checkpoints/modded-nanogpt-moe/interactive-smoke/` directory rather
-than the production run directory. It does not modify the TOML or parent shell.
+the requested number of completed updates. It sets only
+`STOP_AFTER_COMPLETED_UPDATES`: normal TensorBoard logging, the TOML checkpoint
+policy, and the run's checkpoint directory are retained. It does not modify
+the TOML or parent shell.
+
+Add `--smoke` for a short run without TensorBoard or any checkpoint writes.
+It requires `--steps N` and sets `TB_ROOT=` and `CHECKPOINT_POLICY_DISABLED=1`.
+It creates no checkpoint directory and writes neither periodic nor final/early-stop
+checkpoints. The configured LR-schedule horizon is still preserved. Benchmark
+behavior is unchanged.
 
 Submit one config by adding `--submit`:
 

@@ -100,8 +100,9 @@ environment overrides take precedence over TOML values; keep them compatible.
   `data/fineweb10B/fineweb_val_*.bin`. `DATA_ROOT` is the base prepended to
   those patterns, not the physical dataset directory itself.
 - In the trainer, an empty/unset `TB_ROOT` disables TensorBoard and `TB_SYSTEM`
-  labels the system. Vista `env.sh` sets the shared Stockyard root; its
-  step-limited and benchmark launch paths scope `TB_ROOT=` to the trainer.
+  labels the system. Vista `env.sh` sets the shared Stockyard root;
+  normal step-limited runs retain it; smoke runs and benchmarks scope `TB_ROOT=`
+  to the trainer.
 - `[evaluation]` owns validation token count and regular/final-phase cadence.
   It is independent of `[diagnostics].scalar_interval`, which controls sampled
   training diagnostics only. Evaluation always includes step 0 and the final
@@ -163,10 +164,12 @@ Vista `env.sh` establishes machine state only. Do not globally export
 `MOE_GMM_IMPLEMENTATION=torch`; `train.sh` scopes it to the GH200 trainer
 process and clears stale experiment/profile/checkpoint state. It defaults to
 `configs/moe_e64k8_r0.5.toml`; multiple configs run sequentially. The `--steps`
-validation path is current-node only, preserves the configured schedule horizon,
-and stops through `STOP_AFTER_COMPLETED_UPDATES`. It disables TensorBoard and
-periodic TOML checkpoint policy, saving only to a unique `interactive-smoke`
-checkpoint directory outside the production run directory.
+path is current-node only and sets only `STOP_AFTER_COMPLETED_UPDATES`,
+preserving the configured schedule horizon, normal TensorBoard logging,
+and the run's normal checkpoint directory and TOML checkpoint policy.
+Add `--smoke` (requires `--steps N`) to disable TensorBoard and all checkpoint
+writes via `TB_ROOT=` and `CHECKPOINT_POLICY_DISABLED=1`. Smoke runs create no
+checkpoint directory and never save periodic, early-stop, or final checkpoints.
 
 Vista training-pipeline benchmarks reuse the same trainer and update loop,
 defaulting to 10 warmup plus 30 measured optimizer updates. They disable
