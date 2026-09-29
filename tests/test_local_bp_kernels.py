@@ -30,7 +30,8 @@ DEVICES = [pytest.param("cuda", marks=pytest.mark.skipif(
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("e,k", [(1, 1), (8, 2), (7, 3), (64, 8)])
-def test_mixed_combine_signals(device, dtype, e, k):
+@pytest.mark.parametrize("mix_lambda", [0.5, 1.0])
+def test_mixed_combine_signals(device, dtype, e, k, mix_lambda):
     triton = pytest.importorskip("triton")
     from modded_nanogpt_moe._local_bp_cuda import _mixed_combine_backward
 
@@ -45,7 +46,7 @@ def test_mixed_combine_signals(device, dtype, e, k):
     rows[order] = torch.arange(n * k, device=device)
     out = torch.randn(n * k, d, device=device, dtype=dtype)
     grad = torch.randn(n, d * 2, device=device, dtype=dtype)[:, ::2]
-    expected = _cpu_signals(out, logits, weights, ids, order, grad, 0.4)
+    expected = _cpu_signals(out, logits, weights, ids, order, grad, 0.4, mix_lambda)
     bp, ge = torch.empty_like(out), torch.empty_like(out)
     q = torch.empty(n, k, device=device)
     gw, v = torch.empty_like(weights), torch.empty_like(q)
@@ -54,6 +55,7 @@ def test_mixed_combine_signals(device, dtype, e, k):
         d, k, *out.stride(), *logits.stride(), *weights.stride(),
         *ids.stride(), *grad.stride(), 0.4, True, True, True,
         triton.next_power_of_2(k), triton.next_power_of_2(d),
+        mix_lambda,
         num_warps=4, enable_fp_fusion=False)
     tolerance = dict(atol=2e-5, rtol=8e-3) if dtype == torch.bfloat16 else dict(atol=2e-6, rtol=2e-5)
     torch.testing.assert_close(bp, expected[0], atol=0, rtol=0)
@@ -66,7 +68,8 @@ def test_mixed_combine_signals(device, dtype, e, k):
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("need_ge", [True, False])
-def test_mixed_activation_rounding_and_zero_weight(device, dtype, need_ge):
+@pytest.mark.parametrize("mix_lambda,boundary_mix", [(1., 0.), (0.5, 0.25), (1., 0.5), (0.5, 0.)])
+def test_mixed_activation_rounding_and_zero_weight(device, dtype, need_ge, mix_lambda, boundary_mix):
     triton = pytest.importorskip("triton")
     from modded_nanogpt_moe._local_bp_cuda import _mixed_activation_backward
 
@@ -76,12 +79,13 @@ def test_mixed_activation_rounding_and_zero_weight(device, dtype, need_ge):
     order = torch.tensor([3, 0, 2, 1])
     pre = torch.randn(4, 13, dtype=dtype)
     hidden = torch.randn_like(pre)
-    expected = _activation_backward(hidden, pre, weights, q, order, need_ge)
+    expected = _activation_backward(hidden, pre, weights, q, order, need_ge, mix_lambda, boundary_mix)
     pre, hidden, weights, q, order = (t.to(device) for t in (pre, hidden, weights, q, order))
     bp = torch.empty_like(pre)
     ge = torch.empty_like(pre) if need_ge else None
     _mixed_activation_backward[(triton.cdiv(pre.numel(), 32),)](
         hidden, pre, weights, q, order, bp, ge, pre.numel(), pre.shape[1], need_ge, 32,
+        mix_lambda, boundary_mix,
         num_warps=4, enable_fp_fusion=False)
     torch.testing.assert_close(bp.cpu(), expected[0], atol=0, rtol=0)
     if need_ge:

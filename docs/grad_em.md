@@ -42,7 +42,7 @@ in exact arithmetic `log(p_selected)` differs only by a common shift.
 ## Configuration and compatibility
 
 `[model].moe_backward` defaults to `"standard"`; `"grad_em"` is opt-in and
-requires MoE. `grad_em_mode` defaults to `"global"`; `"local_bp"` selects the
+requires MoE. `grad_em_mode` defaults to `"global"`; `"local_bp"` defaults to the
 BP-anchored variant below. `grad_em_eta` defaults to `0.1`, must be finite and
 positive, and is fixed (no schedule). Existing TOMLs therefore retain global
 behavior. Global mode supports the grouped-GEMM combine boundary on CPU (tests
@@ -51,35 +51,57 @@ device-agnostic eager loop with ModuleList experts, including CPU and MPS,
 and grouped-GEMM with packed or ModuleList parameters. The grouped path uses
 the same CPU/CUDA device and backend dtype restrictions as global mode.
 
-`grad_em_lambda` defaults to `1.0` and must be finite, numeric (not bool), and
-in `[0,1]`. It controls **global** mode only; nondefault values with `local_bp`
-are rejected so local-BP remains full local Grad-EM with a BP boundary.
+`grad_em_lambda` is the **local correction strength** and defaults to `1.0`.
+`grad_em_alpha` is the **recursive propagation strength**. Explicit values of
+both must be finite, numeric (not bool), and in `[0,1]`. Omitted alpha is kept
+as an internal `None`/automatic setting by the config loader and resolves to
+`1.0` for `global` or `0.0` for `local_bp`. The trainer records the effective
+numeric alpha. An explicit alpha overrides this mode-derived default; lambda
+can now be damped in either mode. `moe_backward="standard"` always remains BP.
 
-Resolved experiment/checkpoint configs record all four fields. Compatibility
+Resolved experiment/checkpoint configs record all five fields. Compatibility
 checks interpret missing legacy fields as `"standard"` / `"global"` / `0.1` /
-`1.0`, without mutating the checkpoint. Explicit mode/eta/lambda mismatches are
-rejected. No model state keys or checkpoint format version change.
+`1.0`, plus mode-derived alpha, without mutating the checkpoint. Legacy local-BP
+therefore remains `(lambda,alpha)=(1,0)`; existing global lambda runs retain
+alpha one. Explicit mode/eta/lambda/effective-alpha mismatches are rejected.
+No model state keys or checkpoint format version change.
 
 Do not treat old Grad-EM checkpoints/results as continuations of this corrected
 algorithm: their router rule differed. Config mode/eta alone do not distinguish
 these semantics, so retain the code revision with every result and start fresh
 comparisons. This patch does not add checkpoint migrations or version fields.
 
-## Recursive global interpolation
+## Unified two-parameter interpolation
 
-For `grad_em_mode = "global"`, `grad_em_lambda = 0` is ordinary end-to-end BP;
-`0 < grad_em_lambda < 1` recursively mixes BP and Grad-EM; `grad_em_lambda = 1`
-is the existing global Grad-EM backward. Forward values are unchanged.
+| lambda | alpha | behavior |
+|---|---|---|
+| 0 | any | BP |
+| 1 | 0 | local-BP Grad-EM |
+| between 0 and 1 | 0 | damped local correction |
+| 1 | between 0 and 1 | boundary-damped Grad-EM |
+| between 0 and 1 | 1 | global lambda interpolation |
+| 1 | 1 | global Grad-EM |
+
+Forward values and scoring/responsibilities are unchanged. At each layer, for
+the **same incoming gradient** `g`, parameter signals use correction strength
+lambda and the upstream/input VJP uses `beta = alpha*lambda`:
+
+```text
+delta_parameter = delta_BP + lambda*(delta_GE - delta_BP)
+r_parameter     = r_BP     + lambda*(r_GE     - r_BP)
+u_upstream      = u_BP     + beta  *(u_GE      - u_BP)
+```
 
 Given each layer's incoming gradient `g`, expert signals are
 `[p + lambda*(q-p)]*g`, where `p` is the actual activation-dtype forward
 weight. Router signals are `(1-lambda)*r_BP + lambda*(a-q)/eta`. The BP term
 uses the original softmax/Top-K/normalization/cast graph, preserving
 `normalize_topk=False`; the GE term retains the selected-logit softmax `a`.
-The resulting mixed signals drive both parameter and input gradients through
-the existing expert and router graphs. Their upstream gradient becomes the
-incoming gradient of earlier layers, where responsibilities are recomputed.
-No BP boundary substitution or second-order scoring is used in global mode.
+At alpha one, these parameter signals also drive the existing input-gradient
+graph. Otherwise, the mixed grouped backward independently forms parameter
+and boundary signals. Its upstream gradient becomes the incoming gradient of
+earlier layers, where responsibilities are recomputed. Alpha zero returns the
+ordinary BP input gradient. No second-order scoring is used.
 
 This is interpolation **at every layer**, not necessarily a convex combination
 of two independently computed whole-network gradient vectors. It has exact BP
@@ -89,7 +111,20 @@ recursively. That small-eta BP-limit statement does not apply unchanged to
 unnormalized Top-K (`p` need not equal `a`) or eliminate BF16 rounding.
 Signals are mixed before GEMM; intermediate BF16 results can differ from
 mixing two already-rounded parameter/input gradients. Lambda zero uses the
-ordinary BP path; lambda one retains the previous arithmetic.
+ordinary BP path. Alpha one retains the previous global-lambda arithmetic,
+and `(1,0)` retains the optimized local-BP arithmetic.
+
+For intermediate alpha, the optimized grouped path still computes one BP FC2
+dgrad. It obtains the GE hidden signal by FP32 `(v_BP/safe_p)*q`, preserves
+the zero-forward-weight safeguard, and mixes that signal with BP using lambda
+for FC1 parameters and beta for FC1 dgrad. FC2 parameters use
+`[p+lambda*(q-p)]*g` directly. The router merges its two logit signals before
+one parameter-only linear wgrad and one boundary dgrad. Thus each expert
+linear still has one forward, one wgrad, and one dgrad: no extra grouped GEMM
+or forward. Rescaling across rounded BF16 GEMMs has the existing local-BP
+roundoff qualification; intermediate results need not be bitwise equal to
+two independently rounded VJPs. The eager loop reference retains its existing
+separate parameter/input VJPs and does not repeat its forward.
 
 ## Custom combine boundary
 

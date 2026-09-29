@@ -1,4 +1,4 @@
-"""Local-only pointwise kernels; forward/global/BP kernels stay unchanged."""
+"""Mixed pointwise kernels; forward and alpha=1 global kernels stay unchanged."""
 import torch
 import triton
 import triton.language as tl
@@ -17,7 +17,8 @@ def _mixed_combine_backward(X, Z, Weights, Indices, Rows, Grad,
                             GR: tl.constexpr, GC: tl.constexpr,
                             ETA: tl.constexpr, NEED_GE: tl.constexpr,
                             NEED_WEIGHTS: tl.constexpr, SAVE_V: tl.constexpr,
-                            SLOTS: tl.constexpr, COLS: tl.constexpr):
+                            SLOTS: tl.constexpr, COLS: tl.constexpr,
+                            MIX_LAMBDA: tl.constexpr = 1.0):
     token = tl.program_id(0)
     slots, columns = tl.arange(0, SLOTS), tl.arange(0, COLS)
     rows = tl.load(Rows + token * K + slots, slots < K, other=0)
@@ -41,7 +42,11 @@ def _mixed_combine_backward(X, Z, Weights, Indices, Rows, Grad,
         tl.store(GradWeights + token * K + slots, tl.sum(rounded, axis=1), slots < K)
     if NEED_GE:
         # q*g directly avoids a second rounding through rho*(p*g).
-        tl.store(GE + rows[:, None] * D + columns[None, :], q[:, None] * grad[None, :], valid)
+        mixed = q
+        if MIX_LAMBDA != 1:
+            p = tl.load(Weights + token * WR + slots * WC, slots < K, other=0).to(tl.float32)
+            mixed = p + MIX_LAMBDA * (q - p)
+        tl.store(GE + rows[:, None] * D + columns[None, :], mixed[:, None] * grad[None, :], valid)
     p = tl.load(Weights + token * WR + slots * WC, slots < K, other=0).to(tl.float32)
     safe_p = tl.where(p == 0, 1., p)
     tl.store(BP + rows[:, None] * D + columns[None, :], safe_p[:, None] * grad[None, :], valid)
@@ -50,7 +55,9 @@ def _mixed_combine_backward(X, Z, Weights, Indices, Rows, Grad,
 @triton.jit
 def _mixed_activation_backward(Hidden, Pre, Weights, Q, Order, BP, GE,
                                SIZE: tl.constexpr, H: tl.constexpr,
-                               NEED_GE: tl.constexpr, BLOCK: tl.constexpr):
+                               NEED_GE: tl.constexpr, BLOCK: tl.constexpr,
+                               MIX_LAMBDA: tl.constexpr = 1.0,
+                               BOUNDARY_MIX: tl.constexpr = 0.0):
     elements = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = elements < SIZE
     assignment = tl.load(Order + elements // H, valid, other=0)
@@ -61,18 +68,25 @@ def _mixed_activation_backward(Hidden, Pre, Weights, Q, Order, BP, GE,
     derivative = (2. * tl.maximum(pre, 0.)).to(Pre.dtype.element_ty).to(tl.float32)
     work = (hidden * derivative).to(Pre.dtype.element_ty).to(tl.float32)
     work = tl.where(pre <= 0, 0., work)
-    tl.store(BP + elements, tl.where(p == 0, 0., work), valid)
-    if NEED_GE:
+    bp = tl.where(p == 0, 0., work)
+    if NEED_GE or BOUNDARY_MIX != 0:
         q = tl.load(Q + assignment, valid, other=0)
         safe_p = tl.where(p == 0, 1., p)
         # Do not form an overflowing q/p. div_rn preserves subnormal p,
         # unlike approximate reciprocal multiplication with flush-to-zero.
         scaled = tl.div_rn(work, safe_p) * q
-        tl.store(GE + elements, scaled, valid)
+        if NEED_GE:
+            parameter = scaled
+            if MIX_LAMBDA != 1:
+                parameter = bp + MIX_LAMBDA * (scaled - bp)
+            tl.store(GE + elements, parameter, valid)
+        if BOUNDARY_MIX != 0:
+            bp = bp + BOUNDARY_MIX * (scaled - bp)
+    tl.store(BP + elements, bp, valid)
 
 
 def combine_backward(out, logits, weights, indices, rows, grad, eta,
-                     need_ge, need_logits, need_weights, save_v):
+                     need_ge, need_logits, need_weights, save_v, mix_lambda=1.0):
     n, k = weights.shape
     d, e = out.shape[1], logits.shape[1]
     bp = torch.empty_like(out)
@@ -88,6 +102,7 @@ def combine_backward(out, logits, weights, indices, rows, grad, eta,
                 d, k, *out.stride(), *logits.stride(), *weights.stride(),
                 *indices.stride(), *grad.stride(), eta, need_ge, need_weights, save_v,
                 triton.next_power_of_2(k), triton.next_power_of_2(d),
+                mix_lambda,
                 num_warps=4, enable_fp_fusion=False)
             if need_logits:
                 _grad_em_router_backward[(n,)](
@@ -97,12 +112,13 @@ def combine_backward(out, logits, weights, indices, rows, grad, eta,
     return bp, ge, gz, q, gw, v
 
 
-def activation_backward(hidden, pre, weights, q, order, need_ge):
+def activation_backward(hidden, pre, weights, q, order, need_ge,
+                        mix_lambda=1.0, boundary_mix=0.0):
     bp = torch.empty_like(pre)
     ge = torch.empty_like(pre) if need_ge else None
     if pre.numel():
         with torch.cuda.device(pre.device):
             _mixed_activation_backward[(triton.cdiv(pre.numel(), 1024),)](
                 hidden, pre, weights, q, order, bp, ge, pre.numel(), pre.shape[1],
-                need_ge, 1024, num_warps=4, enable_fp_fusion=False)
+                need_ge, 1024, mix_lambda, boundary_mix, num_warps=4, enable_fp_fusion=False)
     return bp, ge

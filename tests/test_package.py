@@ -333,6 +333,7 @@ def test_dense_example_config_resolves_current_training_defaults():
         "grad_em_mode": "global",
         "grad_em_eta": 0.1,
         "grad_em_lambda": 1.0,
+        "grad_em_alpha": None,
     }
     assert config["training"]["global_batch_tokens"] == 524288
     assert config["training"]["microbatch_sequences"] == 64

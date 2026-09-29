@@ -24,7 +24,7 @@ from .checkpoint import (
     restore_training_checkpoint,
     save_repro_diagnostic,
 )
-from .config import parse_train_args
+from .config import parse_train_args, resolve_grad_em_alpha
 from .data import distributed_data_generator
 from .diagnostics import make_diagnostics
 from .model import (
@@ -148,6 +148,8 @@ def read_source_snapshot():
 def main(argv=None):
     argv = sys.argv if argv is None else argv
     experiment_config, config_path = parse_train_args(argv[1:])
+    experiment_config["model"]["grad_em_alpha"] = resolve_grad_em_alpha(
+        experiment_config["model"]["grad_em_alpha"], experiment_config["model"]["grad_em_mode"])
     code = read_source_snapshot()
 
     # torchrun sets these environment variables.
@@ -449,7 +451,8 @@ def main(argv=None):
                 moe_backward=model_config["moe_backward"],
                 grad_em_mode=model_config["grad_em_mode"],
                 grad_em_eta=model_config["grad_em_eta"],
-                grad_em_lambda=model_config["grad_em_lambda"])
+                grad_em_lambda=model_config["grad_em_lambda"],
+                grad_em_alpha=model_config["grad_em_alpha"])
     assert model.hidden_dim == hidden_dim
     gmm_implementation = (model.blocks[0].mlp.gmm_implementation if mlp_type == "moe" else "n/a")
     print0(
@@ -572,6 +575,7 @@ def main(argv=None):
                 "grad_em_mode": model_config["grad_em_mode"],
                 "grad_em_eta": model_config["grad_em_eta"],
                 "grad_em_lambda": model_config["grad_em_lambda"],
+                "grad_em_alpha": model_config["grad_em_alpha"],
             },
             "training": {
                 "sequence_length": sequence_length,

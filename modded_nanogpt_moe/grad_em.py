@@ -20,12 +20,12 @@ def require_grad_em_device(device):
 
 
 class LocalBPGradEM(torch.autograd.Function):
-    """Use ordinary BP at the MoE input and Grad-EM for local parameters.
+    """Eager reference for independent parameter and boundary signal mixes.
 
     The eager ModuleList forward is recorded once behind this boundary. Its
-    ordinary output graph supplies only the input VJP. Separate VJPs from the
-    same saved router logits and selected expert outputs supply parameter
-    gradients, so replacement signals never cross the MoE input boundary.
+    ordinary output graph supplies the BP input VJP at alpha zero. Separate
+    VJPs from the same saved router logits and selected expert outputs supply
+    mixed parameter gradients and, for positive alpha, the mixed input VJP.
     """
 
     @staticmethod
@@ -48,6 +48,9 @@ class LocalBPGradEM(torch.autograd.Function):
         ctx.selected_outputs = selected_outputs
         ctx.parameters = parameters
         ctx.eta = module.grad_em_eta
+        ctx.mix_lambda = module.grad_em_lambda
+        ctx.boundary_mix = module.grad_em_lambda * module.grad_em_alpha
+        ctx.normalize_topk = module.normalize_topk
         ctx.sensitivity_observer = (
             module._routing_diagnostics.sensitivity_observer()
             if module._routing_diagnostics is not None else None)
@@ -64,21 +67,43 @@ class LocalBPGradEM(torch.autograd.Function):
         selected_outputs, parameters = ctx.selected_outputs, ctx.parameters
         result = grad_em_reference(
             logits, indices, selected_outputs, grad_output.flatten(0, 1), ctx.eta)
+        def signals(coefficient):
+            if coefficient == 1:
+                return (result.grad_expert.to(selected_outputs.dtype),
+                        result.grad_logits.to(logits.dtype))
+            p = logits.float().softmax(-1).gather(1, indices)
+            if ctx.normalize_topk:
+                p = p / p.sum(-1, keepdim=True)
+            p = p.to(selected_outputs.dtype).float()
+            expert = (p + coefficient * (result.q - p))[..., None]
+            expert = (expert * grad_output.flatten(0, 1).float()[:, None, :]).to(selected_outputs.dtype)
+            router = (bp_router.float() + coefficient * (
+                result.grad_logits - bp_router.float())).to(logits.dtype)
+            return expert, router
+
+        bp_router = torch.zeros_like(logits)
+        if (ctx.mix_lambda != 1 or ctx.boundary_mix not in (0, 1)) and logits.requires_grad:
+            bp_router, = torch.autograd.grad(output, logits, grad_output, retain_graph=True)
+        parameter_signals = signals(ctx.mix_lambda)
         if ctx.sensitivity_observer is not None:
             ctx.sensitivity_observer(result.v)
         if ctx.logit_gradient_observer is not None:
-            ctx.logit_gradient_observer(result.grad_logits.to(logits.dtype))
+            ctx.logit_gradient_observer(parameter_signals[1])
 
         grad_x = None
         if ctx.needs_input_grad[0]:
-            grad_x, = torch.autograd.grad(
-                output, inner_x, grad_output, retain_graph=True,
-                create_graph=False, allow_unused=False)
+            if ctx.boundary_mix == 0:
+                grad_x, = torch.autograd.grad(
+                    output, inner_x, grad_output, retain_graph=True,
+                    create_graph=False, allow_unused=False)
+            else:
+                grad_x, = torch.autograd.grad(
+                    (selected_outputs, logits), inner_x, signals(ctx.boundary_mix),
+                    retain_graph=True, create_graph=False)
 
         parameter_grads = torch.autograd.grad(
             (selected_outputs, logits), parameters,
-            (result.grad_expert.to(selected_outputs.dtype),
-             result.grad_logits.to(logits.dtype)),
+            parameter_signals,
             create_graph=False, allow_unused=True)
         parameter_grads = tuple(
             torch.zeros_like(parameter) if gradient is None else gradient

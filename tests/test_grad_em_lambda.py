@@ -211,5 +211,4 @@ def test_lambda_defaults_loading_and_checkpoint_compatibility(tmp_path):
     with pytest.raises(ValueError, match="incompatible"):
         validate_checkpoint_config(checkpoint, mixed)
     mixed["model"]["grad_em_mode"] = "local_bp"
-    with pytest.raises(ValueError, match="requires grad_em_mode"):
-        validate_experiment_config(mixed)
+    validate_experiment_config(mixed)  # Now supports damped local correction.
