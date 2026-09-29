@@ -5,6 +5,7 @@ master parameters and fixed inputs/upstream gradients, not a training update.
 No profiler, optimizer, or CPU substitute is included in the timed regions.
 """
 import argparse
+from collections import Counter
 import gc
 import importlib.metadata
 import json
@@ -16,6 +17,7 @@ import time
 import torch
 
 from modded_nanogpt_moe._grouped_gemm import expert_dgrad
+from modded_nanogpt_moe import _grouped_gemm as gemm
 from modded_nanogpt_moe.model import MoE
 
 
@@ -31,6 +33,41 @@ def timed(call):
 def statistics_ms(samples):
     return {"mean_ms": statistics.mean(samples), "median_ms": statistics.median(samples),
             "min_ms": min(samples), "max_ms": max(samples), "samples_ms": samples}
+
+
+def count_grouped_calls(model, x, grad):
+    """One untimed pass through the real backend, after recording memory peaks."""
+    counts = Counter()
+
+    def record(kind, width):
+        phase = "fc1" if width == model.router.in_features else "fc2"
+        counts[f"{phase}.{kind}"] += 1
+
+    if model.gmm_implementation == "torch":
+        original = gemm.native_phase
+
+        def counted(a, b, offsets, kind, grad=None):
+            record(kind, b.shape[1] if kind == "dx" else a.shape[1])
+            return original(a, b, offsets, kind, grad)
+
+        owner, name = gemm, "native_phase"
+    else:
+        from grouped_gemm import backend
+        original = backend.gmm
+
+        def counted(a, b, sizes, trans_a=False, trans_b=False):
+            kind = "dw" if trans_a else "dx" if trans_b else "forward"
+            record(kind, b.shape[1] if trans_b else a.shape[1])
+            return original(a, b, sizes, trans_a=trans_a, trans_b=trans_b)
+
+        owner, name = backend, "gmm"
+    setattr(owner, name, counted)
+    try:
+        model(x).backward(grad)
+        torch.cuda.synchronize()
+    finally:
+        setattr(owner, name, original)
+    return dict(sorted(counts.items()))
 
 
 def main():
@@ -96,7 +133,9 @@ def main():
     }
     if args.implementation == "extension":
         report["nv_grouped_gemm"] = importlib.metadata.version("nv-grouped-gemm")
-    # Isolate the extra FC2 dgrad after recording layer peaks, so this scratch
+    clear_gradients()
+    report["grouped_gemm_calls"] = count_grouped_calls(model, x, g)
+    # Isolate FC2 dgrad after recording layer peaks, so this scratch
     # cannot contaminate the forward/backward memory comparison.
     if args.mode == "local_bp":
         clear_gradients()
@@ -116,7 +155,7 @@ def main():
                 result, ms = timed(call)
                 samples.append(ms)
                 del result
-            report["isolated_extra_fc2_dgrad"] = statistics_ms(samples)
+            report["isolated_fc2_dgrad"] = statistics_ms(samples)
     rendered = json.dumps(report, indent=2, sort_keys=True)
     print(rendered, flush=True)
     if args.output:

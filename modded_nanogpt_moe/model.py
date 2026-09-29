@@ -428,7 +428,7 @@ class MoE(nn.Module):
         local_bp = self.moe_backward == "grad_em" and self.grad_em_mode == "local_bp"
         bp_x = x if local_bp and torch.is_grad_enabled() and x.requires_grad else None
         if local_bp:
-            # Only the input-only branch below may cross this MoE boundary.
+            # Only the explicit BP expert/router VJPs may cross this boundary.
             x = x.detach()
 
         with nsys_range(_moe_nsys_capture_active, "moe.router_topk"):
@@ -480,18 +480,21 @@ class MoE(nn.Module):
                 proj_w = torch.stack([e.proj.weight for e in self.experts]).transpose(-2, -1).contiguous().type_as(x_sorted)
                 proj_b = torch.stack([e.proj.bias for e in self.experts]).type_as(x_sorted)
 
-        with nsys_range(_moe_nsys_capture_active, "moe.fc1"):
-            h_pre = add_bias_by_expert_segments(
-                expert_gmm(x_sorted, fc_w, batch_sizes, offsets, self.gmm_implementation,
-                           self._gmm, "fc1", _moe_nsys_capture_active),
-                fc_b, batch_sizes_device, sorted_experts)
-        with nsys_range(_moe_nsys_capture_active, "moe.activation"):
-            h_act = h_pre.relu().square()
-        with nsys_range(_moe_nsys_capture_active, "moe.fc2"):
-            out_sorted = add_bias_by_expert_segments(
-                expert_gmm(h_act.type_as(x_sorted), proj_w, batch_sizes, offsets, self.gmm_implementation,
-                           self._gmm, "fc2", _moe_nsys_capture_active),
-                proj_b, batch_sizes_device, sorted_experts)
+        # Local BP records a single mixed VJP below. Execute the same forward
+        # operations without retaining a second expert autograd graph.
+        with torch.set_grad_enabled(torch.is_grad_enabled() and bp_x is None):
+            with nsys_range(_moe_nsys_capture_active, "moe.fc1"):
+                h_pre = add_bias_by_expert_segments(
+                    expert_gmm(x_sorted, fc_w, batch_sizes, offsets, self.gmm_implementation,
+                               self._gmm, "fc1", _moe_nsys_capture_active),
+                    fc_b, batch_sizes_device, sorted_experts)
+            with nsys_range(_moe_nsys_capture_active, "moe.activation"):
+                h_act = h_pre.relu().square()
+            with nsys_range(_moe_nsys_capture_active, "moe.fc2"):
+                out_sorted = add_bias_by_expert_segments(
+                    expert_gmm(h_act.type_as(x_sorted), proj_w, batch_sizes, offsets, self.gmm_implementation,
+                               self._gmm, "fc2", _moe_nsys_capture_active),
+                    proj_b, batch_sizes_device, sorted_experts)
 
         # ---- unpermute + weighted combine ----
         # NOTE on optimizer semantics, not just numerics: when an expert
@@ -513,20 +516,21 @@ class MoE(nn.Module):
         with nsys_range(_moe_nsys_capture_active, "moe.combine"):
             if self.moe_backward == "standard":
                 out = combine_expert_outputs(out_sorted, topk_weights, order)
+            elif bp_x is not None:
+                from ._local_bp import MixedLocalBP
+                out = MixedLocalBP.apply(
+                    bp_x, x_sorted, fc_w, fc_b, proj_w, proj_b,
+                    h_pre, h_act, out_sorted, router_logits, topk_weights,
+                    topk_experts, order, batch_sizes, batch_sizes_device, offsets,
+                    self.grad_em_eta, self.gmm_implementation,
+                    (self._routing_diagnostics.observe_sensitivity
+                     if self._routing_diagnostics is not None else None))
             else:
                 from .grad_em import GradEMCombine
                 out = GradEMCombine.apply(out_sorted, router_logits, topk_weights,
                                           topk_experts, order, self.grad_em_eta,
                                           (self._routing_diagnostics.observe_sensitivity
                                            if self._routing_diagnostics is not None else None))
-                if bp_x is not None:
-                    from ._local_bp import ExpertInputOnly, LocalBPOutput
-                    bp_experts = ExpertInputOnly.apply(
-                        bp_x, out_sorted.detach(), h_pre.detach(), fc_w.detach(),
-                        proj_w.detach(), batch_sizes, offsets, order, self.top_k,
-                        self.gmm_implementation)
-                    bp_out = combine_expert_outputs(bp_experts, topk_weights, order)
-                    out = LocalBPOutput.apply(out, bp_out)
             out = out.view(B, T, D)
         if self._grad_em_diagnostics is not None:
             self._grad_em_diagnostics(

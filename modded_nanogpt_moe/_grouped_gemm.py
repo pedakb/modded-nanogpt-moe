@@ -93,6 +93,16 @@ def expert_dgrad(grad, weight, counts, offsets, implementation, phase):
         return backend.gmm(grad, weight, counts, trans_a=False, trans_b=True)
 
 
+def expert_wgrad(a, grad, counts, offsets, implementation, phase):
+    """Weight VJP with a signal independent of the input VJP's signal."""
+    grad = grad.contiguous()
+    with _range(phase, "dw"):
+        if implementation == "torch":
+            return native_phase(a, None, offsets, "dw", grad)
+        from grouped_gemm import backend
+        return backend.gmm(a, grad, counts, trans_a=True, trans_b=False)
+
+
 class _ProfiledExtensionGemm(torch.autograd.Function):
     """Exact trans_b=False ops.py call sequence, with separate enqueue ranges.
 

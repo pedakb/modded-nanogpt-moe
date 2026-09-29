@@ -136,7 +136,12 @@ def check_equivalence(models, dtype, *, variant="normal", report=False):
         compare_pair(local[1], ref[1], dtype)
     for name in local[2]:
         compare_pair(local[2][name], ref[2][name], dtype)
-        torch.testing.assert_close(local[2][name], glob[2][name], atol=0, rtol=0)
+        if ".fc." in name and variant != "no_input_grad":
+            # Rescaling commutes in real arithmetic, but moves rounding across
+            # FC2 dgrad. Keep the established FP32/BF16 tolerances unchanged.
+            compare_pair(local[2][name], glob[2][name], dtype)
+        else:
+            torch.testing.assert_close(local[2][name], glob[2][name], atol=0, rtol=0)
     if loop.top_k < loop.num_experts and variant != "frozen_experts":
         for suffix in ("fc.weight", "fc.bias", "proj.weight", "proj.bias"):
             assert torch.count_nonzero(local[2][f"experts.{loop.num_experts-1}.{suffix}"]) == 0
@@ -153,6 +158,10 @@ def check_equivalence(models, dtype, *, variant="normal", report=False):
             "forward_max_abs": maxdiff(local[0], ref[0]),
             "input_max_abs": maxdiff(local[1], ref[1]),
             "input_vs_grouped_bp_max_abs": maxdiff(local[1], bp[1]),
+            "experts": grouped.num_experts, "top_k": grouped.top_k,
+            "normalize_topk": grouped.normalize_topk,
+            "expert_vs_global_max_abs": max(maxdiff(local[2][n], glob[2][n]) for n in local[2] if n.startswith("experts.")),
+            "router_vs_global_max_abs": max(maxdiff(local[2][n], glob[2][n]) for n in local[2] if n.startswith("router.")),
             "expert_max_abs": max(maxdiff(local[2][n], ref[2][n]) for n in local[2] if n.startswith("experts.")),
             "router_max_abs": max(maxdiff(local[2][n], ref[2][n]) for n in local[2] if n.startswith("router.")),
         }, sort_keys=True))
@@ -184,18 +193,118 @@ def test_gradient_edges(cpu_backend, variant, dtype):
 
 
 @pytest.mark.parametrize("layout", ["packed", "modulelist"])
-def test_no_duplicate_wgrad_or_forward(cpu_backend, layout):
+def test_one_dgrad_and_wgrad_per_expert_linear(cpu_backend, layout, monkeypatch):
     _, grouped, _, _ = make_models(layout=layout)
     value = torch.randn(2, 7, 16)
     g = torch.randn_like(value)
     with torch.no_grad():
         expected = grouped(value)
     cpu_backend.clear()
+    phases = []
+    from contextlib import nullcontext
+
+    def record_phase(phase, kind):
+        phases.append((phase, kind))
+        return nullcontext()
+
+    monkeypatch.setattr(gemm, "_range", record_phase)
     out, _, _ = run(grouped, value, g)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
     assert cpu_backend.count("forward") == 2
-    assert cpu_backend.count("dx") == 3  # GE FC2, BP FC2, BP FC1
+    assert cpu_backend.count("dx") == 2  # BP FC2 and BP FC1 only
     assert cpu_backend.count("dw") == 2  # GE FC2 and FC1 only
+    assert phases.count(("fc2", "dx_bp")) == 1
+    assert phases.count(("fc1", "dx_bp")) == 1
+    assert phases.count(("fc2", "dw")) == 1
+    assert phases.count(("fc1", "dw")) == 1
+
+
+@pytest.mark.parametrize("normalize", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_router_input_vjp_matches_bp_without_ge_dgrad(cpu_backend, monkeypatch, normalize, dtype):
+    check_router_vjp(monkeypatch, normalize, dtype)
+
+
+def check_router_vjp(monkeypatch, normalize, dtype, device="cpu"):
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from modded_nanogpt_moe._local_bp import RouterInputOnly
+
+    _, local, bp, _ = make_models(normalize=normalize, device=device)
+    value = torch.randn(2, 7, 16, dtype=dtype, device=device)
+    upstream = torch.randn_like(value) / 4
+    logits = []
+
+    def save_logits(module, inputs, output):
+        output.retain_grad()
+        logits.append(output)
+
+    bp.router.register_forward_hook(save_logits)
+    run(bp, value, upstream)
+    expected_signal = logits[0].grad
+    expected_dx = expected_signal @ bp.router.weight.to(dtype)
+    original = RouterInputOnly.backward
+    contributions = []
+
+    def backward(ctx, grad):
+        result = original(ctx, grad)
+        contributions.append((grad.detach().clone(), result[0].detach().clone()))
+        return result
+
+    monkeypatch.setattr(RouterInputOnly, "backward", staticmethod(backward))
+    products = []
+
+    class CountMatmuls(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func == torch.ops.aten.mm.default:
+                products.append(tuple(tuple(a.shape) for a in args))
+            return func(*args, **(kwargs or {}))
+
+    x = value.clone().requires_grad_()
+    output = local(x)
+    with CountMatmuls():
+        output.backward(upstream)
+    assert len(contributions) == 1
+    torch.testing.assert_close(contributions[0][0], expected_signal, atol=0, rtol=0)
+    torch.testing.assert_close(contributions[0][1], expected_dx, atol=0, rtol=0)
+    assert products.count(((14, 8), (8, 16))) == 1  # BP router dgrad
+    assert products.count(((8, 14), (14, 16))) == 1  # GE router wgrad
+
+
+@pytest.mark.parametrize("normalize", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_zero_selected_weight_can_have_nonzero_ge_gradient(cpu_backend, normalize, dtype):
+    check_zero_selected_weight(normalize, dtype)
+
+
+def check_zero_selected_weight(normalize, dtype, device="cpu"):
+    # Select the full support: equal zero full-softmax probabilities otherwise
+    # make the identity of the second selected expert deliberately unspecified.
+    models = make_models(e=2, k=2, normalize=normalize, device=device)
+    for model in models:
+        with torch.no_grad():
+            model.router.weight.zero_()
+            model.router.bias.fill_(-500)
+            model.router.bias[0] = 0
+            model.router.bias[1] = -120
+            if model.moe_parameter_layout == "packed":
+                model.proj_bias[0].fill_(400)
+            else:
+                model.experts[0].proj.bias.fill_(400)
+    value = torch.randn(2, 7, 16, dtype=dtype, device=device)
+    upstream = torch.ones_like(value) / 16
+    with torch.no_grad():
+        selected = models[1].router(value.flatten(0, 1)).float().softmax(-1).topk(2).values
+        assert torch.count_nonzero(selected[:, 1]) == 0
+    results = [run(m, value, upstream) for m in models]
+    ref, local, bp, glob = results
+    torch.testing.assert_close(local[0], bp[0], atol=0, rtol=0)
+    torch.testing.assert_close(local[1], bp[1], atol=0, rtol=0)
+    assert torch.count_nonzero(local[2]["experts.1.fc.weight"]) > 0
+    assert torch.count_nonzero(bp[2]["experts.1.fc.weight"]) == 0
+    for name in local[2]:
+        assert torch.isfinite(local[2][name]).all()
+        compare_pair(local[2][name], glob[2][name], dtype)
+        compare_pair(local[2][name], ref[2][name], dtype)
 
 
 def check_two_layers(dtype, device="cpu"):
@@ -228,8 +337,10 @@ def test_two_moe_input_boundary(cpu_backend, dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_numerical_report(cpu_backend, dtype):
-    check_equivalence(make_models(), dtype, report=True)
+@pytest.mark.parametrize("e,k", [(1, 1), (8, 2), (64, 8)])
+@pytest.mark.parametrize("normalize", [True, False])
+def test_numerical_report(cpu_backend, dtype, e, k, normalize):
+    check_equivalence(make_models(e, k, normalize=normalize), dtype, report=True)
 
 
 def test_packed_config_preserves_loop_experiment():
@@ -268,10 +379,11 @@ def require_cuda_backend(monkeypatch, implementation, dtype):
 @pytest.mark.parametrize("implementation,dtype", [("extension", torch.float32),
                                                  ("extension", torch.bfloat16),
                                                  ("torch", torch.bfloat16)])
-@pytest.mark.parametrize("e,k,h", [(8, 2, 1536), (64, 8, 384)])
-def test_cuda_loop_grouped_equivalence(monkeypatch, implementation, dtype, e, k, h):
+@pytest.mark.parametrize("e,k,h", [(1, 1, 1536), (8, 2, 1536), (64, 8, 384)])
+@pytest.mark.parametrize("normalize", [True, False])
+def test_cuda_loop_grouped_equivalence(monkeypatch, implementation, dtype, e, k, h, normalize):
     require_cuda_backend(monkeypatch, implementation, dtype)
-    check_equivalence(make_models(e, k, d=768, h=h, device="cuda"), dtype, report=True)
+    check_equivalence(make_models(e, k, d=768, h=h, device="cuda", normalize=normalize), dtype, report=True)
 
 
 @CUDA
@@ -289,3 +401,34 @@ def test_cuda_two_moe(monkeypatch, implementation, dtype):
 def test_cuda_gradient_edges(monkeypatch, implementation, variant):
     require_cuda_backend(monkeypatch, implementation, torch.bfloat16)
     check_equivalence(make_models(device="cuda"), torch.bfloat16, variant=variant)
+
+
+@CUDA
+@pytest.mark.parametrize("implementation", ["extension", "torch"])
+@pytest.mark.parametrize("normalize", [True, False])
+def test_cuda_router_boundary(monkeypatch, implementation, normalize):
+    require_cuda_backend(monkeypatch, implementation, torch.bfloat16)
+    check_router_vjp(monkeypatch, normalize, torch.bfloat16, "cuda")
+
+
+@CUDA
+@pytest.mark.parametrize("implementation", ["extension", "torch"])
+@pytest.mark.parametrize("normalize", [True, False])
+def test_cuda_zero_selected_weight(monkeypatch, implementation, normalize):
+    require_cuda_backend(monkeypatch, implementation, torch.bfloat16)
+    check_zero_selected_weight(normalize, torch.bfloat16, "cuda")
+
+
+@CUDA
+@pytest.mark.parametrize("implementation", ["extension", "torch"])
+def test_cuda_grouped_gemm_counts(monkeypatch, implementation):
+    from tools.benchmark_grad_em import count_grouped_calls
+
+    require_cuda_backend(monkeypatch, implementation, torch.bfloat16)
+    _, local, standard, global_em = make_models(device="cuda")
+    x = torch.randn(2, 7, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn_like(x)
+    expected = {f"{phase}.{kind}": 1 for phase in ("fc1", "fc2")
+                for kind in ("forward", "dx", "dw")}
+    for model in (local, standard, global_em):
+        assert count_grouped_calls(model, x, g) == expected

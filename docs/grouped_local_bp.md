@@ -1,5 +1,8 @@
 # Grouped local-BP Grad-EM
 
+This page records the initial implementation. The current optimized backward
+and new correctness/timing results are in [Mixed local-BP backward](mixed_local_bp.md).
+
 Implemented on `cleanup-active-codebase`, based on `18d5d5a`. Measurements below
 were collected on 2026-09-28 on an existing Vista GH200 allocation. No optimizer,
 objective, schedule, data, checkpoint keys, initialization, or global Grad-EM

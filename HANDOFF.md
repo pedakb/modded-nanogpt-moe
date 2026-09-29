@@ -1,5 +1,35 @@
 # Current handoff
 
+## Mixed local-BP optimization (2026-09-29, validated, uncommitted)
+
+Base `1928123`, branch `cleanup-active-codebase`. Complete report, numerical
+contract, measurements and reproduction commands: `docs/mixed_local_bp.md`.
+No installs, commits, pushes, or training jobs. No validation jobs remain active.
+
+- One BP FC2 dgrad and activation VJP now supply both BP input gradients and
+  rescaled GE FC1 parameter gradients; GE FC2 dgrad and duplicate combine are
+  removed. Router has one GE wgrad and one BP dgrad. p is the actual forward
+  weight, including unnormalized Top-K and activation cast; zero p is handled
+  without division. Parameter keys, configs, global/BP behavior, optimizers,
+  launcher/backend defaults and forward values are preserved.
+- Focused suite: 160 passed (116 CPU / 44 CUDA), 7 unsupported extension FP32
+  skips. Real GH200 kernels and both grouped APIs validated. BP boundary,
+  FC2 and router comparisons are exact; reassociated GE FC1 uses unchanged
+  FP32/BF16 tolerances. Max CPU FP32 difference 2.087e-7; CPU BF16 .00390625;
+  GH200 BF16 .001953125 (E8), .0009765625 (E64). Direct previous-code comparison
+  also confirms forward/input/FC2/router equality on both normalization modes.
+- Full GPU-enabled suite: 813 passed, 9 skipped, 6 failed. Five unchanged
+  launcher failures reproduce on extracted baseline; unchanged bias-profiler
+  test misses CUDA events in the full suite but passes alone. Diff check passes.
+- Idle GH200, 65,536 tokens, native BF16: old/new backward medians 6.023/3.770 ms
+  (E8) and 8.478/5.880 ms (E64); peak allocated savings .543/1.199 GiB.
+  Actual backend counts confirm FC2 dgrad 2 -> 1, all other GEMMs unchanged.
+  Full timings/memory tables are in the report. Earlier contended timings discarded.
+- Task files: model.py, _local_bp.py, _grouped_gemm.py, new _local_bp_cuda.py,
+  grouped local tests, new test_local_bp_kernels.py, benchmark_grad_em.py,
+  docs/mixed_local_bp.md and historical-report link. Other dirty README/AGENTS/
+  config/docs edits predate this task. Next step: user review; no pending GPU checks.
+
 Updated: 2026-09-24
 
 ## Current goal and state
