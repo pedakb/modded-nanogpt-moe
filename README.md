@@ -288,6 +288,57 @@ See [diagnostic metrics and overhead](docs/diagnostics.md) for
 the optional `[diagnostics]` TOML settings. Benchmarks always bypass diagnostics;
 Nsight bypasses them unless explicitly enabled.
 
+### Training-divergence guard
+
+The opt-in guard stops a deteriorating experiment successfully so the Vista
+launcher's existing sequential config loop can start the next run. It is not
+validation-based model selection. Add this section to an experiment TOML to
+enable it (the default for `enabled` is `false`; all other defaults are shown):
+
+```toml
+[divergence_guard]
+enabled = true
+grace_updates = 100
+window = 20
+moving_avg_delta = 0.5
+moving_avg_patience = 10
+raw_loss_delta = 2.0
+raw_loss_patience = 3
+```
+
+After each completed update, it observes raw per-token training loss, using the
+same microbatch loss aggregation as TensorBoard, even when TensorBoard is off.
+NaN/Inf stops immediately at that update boundary, including during grace.
+Finite checks start at update 100 and require a full trailing 20-update window.
+The best moving average uses only eligible updates at/after the grace point.
+The guard stops when the moving average exceeds that best by strictly more
+than 0.5 for 10 consecutive updates, or raw loss exceeds it by strictly more
+than 2.0 for 3 consecutive updates. Each counter resets on recovery. Changing
+the window to exceed the grace point delays finite checks until the window fills.
+
+An intentional stop prints `[DIVERGENCE_STOP]` with update, reason, current loss,
+moving average, and best moving average. The guard emits no TensorBoard tags;
+ordinary TensorBoard logging still flushes and closes normally. The trainer returns success;
+Python/CUDA/OOM/checkpoint errors still fail the suite. No launcher flag is needed:
+
+```bash
+scripts/vista/train.sh --submit config1.toml config2.toml config3.toml
+```
+
+Checkpoint behavior matches `STOP_AFTER_COMPLETED_UPDATES`: an enabled checkpoint
+policy saves the completed stopping update, including a nonfinite-loss stop;
+disabled checkpointing (including smoke mode) writes nothing. Guard history
+and patience counters are saved with enabled-guard checkpoints and restored
+on resume. A stopping checkpoint also records the stop reason; it is a record of
+the deteriorated state, not a best-model checkpoint. Legacy checkpoints missing
+guard configuration mean disabled with the defaults above. Resume requires
+matching guard settings, as with other resolved experiment settings.
+
+The guard does not change `total_steps`, the LR horizon, optimizer updates,
+or evaluation/periodic checkpoint cadence. Like the existing completed-update
+stop, it exits without adding a final validation pass. It adds a scalar loss
+synchronization only when enabled, and is rejected in training-benchmark mode.
+
 ## Validation
 
 Run local tests with:

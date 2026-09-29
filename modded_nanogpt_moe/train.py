@@ -25,6 +25,7 @@ from .checkpoint import (
     save_repro_diagnostic,
 )
 from .config import parse_train_args, resolve_grad_em_alpha
+from .divergence_guard import DivergenceGuard
 from .data import distributed_data_generator
 from .diagnostics import make_diagnostics
 from .model import (
@@ -132,6 +133,7 @@ def read_source_snapshot():
         package_dir / "_combine.py",
         package_dir / "_grouped_gemm.py",
         package_dir / "diagnostics.py",
+        package_dir / "divergence_guard.py",
         package_dir / "optim.py",
         package_dir / "data.py",
         package_dir / "checkpoint.py",
@@ -163,6 +165,9 @@ def main(argv=None):
     num_trials = experiment_config["num_trials"]
     requested_run_name = experiment_config["run_name"]
     benchmark = benchmark_settings_from_environment()
+    guard_config = experiment_config["divergence_guard"]
+    if benchmark["enabled"] and guard_config["enabled"]:
+        raise ValueError("TRAINING_BENCHMARK cannot be combined with divergence_guard")
     if benchmark["enabled"]:
         if dist.get_world_size() != 1:
             raise ValueError("TRAINING_BENCHMARK=1 currently requires exactly one GPU")
@@ -560,6 +565,7 @@ def main(argv=None):
                     group["lr"] = group["initial_lr"] * eta
     
         resolved_config = {
+            "divergence_guard": guard_config,
             "model": {
                 "vocab_size": model_config["vocab_size"],
                 "num_layers": model_config["num_layers"],
@@ -693,6 +699,11 @@ def main(argv=None):
             model, writer, experiment_config["diagnostics"],
             benchmark=benchmark["enabled"], nsys_profile=nsys_profile, rank=dist.get_rank())
 
+        guard = DivergenceGuard(guard_config)
+        if resume_checkpoint is not None and guard.enabled:
+            if "divergence_guard_state" in resume_checkpoint:
+                guard.load_state_dict(resume_checkpoint["divergence_guard_state"])
+
         for p in model.parameters():
             dist.broadcast(p.detach(), 0)
         if resume_checkpoint is not None:
@@ -797,7 +808,7 @@ def main(argv=None):
                 diagnostic_update = (
                     step + 1 if repro_diagnostics_dir and step in (0, 1) else None)
                 diagnostic_losses = [] if diagnostic_update is not None else None
-                tensorboard_losses = [] if writer is not None else None
+                tensorboard_losses = [] if writer is not None or guard.enabled else None
                 collect_tb = tb_diagnostics is not None and tb_diagnostics.due(step + 1)
                 with tb_diagnostics.capture_routing() if collect_tb else nullcontext():
                     for i in range(len(inputs) // mbs):
@@ -894,11 +905,24 @@ def main(argv=None):
                 writer.flush()
     
             completed_updates = step + 1
+            divergence_stop = None
+            if guard.enabled:
+                # All ranks make the same stop decision from global per-token loss.
+                guard_loss = train_loss.detach().clone()
+                dist.all_reduce(guard_loss, op=dist.ReduceOp.SUM)
+                guard_loss /= dist.get_world_size()
+                divergence_stop = guard.observe(completed_updates, guard_loss.item())
+                if divergence_stop is not None:
+                    print0("[DIVERGENCE_STOP] " + " ".join(
+                        f"{key}={value}" for key, value in divergence_stop.items()), console=True)
+                    if writer is not None:
+                        writer.flush()
             save_due = bool(checkpoint_dir) and (
                 completed_updates == train_steps
                 or (checkpoint_interval is not None and checkpoint_interval > 0
                     and completed_updates % checkpoint_interval == 0)
-                or completed_updates == stop_after_updates)
+                or completed_updates == stop_after_updates
+                or divergence_stop is not None)
             if save_due:
                 for name, parameter in model.named_parameters():
                     if parameter.grad is not None:
@@ -924,6 +948,10 @@ def main(argv=None):
                     last_val_step=last_val_step,
                     environment_metadata=environment_metadata,
                 )
+                if guard.enabled:
+                    checkpoint["divergence_guard_state"] = guard.state_dict()
+                    if divergence_stop is not None:
+                        checkpoint["divergence_stop"] = divergence_stop
                 saved_path = atomic_save_checkpoint(checkpoint, checkpoint_dir)
                 checkpoint_duration = time.perf_counter() - checkpoint_started
                 # Checkpoint I/O is bookkeeping rather than training time.
@@ -933,7 +961,7 @@ def main(argv=None):
                     console=True,
                 )
     
-            if completed_updates == stop_after_updates:
+            if completed_updates == stop_after_updates or divergence_stop is not None:
                 if nsys_capture_active:
                     try:
                         torch.cuda.synchronize()
@@ -945,11 +973,12 @@ def main(argv=None):
                         f"Nsight Systems capture ended early after update {completed_updates}",
                         console=True,
                     )
-                print0(
-                    f"Stopped cleanly after requested update {completed_updates}; "
-                    f"schedule horizon remains {train_steps}",
-                    console=True,
-                )
+                if divergence_stop is None:
+                    print0(
+                        f"Stopped cleanly after requested update {completed_updates}; "
+                        f"schedule horizon remains {train_steps}",
+                        console=True,
+                    )
                 stopped_early = True
                 break
 

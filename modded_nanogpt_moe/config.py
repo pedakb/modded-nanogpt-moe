@@ -7,11 +7,14 @@ import os
 import tomllib
 from pathlib import Path
 
+from .divergence_guard import DEFAULTS as GUARD_DEFAULTS, validate_guard_config
+
 
 DEFAULT_CONFIG = {
     "run_name": None,
     "num_trials": 1,
     "seed": None,
+    "divergence_guard": copy.deepcopy(GUARD_DEFAULTS),
     "checkpoint": {
         "interval": None,
     },
@@ -119,6 +122,7 @@ def resolve_grad_em_alpha(value, mode):
 
 
 def validate_experiment_config(config, require_run_name=False):
+    validate_guard_config(config["divergence_guard"])
     checkpoint_interval = config["checkpoint"]["interval"]
     if checkpoint_interval is not None and (
             isinstance(checkpoint_interval, bool)

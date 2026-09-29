@@ -195,6 +195,10 @@ def atomic_save_checkpoint(payload, checkpoint_dir: str | Path):
 def _with_legacy_defaults(config):
     """Missing backward/ownership metadata means standard backward/Muon routers."""
     config = copy.deepcopy(config)
+    if isinstance(config, dict):
+        from .divergence_guard import DEFAULTS
+        config["divergence_guard"] = {
+            **DEFAULTS, **config.get("divergence_guard", {})}
     if isinstance(config, dict) and isinstance(config.get("model"), dict):
         config["model"].setdefault("moe_backward", "standard")
         config["model"].setdefault("grad_em_mode", "global")
