@@ -46,13 +46,13 @@ Heavy diagnostics are sampled on completed updates divisible by
 Only representative transformer layers `l00`, `l05`, and `l11` emit per-layer
 heavy metrics. Each emits:
 
-- `opt/router/lXX/{param_rms,grad_rms,update_rms,update_ratio,dlogit_rms,sens_range_med}`
+- `opt/router/lXX/{param_rms,grad_rms,update_rms,update_ratio,dlogit_rms,sens_range_med,sens_std_med}`
 - `opt/expert/lXX/{param_rms_med,grad_rms_med,update_rms_med,update_ratio_med}`
 - `router/lXX/{entropy_norm,entropy_post_norm,logit_range_med,topk_margin_med}`
 - `router/lXX/load/{cv,zero}`
 
-The standard 12-layer, three-AdamW-group run therefore has exactly 60 unique
-scalar series: 8 ordinary series, 4 global diagnostics, and 16 diagnostics for
+The standard 12-layer, three-AdamW-group run therefore has exactly 63 unique
+scalar series: 8 ordinary series, 4 global diagnostics, and 17 diagnostics for
 each of three representative layers. No legacy aliases are emitted and old
 event files are not migrated.
 
@@ -122,7 +122,16 @@ modify routing tensors.
   records its already-computed FP32 `v` from the custom backward kernel/reference;
   neither path performs a second backward or recomputes expert dot products.
 
-Counts, entropy sums, ranges, margins, and gradient sums combine all
+- `sens_std_med` is the midpoint median across tokens of
+  `sqrt(sum_e b_e * (v_e - sum_j b_j*v_j)^2)`, using the same sensitivity scores
+  as `sens_range_med`. Here `b = softmax(selected_logits.float())`, the normalized
+  base of the existing Grad-EM responsibilities, including when
+  `normalize_topk=False`. Detached FP32 accumulation centers scores first and
+  clamps variance to zero before square root. Each callback retains only its
+  forward's detached selected base weights; no additional expert computation
+  or backward is performed.
+
+Counts, entropy sums, ranges, standard deviations, margins, and gradient sums combine all
 microbatches in the sampled optimizer update. Routing and gradient metrics are
 rank-local.
 

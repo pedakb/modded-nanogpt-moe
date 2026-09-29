@@ -525,13 +525,13 @@ class MoE(nn.Module):
                     h_pre, h_act, out_sorted, router_logits, topk_weights,
                     topk_experts, order, batch_sizes, batch_sizes_device, offsets,
                     self.grad_em_eta, self.gmm_implementation,
-                    (self._routing_diagnostics.observe_sensitivity
+                    (self._routing_diagnostics.sensitivity_observer()
                      if self._routing_diagnostics is not None else None))
             else:
                 from .grad_em import GradEMCombine
                 out = GradEMCombine.apply(out_sorted, router_logits, topk_weights,
                                           topk_experts, order, self.grad_em_eta,
-                                          (self._routing_diagnostics.observe_sensitivity
+                                          (self._routing_diagnostics.sensitivity_observer()
                                            if self._routing_diagnostics is not None else None),
                                           self.grad_em_lambda)
             out = out.view(B, T, D)

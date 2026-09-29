@@ -5,6 +5,7 @@ all-reduce. State is transient and never included in checkpoints. See
 docs/diagnostics.md for definitions, scope, and memory costs.
 """
 from contextlib import contextmanager
+from functools import partial
 import math
 
 import torch
@@ -49,6 +50,8 @@ class RoutingStatistics:
         self.margins = []
         self.logit_ranges = []
         self.sensitivity_ranges = []
+        self.sensitivity_stds = []
+        self.sensitivity_base = None
         self.logit_grad_squares = None
         self.logit_grad_elements = 0
         self.gradient_handles = []
@@ -72,16 +75,27 @@ class RoutingStatistics:
         self.gradient_handles.clear()
 
     @torch.no_grad()
-    def observe_sensitivity(self, sensitivity):
+    def observe_sensitivity(self, sensitivity, *, base=None):
         sensitivity = sensitivity.detach().float()
         self.sensitivity_ranges.append(
             sensitivity.amax(dim=-1) - sensitivity.amin(dim=-1))
+        if base is not None:
+            # Center first to avoid cancellation from a large common offset.
+            centered = sensitivity - sensitivity[:, :1]
+            mean = (base * centered).sum(-1, keepdim=True)
+            variance = (base * (centered - mean).square()).sum(-1)
+            self.sensitivity_stds.append(variance.clamp_min(0).sqrt())
         # Returning None from a tensor hook leaves its gradient untouched.
+
+    def sensitivity_observer(self):
+        # Bind this forward's detached base, even if several forwards precede
+        # backward. Never retain logits or an autograd graph in the callback.
+        return partial(self.observe_sensitivity, base=self.sensitivity_base)
 
     def attach_sensitivity_gradient(self, weights):
         if weights.requires_grad:
             self.gradient_handles.append(
-                weights.register_hook(self.observe_sensitivity))
+                weights.register_hook(self.sensitivity_observer()))
 
     @torch.no_grad()
     def observe(self, logits, probabilities, selected, selected_weights):
@@ -91,6 +105,9 @@ class RoutingStatistics:
         selected_weights = selected_weights.detach().float()
         if not logits.shape[0]:
             return
+        # This is the base of q=softmax(z_selected-eta*v), even when forward
+        # Top-K weights are unnormalized or have underflowed to zero.
+        self.sensitivity_base = logits.gather(1, selected).softmax(-1)
         self.tokens += logits.shape[0]
         entropy = -(probabilities * probabilities.clamp_min(
             torch.finfo(probabilities.dtype).tiny).log()).sum(-1).sum()
@@ -133,6 +150,9 @@ class RoutingStatistics:
         if self.sensitivity_ranges:
             metrics["sensitivity_range_median"] = midpoint_median(
                 torch.cat(self.sensitivity_ranges))
+        if self.sensitivity_stds:
+            metrics["sensitivity_std_median"] = midpoint_median(
+                torch.cat(self.sensitivity_stds))
         return metrics
 
 
@@ -334,6 +354,9 @@ class TrainingDiagnostics:
             if "sensitivity_range_median" in routing:
                 scalars[f"opt/router/{layer}/sens_range_med"] = routing[
                     "sensitivity_range_median"]
+            if "sensitivity_std_median" in routing:
+                scalars[f"opt/router/{layer}/sens_std_med"] = routing[
+                    "sensitivity_std_median"]
         # One batched device-to-host transfer, including the ordinary training
         # loss on sampled steps when the trainer supplies it.
         values = torch.stack([value.float() for value in scalars.values()]).cpu().tolist()

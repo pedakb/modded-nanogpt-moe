@@ -49,7 +49,7 @@ class LocalBPGradEM(torch.autograd.Function):
         ctx.parameters = parameters
         ctx.eta = module.grad_em_eta
         ctx.sensitivity_observer = (
-            module._routing_diagnostics.observe_sensitivity
+            module._routing_diagnostics.sensitivity_observer()
             if module._routing_diagnostics is not None else None)
         ctx.logit_gradient_observer = (
             module._routing_diagnostics.observe_logit_gradient

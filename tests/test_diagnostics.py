@@ -14,6 +14,7 @@ from modded_nanogpt_moe import diagnostics as diag, optim, train
 from modded_nanogpt_moe.config import load_experiment_config, validate_experiment_config
 from modded_nanogpt_moe.grad_em import GradEMCombine
 from modded_nanogpt_moe.model import MoE
+from test_grad_em_grouped_local_bp import cpu_backend, make_models
 
 
 SETTINGS = dict(scalar_interval=10, histogram_interval=0, during_nsys=False)
@@ -124,6 +125,95 @@ def test_midpoint_median_selection():
     assert diag.midpoint_median(torch.tensor([1., 4., 2., 3.])) == 2.5
     assert diag.midpoint_median(torch.tensor([1., 9., 7.])) == 7
     assert torch.isnan(diag.midpoint_median(torch.tensor([1., float("nan")])))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("normalize", [True, False])
+def test_sense_std_weighted_reference_and_translation(dtype, normalize):
+    logits = torch.tensor([[3., 1., 0.], [0., 2., 1.], [1., 0., 4.],
+                           [2., 1., 0.]], dtype=dtype, requires_grad=True)
+    probabilities = logits.float().softmax(-1)
+    weights, indices = probabilities.topk(2, dim=-1)
+    if normalize:
+        weights = weights / weights.sum(-1, keepdim=True)
+    scores = torch.tensor([[1., 5.], [-2., 4.], [8., 0.], [3., 3.]], dtype=dtype)
+    base = logits.detach().double().gather(1, indices).softmax(-1)
+    mean = (base * scores.double()).sum(-1, keepdim=True)
+    sigma = (base * (scores.double() - mean).square()).sum(-1).sqrt()
+    expected = sigma.sort().values[1:3].mean()
+    for shift in (0., 128.):
+        stats = diag.RoutingStatistics(3, 2, normalize)
+        stats.observe(logits, probabilities, indices, weights)
+        callback = stats.sensitivity_observer()
+        # Translate the already-quantized input in FP32, without losing BF16
+        # score differences by re-quantizing a large common offset.
+        assert callback(scores.float() + shift) is None
+        metric = stats.finish()["sensitivity_std_median"]
+        torch.testing.assert_close(metric.double(), expected, atol=1e-6, rtol=1e-6)
+        assert torch.isfinite(metric) and metric.dtype == torch.float32
+        assert not metric.requires_grad and metric.grad_fn is None
+    if not normalize:
+        wrong_mean = (weights.detach().double() * scores.double()).sum(-1, keepdim=True)
+        wrong = (weights.detach().double() * (scores.double() - wrong_mean).square()).sum(-1).sqrt()
+        assert not torch.isclose(expected, wrong.sort().values[1:3].mean(), atol=1e-4, rtol=1e-4)
+
+
+def test_sense_std_callbacks_bind_each_forward_base():
+    stats = diag.RoutingStatistics(3, 2, False)
+    callbacks, expected = [], []
+    for logits, scores in ((torch.tensor([[3., 1., 0.]]), torch.tensor([[0., 4.]])),
+                           (torch.tensor([[0., 2., 2.], [1., 3., 0.]]),
+                            torch.tensor([[1., 9.], [2., 4.]]))):
+        probabilities = logits.softmax(-1)
+        weights, indices = probabilities.topk(2)
+        stats.observe(logits, probabilities, indices, weights)
+        callbacks.append((stats.sensitivity_observer(), scores))
+        base = logits.double().gather(1, indices).softmax(-1)
+        expected.append((base[:, 0] * base[:, 1]).sqrt() * (scores[:, 0] - scores[:, 1]).abs())
+    for callback, scores in reversed(callbacks):
+        callback(scores)
+    torch.testing.assert_close(stats.finish()["sensitivity_std_median"].double(),
+                               torch.cat(expected).sort().values[1], atol=1e-6, rtol=1e-6)
+
+
+def test_sense_std_single_expert_is_zero():
+    stats = diag.RoutingStatistics(1, 1)
+    stats.observe(torch.zeros(2, 1), torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.long), torch.ones(2, 1))
+    stats.sensitivity_observer()(torch.tensor([[1e10], [-1e10]]))
+    assert stats.finish()["sensitivity_std_median"] == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("normalize", [True, False])
+@pytest.mark.parametrize("mode,coefficient", [("standard", 1.), ("global", 0.5),
+                                             ("global", 1.), ("local_bp", 1.)])
+def test_sense_std_observer_preserves_backward_and_gemm_counts(
+        cpu_backend, dtype, normalize, mode, coefficient):
+    _, local, standard, global_em = make_models(normalize=normalize)
+    moe = {"standard": standard, "global": global_em, "local_bp": local}[mode]
+    moe.grad_em_lambda = coefficient
+    model = nn.Module()
+    block = nn.Module()
+    block.mlp = moe
+    model.blocks = nn.ModuleList([block])
+    observer = diag.TrainingDiagnostics(model, SETTINGS)
+    x = torch.randn(1, 7, 16, dtype=dtype, requires_grad=True)
+    g = torch.randn_like(x)
+    cpu_backend.clear()
+    old = moe(x)
+    expected = torch.autograd.grad(old, (x, *moe.parameters()), g)
+    calls = list(cpu_backend)
+    cpu_backend.clear()
+    rng = torch.get_rng_state().clone()
+    with observer.capture_routing():
+        new = moe(x)
+        actual = torch.autograd.grad(new, (x, *moe.parameters()), g)
+    assert cpu_backend == calls
+    torch.testing.assert_close(new, old, atol=0, rtol=0)
+    for value, reference in zip(actual, expected):
+        torch.testing.assert_close(value, reference, atol=0, rtol=0)
+    torch.testing.assert_close(torch.get_rng_state(), rng, atol=0, rtol=0)
+    assert torch.isfinite(observer.routing["l00"].finish()["sensitivity_std_median"])
 
 
 def test_standard_and_grad_em_sensitivity_use_existing_backward_values():
@@ -381,7 +471,7 @@ def test_only_representative_layers_emit_compact_heavy_surface(monkeypatch, layo
     for layer in ("l00", "l05", "l11"):
         expected.update(f"opt/router/{layer}/{metric}" for metric in (
             "param_rms", "grad_rms", "update_rms", "update_ratio", "dlogit_rms",
-            "sens_range_med"))
+            "sens_range_med", "sens_std_med"))
         expected.update(f"opt/expert/{layer}/{metric}_med" for metric in (
             "param_rms", "grad_rms", "update_rms", "update_ratio"))
         expected.update({
@@ -390,7 +480,7 @@ def test_only_representative_layers_emit_compact_heavy_surface(monkeypatch, layo
             f"router/{layer}/load/cv", f"router/{layer}/load/zero",
         })
     assert set(writer.scalars) == expected
-    assert len(writer.scalars) == 53
+    assert len(writer.scalars) == 56
     assert not writer.histograms
     discarded = (
         "/fc1/", "/fc2/", "param_norm", "grad_norm", "update_norm",
@@ -401,12 +491,12 @@ def test_only_representative_layers_emit_compact_heavy_surface(monkeypatch, layo
         "/load/max", "/load/mean", "/load/std", "/load/max_mean",
     )
     for tag in writer.scalars:
-        assert not any(fragment in tag for fragment in discarded), tag
+        assert tag.endswith("/sens_std_med") or not any(fragment in tag for fragment in discarded), tag
         assert not any(f"l{index:02d}" in tag for index in range(12)
                        if index not in (0, 5, 11)), tag
 
 
-def test_expected_production_scalar_surface_has_exactly_60_series():
+def test_expected_production_scalar_surface_has_exactly_63_series():
     tags = {
         "metric/loss/train", "metric/loss/val", "perf/step_ms", "perf/tok_s",
         "opt/lr/adamw/g0", "opt/lr/adamw/g1", "opt/lr/adamw/g2", "opt/lr/muon",
@@ -416,7 +506,7 @@ def test_expected_production_scalar_surface_has_exactly_60_series():
     for layer in ("l00", "l05", "l11"):
         tags.update(f"opt/router/{layer}/{metric}" for metric in (
             "param_rms", "grad_rms", "update_rms", "update_ratio", "dlogit_rms",
-            "sens_range_med"))
+            "sens_range_med", "sens_std_med"))
         tags.update(f"opt/expert/{layer}/{metric}_med" for metric in (
             "param_rms", "grad_rms", "update_rms", "update_ratio"))
         tags.update({
@@ -424,7 +514,7 @@ def test_expected_production_scalar_surface_has_exactly_60_series():
             f"router/{layer}/logit_range_med", f"router/{layer}/topk_margin_med",
             f"router/{layer}/load/cv", f"router/{layer}/load/zero",
         })
-    assert len(tags) == 60
+    assert len(tags) == 63
 
 
 def test_sampling_cadence_uses_completed_updates(monkeypatch):
