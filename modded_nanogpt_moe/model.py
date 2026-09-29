@@ -278,10 +278,11 @@ class MoE(nn.Module):
     def __init__(self, dim: int, num_experts: int, top_k: int, normalize_topk: bool = True,
                  moe_backend: str = "loop", hidden_dim: int | None = None,
                  moe_parameter_layout: str = "modulelist", moe_backward: str = "standard",
-                 grad_em_mode: str = "global", grad_em_eta: float = 0.1):
+                 grad_em_mode: str = "global", grad_em_eta: float = 0.1, grad_em_lambda: float = 1.0):
         super().__init__()
-        from .config import validate_grad_em_eta
+        from .config import validate_grad_em_eta, validate_grad_em_lambda
         validate_grad_em_eta(grad_em_eta)
+        validate_grad_em_lambda(grad_em_lambda, grad_em_mode)
         if moe_backward not in ("standard", "grad_em"):
             raise ValueError("moe_backward must be 'standard' or 'grad_em'")
         if grad_em_mode not in ("global", "local_bp"):
@@ -291,6 +292,7 @@ class MoE(nn.Module):
         self.moe_backward = moe_backward
         self.grad_em_mode = grad_em_mode
         self.grad_em_eta = grad_em_eta
+        self.grad_em_lambda = grad_em_lambda
         assert 1 <= top_k <= num_experts
         assert moe_backend in ("loop", "grouped_gemm"), f"unknown moe_backend: {moe_backend!r}"
         if moe_parameter_layout not in ("modulelist", "packed"):
@@ -372,7 +374,7 @@ class MoE(nn.Module):
         if self._routing_diagnostics is not None:
             self._routing_diagnostics.observe(
                 router_logits, routing_weights, topk_experts, topk_weights)
-            if self.moe_backward == "standard":
+            if self.moe_backward == "standard" or self.grad_em_lambda == 0:
                 self._routing_diagnostics.attach_sensitivity_gradient(topk_weights)
         topk_weights = topk_weights.type_as(x)
 
@@ -445,7 +447,7 @@ class MoE(nn.Module):
             if self._routing_diagnostics is not None:
                 self._routing_diagnostics.observe(
                     router_logits, routing_weights, topk_experts, topk_weights)
-                if self.moe_backward == "standard":
+                if self.moe_backward == "standard" or self.grad_em_lambda == 0:
                     self._routing_diagnostics.attach_sensitivity_gradient(topk_weights)
             topk_weights = topk_weights.type_as(x)
 
@@ -514,7 +516,7 @@ class MoE(nn.Module):
         # Whether that is benign or causes drift for experts that are
         # repeatedly starved of tokens has not been checked empirically.
         with nsys_range(_moe_nsys_capture_active, "moe.combine"):
-            if self.moe_backward == "standard":
+            if self.moe_backward == "standard" or self.grad_em_lambda == 0:
                 out = combine_expert_outputs(out_sorted, topk_weights, order)
             elif bp_x is not None:
                 from ._local_bp import MixedLocalBP
@@ -530,7 +532,8 @@ class MoE(nn.Module):
                 out = GradEMCombine.apply(out_sorted, router_logits, topk_weights,
                                           topk_experts, order, self.grad_em_eta,
                                           (self._routing_diagnostics.observe_sensitivity
-                                           if self._routing_diagnostics is not None else None))
+                                           if self._routing_diagnostics is not None else None),
+                                          self.grad_em_lambda)
             out = out.view(B, T, D)
         if self._grad_em_diagnostics is not None:
             self._grad_em_diagnostics(
@@ -545,7 +548,7 @@ class Block(nn.Module):
                  top_k: int = 1, normalize_topk: bool = True, moe_backend: str = "loop",
                  hidden_dim: int | None = None, moe_parameter_layout: str = "modulelist",
                  moe_backward: str = "standard", grad_em_mode: str = "global",
-                 grad_em_eta: float = 0.1):
+                 grad_em_eta: float = 0.1, grad_em_lambda: float = 1.0):
         super().__init__()
         self.attn = CausalSelfAttention(dim)
         if mlp_type == "dense":
@@ -555,7 +558,7 @@ class Block(nn.Module):
                             moe_backend=moe_backend, hidden_dim=hidden_dim,
                             moe_parameter_layout=moe_parameter_layout,
                             moe_backward=moe_backward, grad_em_mode=grad_em_mode,
-                            grad_em_eta=grad_em_eta)
+                            grad_em_eta=grad_em_eta, grad_em_lambda=grad_em_lambda)
         else:
             raise ValueError(f"unknown mlp_type: {mlp_type!r}")
         self.norm1 = RMSNorm(dim)
@@ -571,10 +574,11 @@ class GPT(nn.Module):
                  num_experts: int = 1, top_k: int = 1, normalize_topk: bool = True,
                  moe_backend: str = "loop", mlp_ratio: float = 4,
                  moe_parameter_layout: str = "modulelist", moe_backward: str = "standard",
-                 grad_em_mode: str = "global", grad_em_eta: float = 0.1):
+                 grad_em_mode: str = "global", grad_em_eta: float = 0.1, grad_em_lambda: float = 1.0):
         super().__init__()
-        from .config import validate_grad_em_eta
+        from .config import validate_grad_em_eta, validate_grad_em_lambda
         validate_grad_em_eta(grad_em_eta)
+        validate_grad_em_lambda(grad_em_lambda, grad_em_mode)
         if moe_backward not in ("standard", "grad_em"):
             raise ValueError("moe_backward must be 'standard' or 'grad_em'")
         if grad_em_mode not in ("global", "local_bp"):
@@ -596,7 +600,7 @@ class GPT(nn.Module):
                   normalize_topk=normalize_topk, moe_backend=moe_backend,
                   hidden_dim=hidden_dim, moe_parameter_layout=moe_parameter_layout,
                   moe_backward=moe_backward, grad_em_mode=grad_em_mode,
-                  grad_em_eta=grad_em_eta)
+                  grad_em_eta=grad_em_eta, grad_em_lambda=grad_em_lambda)
             for _ in range(num_layers)
         ])
         self.proj = Linear(model_dim, vocab_size)

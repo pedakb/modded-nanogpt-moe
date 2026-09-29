@@ -20,7 +20,11 @@ def _grad_em_expert_backward(X, Z, Indices, Rows, Grad, GradX, Q, V,
                              GR: tl.constexpr, GC: tl.constexpr,
                              ETA: tl.constexpr, NEED_X: tl.constexpr,
                              SAVE_V: tl.constexpr,
-                             SLOTS: tl.constexpr, COLS: tl.constexpr):
+                             SLOTS: tl.constexpr, COLS: tl.constexpr,
+                             Weights=None, GradWeights=None,
+                             WR: tl.constexpr = 0, WC: tl.constexpr = 0,
+                             MIX_LAMBDA: tl.constexpr = 1.0,
+                             NEED_WEIGHTS: tl.constexpr = False):
     token = tl.program_id(0)
     slots, columns = tl.arange(0, SLOTS), tl.arange(0, COLS)
     rows = tl.load(Rows + token * K + slots, slots < K, other=0)
@@ -37,10 +41,19 @@ def _grad_em_expert_backward(X, Z, Indices, Rows, Grad, GradX, Q, V,
     tl.store(Q + token * K + slots, q, slots < K)
     if SAVE_V:
         tl.store(V + token * K + slots, v, slots < K)
+    if NEED_WEIGHTS:
+        # Match ordinary combine: activation-dtype product and reduction result.
+        products = (values * grad[None, :]).to(X.dtype.element_ty).to(tl.float32)
+        bp_weight = tl.sum(products, axis=1).to(Weights.dtype.element_ty).to(tl.float32)
+        tl.store(GradWeights + token * K + slots, (1. - MIX_LAMBDA) * bp_weight, slots < K)
     if NEED_X:
+        mixed = q
+        if MIX_LAMBDA != 1:
+            p = tl.load(Weights + token * WR + slots * WC, slots < K, other=0).to(tl.float32)
+            mixed = p + MIX_LAMBDA * (q - p)
         # A permutation gives each sorted row exactly one token/slot writer.
         tl.store(GradX + rows[:, None] * D + columns[None, :],
-                 q[:, None] * grad[None, :],
+                 mixed[:, None] * grad[None, :],
                  (slots[:, None] < K) & (columns[None, :] < D))
 
 
@@ -100,7 +113,8 @@ def cuda_forward(out_sorted, logits, weights, indices, order):
 
 
 def cuda_backward(out_sorted, logits, indices, rows, grad_output, eta,
-                  need_x=True, need_logits=True, *, save_v=False):
+                  need_x=True, need_logits=True, *, save_v=False,
+                  weights=None, mix_lambda=1.0, grad_weights=None):
     """Return gradients plus compact q (and optional test-only FP32 v)."""
     validate_grad_em_eta(eta)
     n, k = indices.shape
@@ -109,7 +123,7 @@ def cuda_backward(out_sorted, logits, indices, rows, grad_output, eta,
     gz = torch.empty(logits.shape, device=logits.device, dtype=logits.dtype) if need_logits else None
     q = torch.empty((n, k), device=logits.device, dtype=torch.float32)
     v = torch.empty((n, k), device=logits.device, dtype=torch.float32) if save_v else None
-    if n and (need_x or need_logits or save_v):
+    if n and (need_x or need_logits or save_v or grad_weights is not None):
         with torch.cuda.device(out_sorted.device):
             _grad_em_expert_backward[(n,)](
                 out_sorted, logits, indices, rows, grad_output,
@@ -117,6 +131,8 @@ def cuda_backward(out_sorted, logits, indices, rows, grad_output, eta,
                 d, k, *out_sorted.stride(), *logits.stride(), *indices.stride(),
                 *grad_output.stride(), eta, need_x, save_v,
                 triton.next_power_of_2(k), triton.next_power_of_2(d),
+                weights, grad_weights, *(weights.stride() if weights is not None else (0, 0)),
+                mix_lambda, grad_weights is not None,
                 num_warps=4, enable_fp_fusion=False)
             if need_logits:
                 _grad_em_router_backward[(n,)](

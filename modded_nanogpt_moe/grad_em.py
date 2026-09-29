@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 import torch
 
-from .config import validate_grad_em_eta
+from .config import validate_grad_em_eta, validate_grad_em_lambda
 
 
 def require_grad_em_device(device):
@@ -95,37 +95,47 @@ class GradEMCombine(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, out_sorted, router_logits, topk_weights, topk_experts, order, eta,
-                sensitivity_observer=None):
+                sensitivity_observer=None, mix_lambda=1.0):
         require_grad_em_device(out_sorted.device)
         validate_grad_em_eta(eta)
+        validate_grad_em_lambda(mix_lambda, "global")
         ctx.is_cuda = out_sorted.is_cuda
         ctx.sensitivity_observer = sensitivity_observer
+        ctx.mix_lambda = mix_lambda
+        extra = (topk_weights,) if mix_lambda != 1 else ()
         if ctx.is_cuda:
             from ._grad_em_cuda import cuda_forward
             output, rows = cuda_forward(out_sorted, router_logits, topk_weights, topk_experts, order)
-            ctx.save_for_backward(out_sorted, router_logits, topk_experts, rows)
+            ctx.save_for_backward(out_sorted, router_logits, topk_experts, rows, *extra)
             ctx.eta = eta
             return output
         # Lazy import avoids a model/reference import cycle. Reuse the exact
         # existing forward, including activation-dtype mixing/rounding.
         from .model import combine_expert_outputs
-        ctx.save_for_backward(out_sorted, router_logits, topk_experts, order)
+        ctx.save_for_backward(out_sorted, router_logits, topk_experts, order, *extra)
         ctx.eta = eta
         return combine_expert_outputs(out_sorted, topk_weights, order)
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad_output):
-        out_sorted, logits, indices, order = ctx.saved_tensors
+        out_sorted, logits, indices, order = ctx.saved_tensors[:4]
+        weights = ctx.saved_tensors[4] if ctx.mix_lambda != 1 else None
+        grad_weights = None
         if ctx.is_cuda:
             from ._grad_em_cuda import cuda_backward
+            if weights is not None and ctx.needs_input_grad[2]:
+                grad_weights = torch.empty_like(weights, memory_format=torch.contiguous_format)
             gx, gz, _, v = cuda_backward(
                 out_sorted, logits, indices, order, grad_output, ctx.eta,
-                *ctx.needs_input_grad[:2], save_v=ctx.sensitivity_observer is not None)
+                *ctx.needs_input_grad[:2], save_v=ctx.sensitivity_observer is not None,
+                weights=weights, mix_lambda=ctx.mix_lambda, grad_weights=grad_weights)
+            if gz is not None and ctx.mix_lambda != 1:
+                gz = gz * ctx.mix_lambda
             if ctx.sensitivity_observer is not None:
                 ctx.sensitivity_observer(v)
-            gradients = (gx, gz, None, None, None, None)
-            return gradients + ((None,) if len(ctx.needs_input_grad) == 7 else ())
+            gradients = (gx, gz, grad_weights, None, None, None)
+            return gradients + (None,) * (len(ctx.needs_input_grad) - 6)
         selected = torch.empty_like(out_sorted)
         selected[order] = out_sorted
         selected = selected.view(*indices.shape, out_sorted.shape[-1])
@@ -133,9 +143,17 @@ class GradEMCombine(torch.autograd.Function):
         if ctx.sensitivity_observer is not None:
             ctx.sensitivity_observer(result.v)
         grad_sorted = result.grad_expert.flatten(0, 1)[order].to(out_sorted.dtype)
-        # Direct edge to original logits; NO edge through forward mixing weights.
-        gradients = (grad_sorted, result.grad_logits.to(logits.dtype), None, None, None, None)
-        return gradients + ((None,) if len(ctx.needs_input_grad) == 7 else ())
+        grad_logits = result.grad_logits.to(logits.dtype)
+        if ctx.mix_lambda != 1:
+            mixed = weights.float() + ctx.mix_lambda * (result.q - weights.float())
+            grad_sorted = (mixed[..., None] * grad_output.float()[:, None, :])
+            grad_sorted = grad_sorted.flatten(0, 1)[order].to(out_sorted.dtype)
+            # Let the original softmax/top-k/casts differentiate BP, including
+            # unnormalized routing. Both router edges sum before linear backward.
+            grad_weights = (selected * grad_output[:, None, :]).sum(-1) * (1 - ctx.mix_lambda)
+            grad_logits = grad_logits * ctx.mix_lambda
+        gradients = (grad_sorted, grad_logits, grad_weights, None, None, None)
+        return gradients + (None,) * (len(ctx.needs_input_grad) - 6)
 
 
 class GradEMResult(NamedTuple):

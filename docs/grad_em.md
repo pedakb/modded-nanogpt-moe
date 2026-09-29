@@ -51,15 +51,45 @@ device-agnostic eager loop with ModuleList experts, including CPU and MPS,
 and grouped-GEMM with packed or ModuleList parameters. The grouped path uses
 the same CPU/CUDA device and backend dtype restrictions as global mode.
 
-Resolved experiment/checkpoint configs record all three fields. Compatibility
-checks interpret missing legacy fields as `"standard"` / `"global"` / `0.1`, without
-mutating the checkpoint. Explicit mode/eta mismatches are rejected. No model
-state keys or checkpoint format version change.
+`grad_em_lambda` defaults to `1.0` and must be finite, numeric (not bool), and
+in `[0,1]`. It controls **global** mode only; nondefault values with `local_bp`
+are rejected so local-BP remains full local Grad-EM with a BP boundary.
+
+Resolved experiment/checkpoint configs record all four fields. Compatibility
+checks interpret missing legacy fields as `"standard"` / `"global"` / `0.1` /
+`1.0`, without mutating the checkpoint. Explicit mode/eta/lambda mismatches are
+rejected. No model state keys or checkpoint format version change.
 
 Do not treat old Grad-EM checkpoints/results as continuations of this corrected
 algorithm: their router rule differed. Config mode/eta alone do not distinguish
 these semantics, so retain the code revision with every result and start fresh
 comparisons. This patch does not add checkpoint migrations or version fields.
+
+## Recursive global interpolation
+
+For `grad_em_mode = "global"`, `grad_em_lambda = 0` is ordinary end-to-end BP;
+`0 < grad_em_lambda < 1` recursively mixes BP and Grad-EM; `grad_em_lambda = 1`
+is the existing global Grad-EM backward. Forward values are unchanged.
+
+Given each layer's incoming gradient `g`, expert signals are
+`[p + lambda*(q-p)]*g`, where `p` is the actual activation-dtype forward
+weight. Router signals are `(1-lambda)*r_BP + lambda*(a-q)/eta`. The BP term
+uses the original softmax/Top-K/normalization/cast graph, preserving
+`normalize_topk=False`; the GE term retains the selected-logit softmax `a`.
+The resulting mixed signals drive both parameter and input gradients through
+the existing expert and router graphs. Their upstream gradient becomes the
+incoming gradient of earlier layers, where responsibilities are recomputed.
+No BP boundary substitution or second-order scoring is used in global mode.
+
+This is interpolation **at every layer**, not necessarily a convex combination
+of two independently computed whole-network gradient vectors. It has exact BP
+and global-GE endpoints. Where the normalized Top-K small-eta expansion above
+applies, the first-order global correction is scaled by lambda and propagated
+recursively. That small-eta BP-limit statement does not apply unchanged to
+unnormalized Top-K (`p` need not equal `a`) or eliminate BF16 rounding.
+Signals are mixed before GEMM; intermediate BF16 results can differ from
+mixing two already-rounded parameter/input gradients. Lambda zero uses the
+ordinary BP path; lambda one retains the previous arithmetic.
 
 ## Custom combine boundary
 
@@ -68,11 +98,12 @@ The boundary is `MoE._forward_grouped_gemm`'s call to
 backed by `_combine.py::_FusedCombine` on CUDA for standard mode. The opt-in
 `GradEMCombine` Function reuses that same helper's forward (on CPU in Stage 2A).
 It saves only `out_sorted`, original `router_logits`, `topk_experts`, and `order`,
-plus fixed eta as a scalar. It does not save the mixing weights or any new
-inverse permutation. The forward uses exactly the existing mixing weights.
+plus fixed eta as a scalar. Intermediate global interpolation additionally
+saves the forward mixing weights and returns their scaled BP gradient. The
+forward uses exactly the existing mixing weights.
 
-Backward unsorts the selected expert outputs into `[T,K,D]`, invokes the
-Stage-1 FP32 oracle, and gathers q*g back to expert-sorted order. The existing
+At lambda one, CPU backward unsorts the selected expert outputs into `[T,K,D]`,
+invokes the Stage-1 FP32 oracle, and gathers q*g back to expert-sorted order. The existing
 FC2/activation/FC1 graph receives that gradient unchanged except for casting to
 the original output dtype. It scatters `(a-q)/eta` **directly to selected logits** (cast to
 the logits dtype) and **None for mixing weights**: ordinary top-k, normalization
@@ -81,7 +112,7 @@ connected to x, so expert and router input gradients both accumulate normally.
 The backward is explicitly once-differentiable; q has no higher-order graph.
 
 Standard mode keeps its existing combine call, with no new autograd boundary,
-saved tensors or tensor operations. GEMM, routing, bias, optimizer, kernels and
+saved tensors or tensor operations. GEMM, routing, bias, optimizer and
 compilation boundaries are unchanged. No checkpoint keys change.
 
 ## Local-BP boundary

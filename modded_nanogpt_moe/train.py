@@ -448,7 +448,8 @@ def main(argv=None):
                 moe_parameter_layout=model_config["moe_parameter_layout"],
                 moe_backward=model_config["moe_backward"],
                 grad_em_mode=model_config["grad_em_mode"],
-                grad_em_eta=model_config["grad_em_eta"])
+                grad_em_eta=model_config["grad_em_eta"],
+                grad_em_lambda=model_config["grad_em_lambda"])
     assert model.hidden_dim == hidden_dim
     gmm_implementation = (model.blocks[0].mlp.gmm_implementation if mlp_type == "moe" else "n/a")
     print0(
@@ -570,6 +571,7 @@ def main(argv=None):
                 "moe_backward": model_config["moe_backward"],
                 "grad_em_mode": model_config["grad_em_mode"],
                 "grad_em_eta": model_config["grad_em_eta"],
+                "grad_em_lambda": model_config["grad_em_lambda"],
             },
             "training": {
                 "sequence_length": sequence_length,

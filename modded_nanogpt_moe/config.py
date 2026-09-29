@@ -40,6 +40,7 @@ DEFAULT_CONFIG = {
         "moe_backward": "standard",
         "grad_em_mode": "global",
         "grad_em_eta": 0.1,
+        "grad_em_lambda": 1.0,
     },
     "training": {
         "sequence_length": 1024,
@@ -99,6 +100,14 @@ def validate_grad_em_eta(eta):
     if (isinstance(eta, bool) or not isinstance(eta, (int, float))
             or not math.isfinite(eta) or eta <= 0):
         raise ValueError("model.grad_em_eta must be finite and positive")
+
+
+def validate_grad_em_lambda(value, mode):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not 0 <= value <= 1 or not math.isfinite(value)):
+        raise ValueError("model.grad_em_lambda must be finite and in [0, 1]")
+    if mode != "global" and value != 1:
+        raise ValueError("model.grad_em_lambda != 1 requires grad_em_mode='global'")
 
 
 def validate_experiment_config(config, require_run_name=False):
@@ -161,6 +170,7 @@ def validate_experiment_config(config, require_run_name=False):
     if config["model"]["grad_em_mode"] not in ("global", "local_bp"):
         raise ValueError("model.grad_em_mode must be 'global' or 'local_bp'")
     validate_grad_em_eta(config["model"]["grad_em_eta"])
+    validate_grad_em_lambda(config["model"]["grad_em_lambda"], config["model"]["grad_em_mode"])
     if (config["model"]["moe_backward"] == "grad_em"
             and config["model"]["mlp_type"] != "moe"):
         raise ValueError("model.moe_backward='grad_em' requires MoE")
