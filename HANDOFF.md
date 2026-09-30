@@ -1,5 +1,40 @@
 # Current handoff
 
+## Normalized Grad-EM refinement (2026-09-30, uncommitted)
+
+Base `356d6a8`, branch `cleanup-active-codebase`. The working diff includes
+the initial opt-in normalization plus this epsilon/efficiency refinement.
+No dependencies, configs, optimizers, launchers, GEMM/bias/standard-combine
+kernels, or training numerics outside the opt-in GE responsibilities changed.
+
+- `model.grad_em_score_normalization = "none" | "std"` defaults to raw;
+  `grad_em_score_norm_eps = 1e-6` is finite/positive, with legacy checkpoint
+  defaults. Std uses per-token FP32 weighted population variance and
+  `centered / max(std, eps)`, not a hard zero cutoff. Origin shifting makes
+  constant scores exactly zero despite probability-sum roundoff. No gradients
+  through q/statistics; lambda/alpha, forward and raw sensitivity logs unchanged.
+- Both CUDA backward paths share the fused normalization helper. Std reuses
+  base probabilities in the router kernel via compact `[T,K]` FP32 scratch;
+  two backward launches/two softmaxes total when router gradients are needed.
+  None compiles out this work and allocates no reuse buffer. GPU correctness,
+  launch counts and overhead remain pending; no local CUDA available.
+- CPU focused normalization/grouped-local checks: 179 passed, 252 CUDA skips.
+  Broader GE/local-BP/checkpoint semantics: 455 passed, 310 CUDA skips with
+  `TORCH_COMPILE_DISABLE=1`. Config subset: 8 passed. Full suite with compilation
+  enabled and only `torch._inductor.config.cpp_cache_precompile_headers=False`:
+  837 passed, 453 skipped, 18 failed. All 18 failures reproduced on isolated
+  HEAD: Bash 3.2/launcher test fragments and absent grouped-GEMM extension.
+  Normal compiled Muon testing hits a stale precompiled-header cache; disabling
+  header reuse (test process only) yields all 12 checkpoint tests passing.
+  `git diff --check` and benchmark CLI help pass.
+- Task files: config/model/train/checkpoint plumbing, grad_em/_local_bp and
+  their CUDA modules, normalization/CUDA/grouped-local/kernel/package tests,
+  `tools/benchmark_grad_em.py`, `docs/grad_em.md`, this handoff. Nothing staged.
+- Next: review, then rerun CUDA acceptance commands in `docs/grad_em.md` on
+  Vista. After parity, use the documented `--normalization-benchmark` for both
+  global and local_bp (same real backward wrappers, K=2/4/8, none vs std).
+  No training run/checkpoint was created for this patch.
+
 ## Mixed local-BP optimization (2026-09-29, validated, uncommitted)
 
 Base `1928123`, branch `cleanup-active-codebase`. Complete report, numerical

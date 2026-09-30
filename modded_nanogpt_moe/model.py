@@ -279,10 +279,17 @@ class MoE(nn.Module):
                  moe_backend: str = "loop", hidden_dim: int | None = None,
                  moe_parameter_layout: str = "modulelist", moe_backward: str = "standard",
                  grad_em_mode: str = "global", grad_em_eta: float = 0.1, grad_em_lambda: float = 1.0,
-                 grad_em_alpha: float | None = None):
+                 grad_em_alpha: float | None = None,
+                 grad_em_score_normalization: str = "none",
+                 grad_em_score_norm_eps: float = 1e-6):
         super().__init__()
-        from .config import validate_grad_em_eta, validate_grad_em_lambda, resolve_grad_em_alpha
+        from .config import (resolve_grad_em_alpha, validate_grad_em_eta,
+                             validate_grad_em_lambda,
+                             validate_grad_em_score_normalization,
+                             validate_grad_em_score_norm_eps)
         validate_grad_em_eta(grad_em_eta)
+        validate_grad_em_score_normalization(grad_em_score_normalization)
+        validate_grad_em_score_norm_eps(grad_em_score_norm_eps)
         validate_grad_em_lambda(grad_em_lambda, grad_em_mode)
         resolve_grad_em_alpha(grad_em_alpha, grad_em_mode)
         if moe_backward not in ("standard", "grad_em"):
@@ -294,6 +301,8 @@ class MoE(nn.Module):
         self.moe_backward = moe_backward
         self.grad_em_mode = grad_em_mode
         self.grad_em_eta = grad_em_eta
+        self.grad_em_score_normalization = grad_em_score_normalization
+        self.grad_em_score_norm_eps = grad_em_score_norm_eps
         self.grad_em_lambda = grad_em_lambda
         self.grad_em_alpha = grad_em_alpha
         assert 1 <= top_k <= num_experts
@@ -548,14 +557,17 @@ class MoE(nn.Module):
                     self.grad_em_eta, self.gmm_implementation,
                     (self._routing_diagnostics.sensitivity_observer()
                      if self._routing_diagnostics is not None else None),
-                    self.grad_em_lambda, self.grad_em_alpha * self.grad_em_lambda)
+                    self.grad_em_lambda, self.grad_em_alpha * self.grad_em_lambda,
+                    self.grad_em_score_normalization, self.grad_em_score_norm_eps)
             else:
                 from .grad_em import GradEMCombine
                 out = GradEMCombine.apply(out_sorted, router_logits, topk_weights,
                                           topk_experts, order, self.grad_em_eta,
                                           (self._routing_diagnostics.sensitivity_observer()
                                            if self._routing_diagnostics is not None else None),
-                                          self.grad_em_lambda)
+                                          self.grad_em_lambda,
+                                          self.grad_em_score_normalization,
+                                          self.grad_em_score_norm_eps)
             out = out.view(B, T, D)
         if self._grad_em_diagnostics is not None:
             self._grad_em_diagnostics(
@@ -571,7 +583,9 @@ class Block(nn.Module):
                  hidden_dim: int | None = None, moe_parameter_layout: str = "modulelist",
                  moe_backward: str = "standard", grad_em_mode: str = "global",
                  grad_em_eta: float = 0.1, grad_em_lambda: float = 1.0,
-                 grad_em_alpha: float | None = None):
+                 grad_em_alpha: float | None = None,
+                 grad_em_score_normalization: str = "none",
+                 grad_em_score_norm_eps: float = 1e-6):
         super().__init__()
         self.attn = CausalSelfAttention(dim)
         if mlp_type == "dense":
@@ -581,7 +595,10 @@ class Block(nn.Module):
                             moe_backend=moe_backend, hidden_dim=hidden_dim,
                             moe_parameter_layout=moe_parameter_layout,
                             moe_backward=moe_backward, grad_em_mode=grad_em_mode,
-                            grad_em_eta=grad_em_eta, grad_em_lambda=grad_em_lambda, grad_em_alpha=grad_em_alpha)
+                            grad_em_eta=grad_em_eta, grad_em_lambda=grad_em_lambda,
+                            grad_em_alpha=grad_em_alpha,
+                            grad_em_score_normalization=grad_em_score_normalization,
+                            grad_em_score_norm_eps=grad_em_score_norm_eps)
         else:
             raise ValueError(f"unknown mlp_type: {mlp_type!r}")
         self.norm1 = RMSNorm(dim)
@@ -598,10 +615,17 @@ class GPT(nn.Module):
                  moe_backend: str = "loop", mlp_ratio: float = 4,
                  moe_parameter_layout: str = "modulelist", moe_backward: str = "standard",
                  grad_em_mode: str = "global", grad_em_eta: float = 0.1, grad_em_lambda: float = 1.0,
-                 grad_em_alpha: float | None = None):
+                 grad_em_alpha: float | None = None,
+                 grad_em_score_normalization: str = "none",
+                 grad_em_score_norm_eps: float = 1e-6):
         super().__init__()
-        from .config import validate_grad_em_eta, validate_grad_em_lambda, resolve_grad_em_alpha
+        from .config import (resolve_grad_em_alpha, validate_grad_em_eta,
+                             validate_grad_em_lambda,
+                             validate_grad_em_score_normalization,
+                             validate_grad_em_score_norm_eps)
         validate_grad_em_eta(grad_em_eta)
+        validate_grad_em_score_normalization(grad_em_score_normalization)
+        validate_grad_em_score_norm_eps(grad_em_score_norm_eps)
         validate_grad_em_lambda(grad_em_lambda, grad_em_mode)
         resolve_grad_em_alpha(grad_em_alpha, grad_em_mode)
         if moe_backward not in ("standard", "grad_em"):
@@ -625,7 +649,10 @@ class GPT(nn.Module):
                   normalize_topk=normalize_topk, moe_backend=moe_backend,
                   hidden_dim=hidden_dim, moe_parameter_layout=moe_parameter_layout,
                   moe_backward=moe_backward, grad_em_mode=grad_em_mode,
-                  grad_em_eta=grad_em_eta, grad_em_lambda=grad_em_lambda, grad_em_alpha=grad_em_alpha)
+                  grad_em_eta=grad_em_eta, grad_em_lambda=grad_em_lambda,
+                  grad_em_alpha=grad_em_alpha,
+                  grad_em_score_normalization=grad_em_score_normalization,
+                  grad_em_score_norm_eps=grad_em_score_norm_eps)
             for _ in range(num_layers)
         ])
         self.proj = Linear(model_dim, vocab_size)

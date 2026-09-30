@@ -31,9 +31,10 @@ DEVICES = [pytest.param("cuda", marks=pytest.mark.skipif(
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("e,k", [(1, 1), (8, 2), (7, 3), (64, 8)])
 @pytest.mark.parametrize("mix_lambda", [0.5, 1.0])
-def test_mixed_combine_signals(device, dtype, e, k, mix_lambda):
-    triton = pytest.importorskip("triton")
-    from modded_nanogpt_moe._local_bp_cuda import _mixed_combine_backward
+@pytest.mark.parametrize("normalization,eps", [("none", 1e-6), ("std", 1e-6), ("std", 3.)])
+def test_mixed_combine_signals(device, dtype, e, k, mix_lambda, normalization, eps):
+    pytest.importorskip("triton")
+    from modded_nanogpt_moe._local_bp_cuda import combine_backward
 
     torch.manual_seed(121)
     n, d = 7, 19
@@ -46,20 +47,15 @@ def test_mixed_combine_signals(device, dtype, e, k, mix_lambda):
     rows[order] = torch.arange(n * k, device=device)
     out = torch.randn(n * k, d, device=device, dtype=dtype)
     grad = torch.randn(n, d * 2, device=device, dtype=dtype)[:, ::2]
-    expected = _cpu_signals(out, logits, weights, ids, order, grad, 0.4, mix_lambda)
-    bp, ge = torch.empty_like(out), torch.empty_like(out)
-    q = torch.empty(n, k, device=device)
-    gw, v = torch.empty_like(weights), torch.empty_like(q)
-    _mixed_combine_backward[(n,)](
-        out, logits, weights, ids, rows, grad, bp, ge, q, gw, v,
-        d, k, *out.stride(), *logits.stride(), *weights.stride(),
-        *ids.stride(), *grad.stride(), 0.4, True, True, True,
-        triton.next_power_of_2(k), triton.next_power_of_2(d),
-        mix_lambda,
-        num_warps=4, enable_fp_fusion=False)
+    expected = _cpu_signals(out, logits, weights, ids, order, grad, 0.4,
+                            mix_lambda, normalization, eps)
+    bp, ge, gz, q, gw, v = combine_backward(
+        out, logits, weights, ids, rows, grad, 0.4, True, True, True, True,
+        mix_lambda, normalization, eps)
     tolerance = dict(atol=2e-5, rtol=8e-3) if dtype == torch.bfloat16 else dict(atol=2e-6, rtol=2e-5)
     torch.testing.assert_close(bp, expected[0], atol=0, rtol=0)
     torch.testing.assert_close(ge, expected[1], **tolerance)
+    torch.testing.assert_close(gz, expected[2], **tolerance)
     torch.testing.assert_close(q, expected[3], atol=2e-6, rtol=2e-5)
     torch.testing.assert_close(gw, expected[4], **tolerance)
     torch.testing.assert_close(v, expected[5], atol=2e-6, rtol=2e-5)

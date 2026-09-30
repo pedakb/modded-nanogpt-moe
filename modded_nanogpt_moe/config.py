@@ -43,6 +43,8 @@ DEFAULT_CONFIG = {
         "moe_backward": "standard",
         "grad_em_mode": "global",
         "grad_em_eta": 0.1,
+        "grad_em_score_normalization": "none",
+        "grad_em_score_norm_eps": 1e-6,
         "grad_em_lambda": 1.0,
         "grad_em_alpha": None,  # Omitted: global=1, local_bp=0.
     },
@@ -104,6 +106,18 @@ def validate_grad_em_eta(eta):
     if (isinstance(eta, bool) or not isinstance(eta, (int, float))
             or not math.isfinite(eta) or eta <= 0):
         raise ValueError("model.grad_em_eta must be finite and positive")
+
+
+def validate_grad_em_score_normalization(value):
+    if value not in ("none", "std"):
+        raise ValueError(
+            "model.grad_em_score_normalization must be 'none' or 'std'")
+
+
+def validate_grad_em_score_norm_eps(value):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value <= 0):
+        raise ValueError("model.grad_em_score_norm_eps must be finite and positive")
 
 
 def validate_grad_em_lambda(value, mode):
@@ -182,6 +196,9 @@ def validate_experiment_config(config, require_run_name=False):
     if config["model"]["grad_em_mode"] not in ("global", "local_bp"):
         raise ValueError("model.grad_em_mode must be 'global' or 'local_bp'")
     validate_grad_em_eta(config["model"]["grad_em_eta"])
+    validate_grad_em_score_normalization(
+        config["model"]["grad_em_score_normalization"])
+    validate_grad_em_score_norm_eps(config["model"]["grad_em_score_norm_eps"])
     validate_grad_em_lambda(config["model"]["grad_em_lambda"], config["model"]["grad_em_mode"])
     resolve_grad_em_alpha(config["model"]["grad_em_alpha"], config["model"]["grad_em_mode"])
     if (config["model"]["moe_backward"] == "grad_em"

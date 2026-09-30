@@ -8,7 +8,8 @@ outputs `h [T,K,D]`, and incoming output gradient `g [T,D]`. In FP32:
 ```text
 v[t,i] = sum_d g[t,d] * h[t,i,d]
 a = softmax(z_selected)                      # selected K only
-q = softmax(z_selected - eta * v)              # selected K only; detached
+score = v                                    # raw mode
+q = softmax(z_selected - eta * score)        # selected K only; detached
 grad_expert[t,i,d] = q[t,i] * g[t,d]
 grad_z_selected = (a - q) / eta
 grad_z_unselected = 0
@@ -28,7 +29,7 @@ numerical forward gradcheck is not its correctness oracle.
 Eta must be finite, numeric (not bool), and strictly positive. At `g=0`, v=0
 and q=a: both expert and router gradients are exactly zero. K=1 also gives
 zero router gradient; K=E uses the same selected-support formula.
-As eta approaches zero, `(a-q)/eta` approaches
+In raw mode, as eta approaches zero, `(a-q)/eta` approaches
 `a * (v - (a*v).sum(-1, keepdim=True))`, the ordinary **normalized Top-K**
 router gradient with fixed support, and q*g approaches a*g. Eta=0 itself is
 rejected. The regression checks this against ordinary forward autograd in
@@ -39,13 +40,63 @@ is introduced. The recovery statement assumes normalized Top-K forward.
 Using selected logits avoids underflow from taking `log(topk_weights)`;
 in exact arithmetic `log(p_selected)` differs only by a common shift.
 
+## Normalized Grad-EM
+
+`grad_em_score_normalization = "std"` replaces each token's raw Grad-EM
+sensitivity score with its router-weighted z-score on the selected support:
+
+```text
+mu = sum_i a_i * v_i
+variance = sum_i a_i * (v_i - mu)^2
+score_i = (v_i - mu) / max(sqrt(variance), eps)
+q_i proportional to a_i * exp(-eta * score_i)
+```
+
+All statistics use the same normalized selected-support base distribution `a`
+used to construct the Grad-EM responsibilities, even when the unchanged
+forward uses `normalize_topk = false`. Computation is FP32 and population
+variance is used. `grad_em_score_norm_eps` defaults to `1e-6` and must be finite,
+numeric (not bool), and strictly positive. It is a numerical denominator floor,
+not a second optimization-strength parameter. Tiny nonzero score spreads are
+divided by this floor, not hard-zeroed or amplified to unit variance.
+
+To center exactly constant scores to zero despite FP32 probability-sum roundoff,
+both implementations first subtract the first selected score, then compute the
+weighted mean of these shifted scores. This is algebraically the same centering
+for normalized probabilities, uses two weighted reductions (mean and variance),
+and guarantees `q = a` for constant scores and K=1. The raw sensitivity diagnostic
+`sens_std_med` remains unchanged.
+
+This optional method is called **Normalized Grad-EM**. Its motivation is scale
+invariance: replacing `v` by `c*v+b` for `c>0` leaves normalized
+responsibilities unchanged when both standard deviations are above the epsilon
+floor (up to FP32 rounding). The floor intentionally breaks exact scale
+invariance in the numerically degenerate regime. It does not impose an exact
+constant-KL target.
+For small tilt strength, standardization approximately normalizes the
+KL/Fisher step size; exact KL control would require separately solving for the
+dual temperature.
+
 ## Configuration and compatibility
 
 `[model].moe_backward` defaults to `"standard"`; `"grad_em"` is opt-in and
 requires MoE. `grad_em_mode` defaults to `"global"`; `"local_bp"` defaults to the
 BP-anchored variant below. `grad_em_eta` defaults to `0.1`, must be finite and
-positive, and is fixed (no schedule). Existing TOMLs therefore retain global
-behavior. Global mode supports the grouped-GEMM combine boundary on CPU (tests
+positive, and is fixed (no schedule). In normalized mode it is the dimensionless
+tilt coefficient; in raw mode it retains its existing units and meaning.
+`grad_em_score_normalization` accepts `"none"` (default) or `"std"`.
+`grad_em_score_norm_eps` only affects `"std"`; raw computations are unchanged.
+For example, in an existing MoE config's `[model]` section:
+
+```toml
+moe_backward = "grad_em"
+grad_em_eta = 0.1                 # dimensionless tilt in std mode
+grad_em_score_normalization = "std"
+grad_em_score_norm_eps = 1e-6      # numerical floor only
+```
+
+Existing TOMLs therefore retain raw global behavior. Global mode supports the
+grouped-GEMM combine boundary on CPU (tests
 supply a differentiable CPU GEMM double) and CUDA. Local-BP supports the
 device-agnostic eager loop with ModuleList experts, including CPU and MPS,
 and grouped-GEMM with packed or ModuleList parameters. The grouped path uses
@@ -59,11 +110,13 @@ as an internal `None`/automatic setting by the config loader and resolves to
 numeric alpha. An explicit alpha overrides this mode-derived default; lambda
 can now be damped in either mode. `moe_backward="standard"` always remains BP.
 
-Resolved experiment/checkpoint configs record all five fields. Compatibility
-checks interpret missing legacy fields as `"standard"` / `"global"` / `0.1` /
-`1.0`, plus mode-derived alpha, without mutating the checkpoint. Legacy local-BP
+Resolved experiment/checkpoint configs record the backward mode, Grad-EM mode,
+eta, score normalization/epsilon, lambda, and alpha. Compatibility checks
+interpret missing legacy score normalization as `"none"` and epsilon as `1e-6`,
+alongside the existing backward defaults, without mutating the checkpoint. Legacy local-BP
 therefore remains `(lambda,alpha)=(1,0)`; existing global lambda runs retain
-alpha one. Explicit mode/eta/lambda/effective-alpha mismatches are rejected.
+alpha one. Explicit mode/eta/normalization/epsilon/lambda/effective-alpha mismatches
+are rejected.
 No model state keys or checkpoint format version change.
 
 Do not treat old Grad-EM checkpoints/results as continuations of this corrected
@@ -195,6 +248,38 @@ backward only), besides required outputs/gradients. At T=65536,K=8 these are
 4 MiB and 2 MiB, respectively. Full E8/K2 layer memory measurements are in
 [`grouped_local_bp.md`](grouped_local_bp.md).
 
+Normalized mode fuses its two weighted reductions and denominator floor into
+the existing expert/mixed-combine backward kernel. It computes the base softmax
+there and reuses it in the router kernel via an additional compact FP32 `[T,K]`
+buffer (2 MiB at T=65536,K=8), allocated only when router gradients are needed.
+Thus a full backward still has two softmaxes total (base and tilted), two kernel
+launches, and no additional activation-sized temporary, synchronization or
+host/device transfer. When router gradients are not needed, normalization
+necessarily adds the base softmax, but does not allocate its reuse buffer.
+The raw specialization compiles out all normalization/reuse work and keeps its
+original allocations. CPU/eager reference uses vectorized `[T,K]` temporaries;
+production grouped CUDA never falls back to that implementation for normalization.
+
+Focused none/std microbenchmarks reuse the existing synchronized benchmark tool.
+They compare identical inputs at K=2,4,8 and report mean/median backward latency
+and peak allocated memory. Run both on the same idle Vista GH200 allocation:
+
+```bash
+module load nvidia/25.3 cuda/12.9
+export CC=/usr/bin/gcc CXX=/usr/bin/g++
+uv run --no-sync python -m tools.benchmark_grad_em --mode global \
+  --normalization-benchmark --tokens 65536 --warmup 10 --iterations 30
+uv run --no-sync python -m tools.benchmark_grad_em --mode local_bp \
+  --normalization-benchmark --tokens 65536 --warmup 10 --iterations 30
+```
+
+Run from the repository root. This mode needs CUDA/Triton but no grouped-GEMM
+extension or data. It times the real combine-backward wrappers, including
+allocation/launch overhead and device-wide completion fences; it does not time
+GEMMs, full training, or profiler collection. Raw always runs before std, so
+clock/thermal drift and short-kernel fence overhead can bias timings. No speed
+or overhead claim is established on macOS; rerun CUDA parity tests before timing.
+
 Candidate supports FP32/BF16/FP16, strided inputs, expanded incoming gradients,
 and empty token batches. Current explicit tile bounds: K<=32, D<=4096, E<=1024,
 rounded K*D<=32768. Higher-order backward remains unsupported. No performance
@@ -212,7 +297,8 @@ cd "$WORK/projects/modded-nanogpt-moe"
 module load nvidia/25.3 cuda/12.9
 export CC=/usr/bin/gcc CXX=/usr/bin/g++
 MOE_GMM_IMPLEMENTATION=torch uv run --no-sync python -m pytest -q -rs \
-  tests/test_grad_em_cuda.py
+  tests/test_grad_em_cuda.py tests/test_local_bp_kernels.py \
+  tests/test_grad_em_normalization.py tests/test_grad_em_grouped_local_bp.py
 uv run --no-sync python -m pytest -q -rs \
   tests/test_grad_em.py tests/test_grad_em_integration.py \
   tests/test_combine.py tests/test_packed_experts.py tests/test_package.py

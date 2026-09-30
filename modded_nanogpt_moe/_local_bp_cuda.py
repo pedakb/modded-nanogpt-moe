@@ -3,7 +3,8 @@ import torch
 import triton
 import triton.language as tl
 
-from ._grad_em_cuda import _grad_em_router_backward
+from ._grad_em_cuda import _grad_em_responsibilities, _grad_em_router_backward
+from .config import validate_grad_em_score_normalization, validate_grad_em_score_norm_eps
 
 
 @triton.jit
@@ -16,9 +17,12 @@ def _mixed_combine_backward(X, Z, Weights, Indices, Rows, Grad,
                             IR: tl.constexpr, IC: tl.constexpr,
                             GR: tl.constexpr, GC: tl.constexpr,
                             ETA: tl.constexpr, NEED_GE: tl.constexpr,
+                            SCORE_NORMALIZATION: tl.constexpr,
                             NEED_WEIGHTS: tl.constexpr, SAVE_V: tl.constexpr,
                             SLOTS: tl.constexpr, COLS: tl.constexpr,
-                            MIX_LAMBDA: tl.constexpr = 1.0):
+                            MIX_LAMBDA: tl.constexpr = 1.0,
+                            Base=None, SAVE_BASE: tl.constexpr = False,
+                            SCORE_NORM_EPS: tl.constexpr = 1e-6):
     token = tl.program_id(0)
     slots, columns = tl.arange(0, SLOTS), tl.arange(0, COLS)
     rows = tl.load(Rows + token * K + slots, slots < K, other=0)
@@ -31,9 +35,10 @@ def _mixed_combine_backward(X, Z, Weights, Indices, Rows, Grad,
     products = values * grad[None, :]
     v = tl.sum(products, axis=1)
     selected = tl.load(Z + token * ZR + ids * ZC, slots < K, other=0).to(tl.float32)
-    scores = tl.where(slots < K, selected - ETA * v, -float("inf"))
-    exps = tl.exp(scores - tl.max(scores, axis=0))
-    q = exps / tl.sum(exps, axis=0)
+    q, base = _grad_em_responsibilities(
+        selected, v, slots < K, ETA, SCORE_NORMALIZATION, SCORE_NORM_EPS)
+    if SAVE_BASE:
+        tl.store(Base + token * K + slots, base, slots < K)
     tl.store(Q + token * K + slots, q, slots < K)
     if SAVE_V:
         tl.store(V + token * K + slots, v, slots < K)
@@ -86,7 +91,10 @@ def _mixed_activation_backward(Hidden, Pre, Weights, Q, Order, BP, GE,
 
 
 def combine_backward(out, logits, weights, indices, rows, grad, eta,
-                     need_ge, need_logits, need_weights, save_v, mix_lambda=1.0):
+                     need_ge, need_logits, need_weights, save_v, mix_lambda=1.0,
+                     score_normalization="none", score_norm_eps=1e-6):
+    validate_grad_em_score_normalization(score_normalization)
+    validate_grad_em_score_norm_eps(score_norm_eps)
     n, k = weights.shape
     d, e = out.shape[1], logits.shape[1]
     bp = torch.empty_like(out)
@@ -94,20 +102,25 @@ def combine_backward(out, logits, weights, indices, rows, grad, eta,
     gz = torch.empty_like(logits) if need_logits else None
     gw = torch.empty_like(weights) if need_weights else None
     q = torch.empty((n, k), device=out.device, dtype=torch.float32)
+    reuse_base = score_normalization == "std" and need_logits
+    base = torch.empty_like(q) if reuse_base else None
     v = torch.empty_like(q) if save_v else None
     if n:
         with torch.cuda.device(out.device):
             _mixed_combine_backward[(n,)](
                 out, logits, weights, indices, rows, grad, bp, ge, q, gw, v,
                 d, k, *out.stride(), *logits.stride(), *weights.stride(),
-                *indices.stride(), *grad.stride(), eta, need_ge, need_weights, save_v,
+                *indices.stride(), *grad.stride(), eta, need_ge,
+                score_normalization == "std", need_weights, save_v,
                 triton.next_power_of_2(k), triton.next_power_of_2(d),
                 mix_lambda,
+                Base=base, SAVE_BASE=reuse_base, SCORE_NORM_EPS=score_norm_eps,
                 num_warps=4, enable_fp_fusion=False)
             if need_logits:
                 _grad_em_router_backward[(n,)](
                     logits, indices, q, gz, eta, e, k, *logits.stride(), *indices.stride(),
                     triton.next_power_of_2(e), triton.next_power_of_2(k),
+                    Base=base, REUSE_BASE=reuse_base,
                     num_warps=4, enable_fp_fusion=False)
     return bp, ge, gz, q, gw, v
 

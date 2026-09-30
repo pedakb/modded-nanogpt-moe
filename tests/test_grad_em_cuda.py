@@ -33,7 +33,9 @@ def tolerance(dtype):
 @pytest.mark.parametrize("e,k", [(1, 1), (8, 1), (8, 2), (64, 8), (7, 3), (8, 8)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("case", ["random", "imbalanced", "g_zero"])
-def test_cuda_oracle_and_direct_autograd(candidate, e, k, dtype, case):
+@pytest.mark.parametrize("score_normalization", ["none", "std"])
+def test_cuda_oracle_and_direct_autograd(
+        candidate, e, k, dtype, case, score_normalization):
     torch.manual_seed(41)
     n, d = 19, 768
     z = torch.randn(n, e, device="cuda", dtype=dtype)
@@ -51,9 +53,12 @@ def test_cuda_oracle_and_direct_autograd(candidate, e, k, dtype, case):
     eta = 0.1
     selected = torch.empty_like(x)
     selected[order] = x.detach()
-    ref = em.grad_em_reference(z, ids, selected.view(n, k, d), g, eta)
+    ref = em.grad_em_reference(
+        z, ids, selected.view(n, k, d), g, eta, score_normalization)
     output, rows = candidate.cuda_forward(x, z, w, ids, order)
-    gx, gz, q, v = candidate.cuda_backward(x, z, ids, rows, g, eta, save_v=True)
+    gx, gz, q, v = candidate.cuda_backward(
+        x, z, ids, rows, g, eta, save_v=True,
+        score_normalization=score_normalization)
     torch.testing.assert_close(v, ref.v, rtol=2e-6, atol=2e-6)
     torch.testing.assert_close(q, ref.q, rtol=2e-5, atol=2e-6)
     assert q.dtype == v.dtype == torch.float32 and q.grad_fn is None
@@ -72,7 +77,8 @@ def test_cuda_oracle_and_direct_autograd(candidate, e, k, dtype, case):
         assert not torch.allclose(gz.float(), old_full_kl, **tolerance(dtype))
     standard = model_module.combine_expert_outputs(x, w, order)
     torch.testing.assert_close(output, standard, rtol=0, atol=0)
-    actual = em.GradEMCombine.apply(x, z, w, ids, order, eta)
+    actual = em.GradEMCombine.apply(
+        x, z, w, ids, order, eta, None, 1.0, score_normalization)
     torch.testing.assert_close(actual, standard, rtol=0, atol=0)
     actual.backward(g)
     torch.testing.assert_close(x.grad, gx, rtol=0, atol=0)
@@ -158,7 +164,8 @@ def test_cuda_full_expert_and_router_graph(candidate, monkeypatch, layout, e, k)
         torch.testing.assert_close(p.grad, r.grad, rtol=2e-2, atol=2e-2)
 
 
-def test_candidate_launches_and_compact_scratch(monkeypatch):
+@pytest.mark.parametrize("normalization", ["none", "std"])
+def test_candidate_launches_and_compact_scratch(monkeypatch, normalization):
     """CPU plumbing only: does not compile or establish kernel correctness."""
     launches, allocations = [], []
     class Kernel:
@@ -196,16 +203,19 @@ def test_candidate_launches_and_compact_scratch(monkeypatch):
     _, rows = module.cuda_forward(x, z, w, ids, order)
     with pytest.raises(ValueError, match="finite and positive"):
         module.cuda_backward(x, z, ids, rows, fake((n, d)), 0.0)
-    gx, gz, q, v = module.cuda_backward(x, z, ids, rows, fake((n, d)), 0.1)
+    gx, gz, q, v = module.cuda_backward(
+        x, z, ids, rows, fake((n, d)), 0.1, score_normalization=normalization)
     assert allocations == [((n*k,), torch.int64), ((n, d), torch.bfloat16),
-                           ((n*k, d), torch.bfloat16), ((n, e), torch.float32), ((n, k), torch.float32)]
+                           ((n*k, d), torch.bfloat16), ((n, e), torch.float32), ((n, k), torch.float32)
+                           ] + ([((n, k), torch.float32)] if normalization == "std" else [])
     assert v is None and q.shape == (n, k)
     assert launches == [("_combine_assignment_rows", (1,)), ("_combine_forward", (n, 6)),
                         ("_grad_em_expert_backward", (n,)), ("_grad_em_router_backward", (n,))]
 
 
 @CUDA
-def test_cuda_kernel_launch_count(candidate):
+@pytest.mark.parametrize("normalization", ["none", "std"])
+def test_cuda_kernel_launch_count(candidate, normalization):
     n, k, d, e = 65, 8, 768, 64
     z = torch.randn(n, e, device="cuda", requires_grad=True)
     w, ids = z.detach().softmax(-1).topk(k, -1)
@@ -213,12 +223,12 @@ def test_cuda_kernel_launch_count(candidate):
     order = ids.flatten().argsort(stable=True)
     x = torch.randn(n*k, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     g = torch.randn(n, d, device="cuda", dtype=x.dtype)
-    em.GradEMCombine.apply(x, z, w, ids, order, 0.1).backward(g)
+    em.GradEMCombine.apply(x, z, w, ids, order, 0.1, None, 1., normalization).backward(g)
     x.grad = z.grad = None
     torch.cuda.synchronize()
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                             torch.profiler.ProfilerActivity.CUDA]) as profile:
-        em.GradEMCombine.apply(x, z, w, ids, order, 0.1).backward(g)
+        em.GradEMCombine.apply(x, z, w, ids, order, 0.1, None, 1., normalization).backward(g)
         torch.cuda.synchronize()
     kernels = [event.name for event in profile.events()
                if event.device_type == torch.autograd.DeviceType.CUDA]
@@ -226,3 +236,34 @@ def test_cuda_kernel_launch_count(candidate):
                  "_grad_em_expert_backward", "_grad_em_router_backward"):
         assert sum(name in event for event in kernels) == 1, kernels
     assert len(kernels) == 4, kernels
+
+
+@CUDA
+@pytest.mark.parametrize("k", [1, 2, 4, 8])
+@pytest.mark.parametrize("spread", [0., 1e-10, 0.7])
+@pytest.mark.parametrize("eps", [1e-6, 0.1])
+def test_cuda_normalization_matches_cpu_with_epsilon_floor(candidate, k, spread, eps):
+    # Controlled FP32 dot products; compare the real GPU path with the CPU
+    # oracle, including a true nonzero spread far below epsilon.
+    torch.manual_seed(611)
+    n, d, e = 11, 8, 16
+    logits = torch.randn(n, e) * 2
+    weights, ids = logits.softmax(-1).topk(k)
+    order = ids.flatten().argsort(stable=True)
+    selected = torch.zeros(n, k, d)
+    selected[:, :, 0] = torch.randn(n, k) * spread if spread else 1234.25
+    g = torch.zeros(n, d)
+    g[:, 0] = 1
+    ref = em.grad_em_reference(logits, ids, selected, g, 0.3, "std", eps)
+    x = selected.flatten(0, 1)[order].cuda()
+    z, w, idx, permutation = (t.cuda() for t in (logits, weights, ids, order))
+    _, rows = candidate.cuda_forward(x, z, w, idx, permutation)
+    gx, gz, q, _ = candidate.cuda_backward(x, z, idx, rows, g.cuda(), 0.3,
+                                          score_normalization="std", score_norm_eps=eps)
+    torch.testing.assert_close(q.cpu(), ref.q, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(gx.cpu(), ref.grad_expert.flatten(0, 1)[order], **tolerance(torch.float32))
+    torch.testing.assert_close(gz.cpu(), ref.grad_logits, **tolerance(torch.float32))
+    if spread == 0 or k == 1:
+        assert torch.count_nonzero(gz) == 0
+    if spread == 1e-10 and k > 1 and eps == 1e-6:
+        assert torch.count_nonzero(gz) > 0  # No hard zero-variance cutoff.

@@ -48,10 +48,13 @@ def cpu_backend(request, monkeypatch):
     return calls
 
 
-def make_models(e=8, k=2, d=16, h=32, normalize=True, device="cpu", layout="packed"):
+def make_models(e=8, k=2, d=16, h=32, normalize=True, device="cpu", layout="packed",
+                score_normalization="none", score_norm_eps=1e-6):
     torch.manual_seed(741)
     loop = MoE(d, e, k, hidden_dim=h, normalize_topk=normalize,
-               moe_backward="grad_em", grad_em_mode="local_bp", grad_em_eta=0.4).to(device)
+               moe_backward="grad_em", grad_em_mode="local_bp", grad_em_eta=0.4,
+               grad_em_score_normalization=score_normalization,
+               grad_em_score_norm_eps=score_norm_eps).to(device)
     with torch.no_grad():
         # Imbalanced routing, guaranteed empty final expert whenever k < e.
         loop.router.bias.copy_(torch.linspace(0.7, -0.7, e, device=device))
@@ -59,7 +62,9 @@ def make_models(e=8, k=2, d=16, h=32, normalize=True, device="cpu", layout="pack
             loop.router.bias[-1] = -100
     grouped = MoE(d, e, k, hidden_dim=h, normalize_topk=normalize,
                   moe_backend="grouped_gemm", moe_parameter_layout=layout,
-                  moe_backward="grad_em", grad_em_mode="local_bp", grad_em_eta=0.4).to(device)
+                  moe_backward="grad_em", grad_em_mode="local_bp", grad_em_eta=0.4,
+                  grad_em_score_normalization=score_normalization,
+                  grad_em_score_norm_eps=score_norm_eps).to(device)
     if layout == "modulelist":
         grouped.load_state_dict(loop.state_dict())
     else:
@@ -172,6 +177,15 @@ def check_equivalence(models, dtype, *, variant="normal", report=False):
 @pytest.mark.parametrize("normalize", [True, False])
 def test_loop_grouped_equivalence(cpu_backend, dtype, e, k, normalize):
     check_equivalence(make_models(e, k, normalize=normalize), dtype)
+
+
+@pytest.mark.parametrize("k", [1, 2, 4, 8])
+@pytest.mark.parametrize("eps", [1e-6, 0.5])
+@pytest.mark.parametrize("normalize", [True, False])
+def test_normalized_loop_grouped_equivalence(cpu_backend, k, eps, normalize):
+    check_equivalence(make_models(16, k, normalize=normalize,
+                                 score_normalization="std", score_norm_eps=eps),
+                      torch.float32)
 
 
 @pytest.mark.parametrize("variant", ["zero", "frozen_router", "frozen_experts", "frozen_all", "no_input_grad"])
@@ -384,6 +398,18 @@ def require_cuda_backend(monkeypatch, implementation, dtype):
 def test_cuda_loop_grouped_equivalence(monkeypatch, implementation, dtype, e, k, h, normalize):
     require_cuda_backend(monkeypatch, implementation, dtype)
     check_equivalence(make_models(e, k, d=768, h=h, device="cuda", normalize=normalize), dtype, report=True)
+
+
+@CUDA
+@pytest.mark.parametrize("implementation", ["extension", "torch"])
+@pytest.mark.parametrize("normalize", [True, False])
+@pytest.mark.parametrize("eps", [1e-6, 0.5])
+def test_cuda_normalized_local_bp_loop_grouped_equivalence(monkeypatch, implementation, normalize, eps):
+    require_cuda_backend(monkeypatch, implementation, torch.bfloat16)
+    check_equivalence(
+        make_models(device="cuda", score_normalization="std",
+                    normalize=normalize, score_norm_eps=eps),
+        torch.bfloat16)
 
 
 @CUDA

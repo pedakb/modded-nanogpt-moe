@@ -457,7 +457,10 @@ def main(argv=None):
                 grad_em_mode=model_config["grad_em_mode"],
                 grad_em_eta=model_config["grad_em_eta"],
                 grad_em_lambda=model_config["grad_em_lambda"],
-                grad_em_alpha=model_config["grad_em_alpha"])
+                grad_em_alpha=model_config["grad_em_alpha"],
+                grad_em_score_normalization=model_config[
+                    "grad_em_score_normalization"],
+                grad_em_score_norm_eps=model_config["grad_em_score_norm_eps"])
     assert model.hidden_dim == hidden_dim
     gmm_implementation = (model.blocks[0].mlp.gmm_implementation if mlp_type == "moe" else "n/a")
     print0(
@@ -580,6 +583,9 @@ def main(argv=None):
                 "moe_backward": model_config["moe_backward"],
                 "grad_em_mode": model_config["grad_em_mode"],
                 "grad_em_eta": model_config["grad_em_eta"],
+                "grad_em_score_normalization": model_config[
+                    "grad_em_score_normalization"],
+                "grad_em_score_norm_eps": model_config["grad_em_score_norm_eps"],
                 "grad_em_lambda": model_config["grad_em_lambda"],
                 "grad_em_alpha": model_config["grad_em_alpha"],
             },

@@ -35,6 +35,64 @@ def statistics_ms(samples):
             "min_ms": min(samples), "max_ms": max(samples), "samples_ms": samples}
 
 
+def benchmark_normalization(args):
+    """Compare real combine-backward paths, with identical data per mode.
+
+    No GEMMs, forward, autograd accumulation, profiling or durable artifacts.
+    Timing includes the production backward wrapper's allocation/launch costs.
+    """
+    from modded_nanogpt_moe._grad_em_cuda import cuda_backward
+    from modded_nanogpt_moe._local_bp_cuda import combine_backward
+
+    torch.manual_seed(1234)
+    dtype = getattr(torch, args.dtype)
+    n, d, e = args.tokens, 768, 64
+    cases = []
+    for k in (2, 4, 8):
+        logits = torch.randn(n, e, device="cuda")
+        weights, indices = logits.softmax(-1).topk(k, -1)
+        weights = (weights / weights.sum(-1, keepdim=True)).to(dtype)
+        order = indices.flatten().argsort(stable=True)
+        rows = torch.empty_like(order)
+        rows[order] = torch.arange(n * k, device="cuda")
+        out = torch.randn(n * k, d, device="cuda", dtype=dtype)
+        grad = torch.randn(n, d, device="cuda", dtype=dtype) / d**0.5
+        for normalization in ("none", "std"):
+            def call():
+                if args.mode == "global":
+                    return cuda_backward(out, logits, indices, rows, grad, args.eta,
+                                         score_normalization=normalization,
+                                         score_norm_eps=args.score_norm_eps)
+                return combine_backward(out, logits, weights, indices, rows, grad,
+                                        args.eta, True, True, True, False,
+                                        score_normalization=normalization,
+                                        score_norm_eps=args.score_norm_eps)
+
+            for _ in range(args.warmup):
+                result = call()
+                del result
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            samples = []
+            for _ in range(args.iterations):
+                result, ms = timed(call)
+                samples.append(ms)
+                del result
+            cases.append({"top_k": k, "score_normalization": normalization,
+                          "backward": statistics_ms(samples),
+                          "peak_allocated_bytes": torch.cuda.max_memory_allocated()})
+        del out, grad, logits, weights, indices, order, rows, call
+        gc.collect()
+        torch.cuda.empty_cache()
+    return {"benchmark": "normalization_combine_backward", "mode": args.mode,
+            "tokens": n, "dim": d, "experts": e, "dtype": args.dtype,
+            "eta": args.eta, "score_norm_eps": args.score_norm_eps,
+            "warmup": args.warmup, "iterations": args.iterations,
+            "torch": str(torch.__version__), "cuda": torch.version.cuda,
+            "gpu": torch.cuda.get_device_name(),
+            "triton": importlib.metadata.version("triton"), "cases": cases}
+
+
 def count_grouped_calls(model, x, grad):
     """One untimed pass through the real backend, after recording memory peaks."""
     counts = Counter()
@@ -78,6 +136,9 @@ def main():
     parser.add_argument("--geometry", choices=("e8", "e64"), default="e8")
     parser.add_argument("--tokens", type=int, default=65536)
     parser.add_argument("--eta", type=float, default=0.1)
+    parser.add_argument("--normalization-benchmark", action="store_true",
+                        help="compare none/std combine backward at K=2,4,8; no grouped GEMM")
+    parser.add_argument("--score-norm-eps", type=float, default=1e-6)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--output", type=Path)
@@ -86,6 +147,17 @@ def main():
         parser.error("timing requires CUDA; no CPU timings are substituted")
     if min(args.tokens, args.warmup, args.iterations) < 1:
         parser.error("tokens, warmup and iterations must be positive")
+    if args.normalization_benchmark:
+        if args.mode == "standard":
+            parser.error("normalization benchmark requires --mode global or local_bp")
+        from modded_nanogpt_moe.config import validate_grad_em_eta, validate_grad_em_score_norm_eps
+        validate_grad_em_eta(args.eta)
+        validate_grad_em_score_norm_eps(args.score_norm_eps)
+        rendered = json.dumps(benchmark_normalization(args), indent=2, sort_keys=True)
+        print(rendered, flush=True)
+        if args.output:
+            args.output.write_text(rendered + "\n")
+        return
     if args.implementation == "torch" and args.dtype != "bfloat16":
         parser.error("the production native grouped backend requires BF16")
     os.environ["MOE_GMM_IMPLEMENTATION"] = args.implementation

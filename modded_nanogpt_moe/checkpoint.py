@@ -203,6 +203,8 @@ def _with_legacy_defaults(config):
         config["model"].setdefault("moe_backward", "standard")
         config["model"].setdefault("grad_em_mode", "global")
         config["model"].setdefault("grad_em_eta", 0.1)
+        config["model"].setdefault("grad_em_score_normalization", "none")
+        config["model"].setdefault("grad_em_score_norm_eps", 1e-6)
         config["model"].setdefault("grad_em_lambda", 1.0)
         from .config import resolve_grad_em_alpha
         config["model"]["grad_em_alpha"] = resolve_grad_em_alpha(

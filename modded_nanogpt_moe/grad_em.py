@@ -10,7 +10,31 @@ from typing import NamedTuple
 
 import torch
 
-from .config import validate_grad_em_eta, validate_grad_em_lambda
+from .config import (
+    validate_grad_em_eta,
+    validate_grad_em_lambda,
+    validate_grad_em_score_normalization,
+    validate_grad_em_score_norm_eps,
+)
+
+
+@torch.no_grad()
+def normalize_grad_em_scores(scores, base_probs, normalization="none", eps=1e-6):
+    """Return raw scores or per-token router-weighted FP32 z-scores."""
+    validate_grad_em_score_normalization(normalization)
+    validate_grad_em_score_norm_eps(eps)
+    scores = scores.float()
+    if normalization == "none":
+        return scores
+    probabilities = base_probs.float()
+    # Shift the origin before the weighted mean: algebraically identical for
+    # normalized probabilities, but constant scores center to EXACT zero even
+    # when FP32 softmax probabilities sum to 1 +/- a rounding error.
+    shifted = scores - scores[..., :1]
+    mean = (probabilities * shifted).sum(dim=-1, keepdim=True)
+    centered = shifted - mean
+    variance = (probabilities * centered.square()).sum(dim=-1, keepdim=True)
+    return centered / variance.sqrt().clamp_min(eps)
 
 
 def require_grad_em_device(device):
@@ -48,6 +72,8 @@ class LocalBPGradEM(torch.autograd.Function):
         ctx.selected_outputs = selected_outputs
         ctx.parameters = parameters
         ctx.eta = module.grad_em_eta
+        ctx.score_normalization = module.grad_em_score_normalization
+        ctx.score_norm_eps = module.grad_em_score_norm_eps
         ctx.mix_lambda = module.grad_em_lambda
         ctx.boundary_mix = module.grad_em_lambda * module.grad_em_alpha
         ctx.normalize_topk = module.normalize_topk
@@ -66,7 +92,8 @@ class LocalBPGradEM(torch.autograd.Function):
         logits, indices = ctx.logits, ctx.indices
         selected_outputs, parameters = ctx.selected_outputs, ctx.parameters
         result = grad_em_reference(
-            logits, indices, selected_outputs, grad_output.flatten(0, 1), ctx.eta)
+            logits, indices, selected_outputs, grad_output.flatten(0, 1),
+            ctx.eta, ctx.score_normalization, ctx.score_norm_eps)
         def signals(coefficient):
             if coefficient == 1:
                 return (result.grad_expert.to(selected_outputs.dtype),
@@ -120,13 +147,18 @@ class GradEMCombine(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, out_sorted, router_logits, topk_weights, topk_experts, order, eta,
-                sensitivity_observer=None, mix_lambda=1.0):
+                sensitivity_observer=None, mix_lambda=1.0,
+                score_normalization="none", score_norm_eps=1e-6):
         require_grad_em_device(out_sorted.device)
         validate_grad_em_eta(eta)
         validate_grad_em_lambda(mix_lambda, "global")
+        validate_grad_em_score_normalization(score_normalization)
+        validate_grad_em_score_norm_eps(score_norm_eps)
         ctx.is_cuda = out_sorted.is_cuda
         ctx.sensitivity_observer = sensitivity_observer
         ctx.mix_lambda = mix_lambda
+        ctx.score_normalization = score_normalization
+        ctx.score_norm_eps = score_norm_eps
         extra = (topk_weights,) if mix_lambda != 1 else ()
         if ctx.is_cuda:
             from ._grad_em_cuda import cuda_forward
@@ -154,7 +186,9 @@ class GradEMCombine(torch.autograd.Function):
             gx, gz, _, v = cuda_backward(
                 out_sorted, logits, indices, order, grad_output, ctx.eta,
                 *ctx.needs_input_grad[:2], save_v=ctx.sensitivity_observer is not None,
-                weights=weights, mix_lambda=ctx.mix_lambda, grad_weights=grad_weights)
+                weights=weights, mix_lambda=ctx.mix_lambda, grad_weights=grad_weights,
+                score_normalization=ctx.score_normalization,
+                score_norm_eps=ctx.score_norm_eps)
             if gz is not None and ctx.mix_lambda != 1:
                 gz = gz * ctx.mix_lambda
             if ctx.sensitivity_observer is not None:
@@ -164,7 +198,9 @@ class GradEMCombine(torch.autograd.Function):
         selected = torch.empty_like(out_sorted)
         selected[order] = out_sorted
         selected = selected.view(*indices.shape, out_sorted.shape[-1])
-        result = grad_em_reference(logits, indices, selected, grad_output, ctx.eta)
+        result = grad_em_reference(
+            logits, indices, selected, grad_output, ctx.eta,
+            ctx.score_normalization, ctx.score_norm_eps)
         if ctx.sensitivity_observer is not None:
             ctx.sensitivity_observer(result.v)
         grad_sorted = result.grad_expert.flatten(0, 1)[order].to(out_sorted.dtype)
@@ -190,12 +226,15 @@ class GradEMResult(NamedTuple):
 
 
 @torch.no_grad()
-def grad_em_reference(router_logits, topk_idx, expert_outputs, grad_h, eta=0.1):
+def grad_em_reference(router_logits, topk_idx, expert_outputs, grad_h, eta=0.1,
+                      score_normalization="none", score_norm_eps=1e-6):
     """Evaluate the frozen replacement-gradient contract on fixed support.
 
     Inputs: logits [T,E], unique selected indices [T,K], selected expert
     outputs [T,K,D], incoming output gradient [T,D], fixed finite eta > 0.
-    q = softmax(selected_logits - eta * <g,h_i>) is detached.
+    q = softmax(selected_logits - eta * score) is detached, where score is
+    <g,h_i> in raw mode and its router-weighted per-token z-score in normalized
+    mode.
     Return q*g for selected experts and
     (a - q) / eta on selected logits, zero elsewhere, where a is the
     selected-logit softmax. This is the gradient of KL(q.detach() || a) / eta.
@@ -203,6 +242,8 @@ def grad_em_reference(router_logits, topk_idx, expert_outputs, grad_h, eta=0.1):
     Validation is for the reference, not a GPU hot-path implementation.
     """
     validate_grad_em_eta(eta)
+    validate_grad_em_score_normalization(score_normalization)
+    validate_grad_em_score_norm_eps(score_norm_eps)
     if (router_logits.ndim != 2 or topk_idx.ndim != 2
             or expert_outputs.ndim != 3 or grad_h.ndim != 2):
         raise ValueError("expected logits [T,E], indices [T,K], outputs [T,K,D], g [T,D]")
@@ -229,6 +270,8 @@ def grad_em_reference(router_logits, topk_idx, expert_outputs, grad_h, eta=0.1):
     v = (g * expert_outputs.float()).sum(dim=-1)
     selected_logits = logits.gather(1, topk_idx)
     a = torch.softmax(selected_logits, dim=-1)
-    q = torch.softmax(selected_logits - eta * v, dim=-1)
+    responsibility_scores = normalize_grad_em_scores(
+        v, a, score_normalization, score_norm_eps)
+    q = torch.softmax(selected_logits - eta * responsibility_scores, dim=-1)
     grad_logits = torch.zeros_like(logits).scatter_(1, topk_idx, (a - q) / eta)
     return GradEMResult(v, q, a, q[..., None] * g, grad_logits)

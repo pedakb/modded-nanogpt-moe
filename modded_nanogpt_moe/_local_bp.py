@@ -62,12 +62,14 @@ def _bias_grad(grad, counts):
     return torch.segment_reduce(values, "sum", lengths=counts, axis=0, unsafe=True).to(grad.dtype)
 
 
-def _cpu_signals(out, logits, weights, indices, order, grad, eta, mix_lambda=1.0):
+def _cpu_signals(out, logits, weights, indices, order, grad, eta, mix_lambda=1.0,
+                 score_normalization="none", score_norm_eps=1e-6):
     from .grad_em import grad_em_reference
     selected = torch.empty_like(out)
     selected[order] = out
     selected = selected.view(*indices.shape, out.shape[-1])
-    result = grad_em_reference(logits, indices, selected, grad, eta)
+    result = grad_em_reference(
+        logits, indices, selected, grad, eta, score_normalization, score_norm_eps)
     # A zero forward weight can still have nonzero q. Use an unweighted
     # signal for that row, then zero ONLY its BP VJP after the activation.
     safe_weights = torch.where(weights == 0, 1, weights)
@@ -110,7 +112,8 @@ class MixedLocalBP(torch.autograd.Function):
     def forward(ctx, x, x_sorted, fc_w, fc_b, proj_w, proj_b,
                 h_pre, h_act, out_sorted, logits, weights, indices, order,
                 counts, counts_device, offsets, eta, implementation, observer,
-                mix_lambda=1.0, boundary_mix=0.0):
+                mix_lambda=1.0, boundary_mix=0.0,
+                score_normalization="none", score_norm_eps=1e-6):
         if out_sorted.is_cuda:
             from ._grad_em_cuda import cuda_forward
             out, rows = cuda_forward(out_sorted, logits, weights, indices, order)
@@ -123,6 +126,8 @@ class MixedLocalBP(torch.autograd.Function):
                               offsets, rows)
         ctx.eta, ctx.implementation, ctx.observer = eta, implementation, observer
         ctx.mix_lambda, ctx.boundary_mix = mix_lambda, boundary_mix
+        ctx.score_normalization = score_normalization
+        ctx.score_norm_eps = score_norm_eps
         ctx.input_shape = x.shape
         return out
 
@@ -138,10 +143,11 @@ class MixedLocalBP(torch.autograd.Function):
             bp_out, ge_out, ge_logits, q, bp_weights, v = combine_backward(
                 out, logits, weights, indices, rows, grad, ctx.eta,
                 needs[4] or needs[5], needs[9], needs[10], ctx.observer is not None,
-                ctx.mix_lambda)
+                ctx.mix_lambda, ctx.score_normalization, ctx.score_norm_eps)
         else:
             bp_out, ge_out, ge_logits, q, bp_weights, v = _cpu_signals(
-                out, logits, weights, indices, order, grad, ctx.eta, ctx.mix_lambda)
+                out, logits, weights, indices, order, grad, ctx.eta,
+                ctx.mix_lambda, ctx.score_normalization, ctx.score_norm_eps)
         if ctx.observer is not None:
             ctx.observer(v)
         # Exactly one wgrad per trainable expert weight; no GE dgrad.
