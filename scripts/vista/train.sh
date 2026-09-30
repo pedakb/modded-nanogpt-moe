@@ -304,6 +304,26 @@ fi
 
 source "$repo_root/scripts/vista/env.sh"
 
+checkpoint_root=""
+if [[ "$smoke" -ne 1 && "$benchmark_worker" -ne 1 ]]; then
+    if [[ -n "${VISTA_CHECKPOINT_ROOT:-}" ]]; then
+        checkpoint_root="$VISTA_CHECKPOINT_ROOT"
+    elif [[ -n "${SCRATCH:-}" ]]; then
+        checkpoint_root="$SCRATCH/checkpoints/modded-nanogpt-moe"
+    else
+        echo "Error: SCRATCH must be set when VISTA_CHECKPOINT_ROOT is unset" >&2
+        exit 2
+    fi
+    if ! mkdir -p "$checkpoint_root"; then
+        echo "Error: could not create Vista checkpoint root: $checkpoint_root" >&2
+        exit 2
+    fi
+    if [[ ! -d "$checkpoint_root" || ! -w "$checkpoint_root" ]]; then
+        echo "Error: Vista checkpoint root is not a writable directory: $checkpoint_root" >&2
+        exit 2
+    fi
+fi
+
 if [[ "$worker" -eq 1 ]]; then
     log_dir="$STOCKYARD/logs/modded-nanogpt-moe/vista/slurm"
     mkdir -p "$log_dir"
@@ -341,9 +361,11 @@ for index in "${!config_paths[@]}"; do
     training_environment=(
         env
         "DATA_ROOT=$repo_root"
-        "CHECKPOINT_ROOT=$STOCKYARD/checkpoints/modded-nanogpt-moe"
         MOE_GMM_IMPLEMENTATION=torch
     )
+    if [[ "$smoke" -ne 1 && "$benchmark_worker" -ne 1 ]]; then
+        training_environment+=("CHECKPOINT_ROOT=$checkpoint_root")
+    fi
     if [[ -n "$steps" ]]; then
         training_environment+=("STOP_AFTER_COMPLETED_UPDATES=$steps")
     fi

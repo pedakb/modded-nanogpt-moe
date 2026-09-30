@@ -223,11 +223,17 @@ Checkpoint cadence normally comes from the experiment TOML:
 interval = 250
 ```
 
+Vista stores each run under
+`$SCRATCH/checkpoints/modded-nanogpt-moe/<run_name>` by default. Set
+`VISTA_CHECKPOINT_ROOT` to replace only that machine root—for example, use the
+corresponding Stockyard root for a persistent run. The launcher still adds the
+TOML `run_name` automatically.
+
 An omitted section disables checkpointing. An explicit interval of zero writes
 only the final checkpoint; a positive interval also writes at that completed-
-update cadence. All three production configs use 100. Each run writes under
-`$STOCKYARD/checkpoints/modded-nanogpt-moe/RUN_NAME`. Override the TOML cadence
-for every config in one invocation when needed:
+update cadence. Cadence remains config-specific. Each run writes below the
+selected Vista checkpoint root in its own `RUN_NAME` directory. Override the
+TOML cadence for every config in one invocation when needed:
 
 ```bash
 scripts/vista/train.sh --submit \

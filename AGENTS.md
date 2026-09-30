@@ -109,7 +109,10 @@ environment overrides take precedence over TOML values; keep them compatible.
   completed update.
 - `[checkpoint].interval` is the portable checkpoint policy; omission disables
   it, 0 saves only at completion, and a positive value adds periodic saves.
-  Vista derives the directory from its Stockyard root and TOML `run_name`.
+  Vista defaults the directory to its Scratch checkpoint root plus the TOML
+  `run_name`. `VISTA_CHECKPOINT_ROOT` optionally replaces that machine root
+  (for example, with Stockyard) while retaining automatic per-`run_name`
+  directories.
   `CHECKPOINT_INTERVAL` is a runtime cadence override; `CHECKPOINT_DIR`,
   `RESUME_CHECKPOINT`, and `STOP_AFTER_COMPLETED_UPDATES` remain compatibility
   and recovery controls.
@@ -119,14 +122,15 @@ environment overrides take precedence over TOML values; keep them compatible.
   `TRAIN_STEPS_OVERRIDE`, `MLP_TYPE_OVERRIDE`, `MLP_RATIO_OVERRIDE`,
   `NUM_EXPERTS_OVERRIDE`, `TOP_K_OVERRIDE`, and `MOE_BACKEND_OVERRIDE`.
 
-Keep durable TensorBoard/checkpoint outputs on Stockyard and active data on
-system scratch. On the current Vista setup, repository-local
-`data/fineweb10B` is a symlink to the physical FineWeb10B directory on SCRATCH,
-and the Vista launcher defaults `DATA_ROOT` to its robustly derived repository
-root. Other checkouts may provide their own directory/symlink or explicitly set
-`DATA_ROOT`. Application code and committed configs must remain agnostic to the
-physical target. Never commit user-specific absolute paths, datasets,
-checkpoints, logs, or profiles.
+Keep shared TensorBoard outputs on Stockyard. Vista checkpoints default to
+Scratch; use `VISTA_CHECKPOINT_ROOT` when a run needs persistent Stockyard
+storage. Active data remains on system scratch. On the current Vista setup,
+repository-local `data/fineweb10B` is a symlink to the physical FineWeb10B
+directory on SCRATCH, and the Vista launcher defaults `DATA_ROOT` to its
+robustly derived repository root. Other checkouts may provide their own
+directory/symlink or explicitly set `DATA_ROOT`. Application code and committed
+configs must remain agnostic to the physical target. Never commit user-specific
+absolute paths, datasets, checkpoints, logs, or profiles.
 
 ## Environments and commands
 

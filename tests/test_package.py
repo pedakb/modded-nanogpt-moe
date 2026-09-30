@@ -403,6 +403,11 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path, steps, smok
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
     environment["LAUNCH_CAPTURE"] = str(capture)
     environment["STOCKYARD"] = str(tmp_path / "stockyard")
+    environment.pop("VISTA_CHECKPOINT_ROOT", None)
+    if smoke:
+        environment.pop("SCRATCH", None)
+    else:
+        environment["SCRATCH"] = str(tmp_path / "scratch")
     environment["DATA_ROOT"] = "/stale/data"
     environment["TRAIN_STEPS_OVERRIDE"] = "999"
     environment["MOE_GMM_IMPLEMENTATION"] = "extension"
@@ -435,7 +440,8 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path, steps, smok
         "", "", "", "" if steps is None else str(steps),
     ]
     assert captured[8:14] == [
-        "", "", str(tmp_path / "stockyard/checkpoints/modded-nanogpt-moe"),
+        "", "", "" if smoke else str(
+            tmp_path / "scratch/checkpoints/modded-nanogpt-moe"),
         "1" if smoke else "", "" if smoke else str(tmp_path / "stockyard/tensorboard"), "vista",
     ]
     assert captured[14:17] == ["/usr/bin/gcc", "/usr/bin/g++", "/usr/bin/g++"]
@@ -447,7 +453,11 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path, steps, smok
     config = load_experiment_config(config_path)
     assert config["training"]["total_steps"] == 3250
     assert config["checkpoint"]["interval"] == 250
-    assert not (tmp_path / "stockyard").exists()  # The launcher creates no output directories.
+    checkpoint_root = tmp_path / "scratch/checkpoints/modded-nanogpt-moe"
+    if smoke:
+        assert not checkpoint_root.exists()
+    else:
+        assert checkpoint_root.is_dir()
 
 
 @pytest.mark.parametrize(
@@ -556,6 +566,7 @@ def test_vista_worker_uses_submit_side_root_when_slurm_copies_script(tmp_path):
         LAUNCH_CAPTURE=str(capture),
         SLURM_JOB_ID="123",
         STOCKYARD=str(tmp_path / "stockyard"),
+        SCRATCH=str(tmp_path / "scratch"),
     )
 
     subprocess.run(
@@ -639,6 +650,10 @@ def test_vista_launcher_runs_configs_in_order_with_explicit_checkpoints(
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
     environment["LAUNCH_CAPTURE"] = str(capture)
     environment["STOCKYARD"] = str(stockyard)
+    custom_root = tmp_path / "custom-checkpoints"
+    environment["VISTA_CHECKPOINT_ROOT"] = str(custom_root)
+    environment["CHECKPOINT_ROOT"] = "/stale/checkpoint-root"
+    environment["CHECKPOINT_DIR"] = "/stale/checkpoint-dir"
 
     subprocess.run(
         [
@@ -656,12 +671,80 @@ def test_vista_launcher_runs_configs_in_order_with_explicit_checkpoints(
         "--module modded_nanogpt_moe.train --config "
     )
     assert capture.read_text().splitlines() == [
-        f"{stockyard}/checkpoints/modded-nanogpt-moe|7|"
+        f"{custom_root}|7|"
         f"{resume}||||{command_prefix}"
         f"{repository_root / 'configs/dense_baseline.toml'}",
-        f"{stockyard}/checkpoints/modded-nanogpt-moe|7|||||"
+        f"{custom_root}|7|||||"
         f"{command_prefix}{repository_root / 'configs/moe_e8k2_r2.toml'}",
     ]
+    assert custom_root.is_dir()
+
+
+def test_vista_checkpoint_root_is_generic_and_run_names_remain_separate(tmp_path):
+    launcher = Path(__file__).resolve().parents[1] / "scripts/vista/train.sh"
+    source = launcher.read_text()
+    root = tmp_path / "checkpoints"
+    start = source.index('checkpoint_root=""')
+    end = source.index('if [[ "$worker" -eq 1', start)
+    setup = source[start:end]
+
+    environment = os.environ.copy()
+    environment["SCRATCH"] = str(tmp_path / "scratch")
+    environment.pop("VISTA_CHECKPOINT_ROOT", None)
+    result = subprocess.run(
+        ["bash", "-u", "-c",
+         f'smoke=0\nbenchmark_worker=0\n{setup}\nprintf "%s\\n" "$checkpoint_root"'],
+        env=environment, check=True, capture_output=True, text=True)
+    assert result.stdout.strip() == str(
+        tmp_path / "scratch/checkpoints/modded-nanogpt-moe")
+    assert Path(result.stdout.strip()).is_dir()
+
+    environment["VISTA_CHECKPOINT_ROOT"] = str(root)
+    environment.pop("SCRATCH")
+    result = subprocess.run(
+        ["bash", "-u", "-c",
+         f'smoke=0\nbenchmark_worker=0\n{setup}\nprintf "%s\\n" "$checkpoint_root"'],
+        env=environment, check=True, capture_output=True, text=True)
+    assert result.stdout.strip() == str(root)
+    assert root.is_dir()
+
+    environment.pop("VISTA_CHECKPOINT_ROOT")
+    result = subprocess.run(
+        ["bash", "-u", "-c", f'smoke=0\nbenchmark_worker=0\n{setup}'],
+        env=environment,
+        capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "SCRATCH must be set when VISTA_CHECKPOINT_ROOT is unset" in result.stderr
+
+    for smoke, benchmark_worker in ((1, 0), (0, 1)):
+        result = subprocess.run(
+            ["bash", "-u", "-c",
+             f'smoke={smoke}\nbenchmark_worker={benchmark_worker}\n{setup}'
+             '\nprintf "%s\\n" "$checkpoint_root"'],
+            env=environment, check=True, capture_output=True, text=True)
+        assert result.stdout == "\n"
+
+        unused_root = tmp_path / f"unused-{smoke}-{benchmark_worker}"
+        environment["VISTA_CHECKPOINT_ROOT"] = str(unused_root)
+        subprocess.run(
+            ["bash", "-u", "-c",
+             f'smoke={smoke}\nbenchmark_worker={benchmark_worker}\n{setup}'],
+            env=environment, check=True)
+        assert not unused_root.exists()
+        environment.pop("VISTA_CHECKPOINT_ROOT")
+
+    assert checkpoint_directory_from_environment(
+        "experiment-a", True, {"CHECKPOINT_ROOT": str(root)}) == str(
+            root / "experiment-a")
+    assert checkpoint_directory_from_environment(
+        "experiment-b", True, {"CHECKPOINT_ROOT": str(root)}) == str(
+            root / "experiment-b")
+    assert 'checkpoint_root="$SCRATCH/checkpoints/modded-nanogpt-moe"' in source
+    assert 'checkpoint_root="$VISTA_CHECKPOINT_ROOT"' in source
+    assert "$run_name" not in setup
+    assert source.index(
+        "unset CHECKPOINT_DIR CHECKPOINT_INTERVAL CHECKPOINT_ROOT"
+    ) < source.index('training_environment+=("CHECKPOINT_ROOT=$checkpoint_root")')
 
 
 def test_vista_benchmark_launcher_uses_trainer_without_artifacts(
@@ -676,10 +759,11 @@ def test_vista_benchmark_launcher_uses_trainer_without_artifacts(
     uv = fake_bin / "uv"
     uv.write_text(
         "#!/usr/bin/env bash\n"
-        "printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' \"$PWD\" "
+        "printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' \"$PWD\" "
         "\"${TRAINING_BENCHMARK-}\" \"${TB_ROOT+x}\" \"${TB_ROOT-}\" "
         "\"${BENCHMARK_WARMUP_UPDATES-}\" "
-        "\"${BENCHMARK_MEASURED_UPDATES-}\" > \"$LAUNCH_CAPTURE\"\n"
+        "\"${BENCHMARK_MEASURED_UPDATES-}\" \"${CHECKPOINT_DIR-}\" "
+        "\"${CHECKPOINT_ROOT-}\" > \"$LAUNCH_CAPTURE\"\n"
         "printf '%s\\n' \"$@\" >> \"$LAUNCH_CAPTURE\"\n"
     )
     uv.chmod(0o755)
@@ -690,6 +774,8 @@ def test_vista_benchmark_launcher_uses_trainer_without_artifacts(
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
     environment["LAUNCH_CAPTURE"] = str(capture)
     environment["STOCKYARD"] = str(tmp_path / "stockyard")
+    environment.pop("SCRATCH", None)
+    environment.pop("VISTA_CHECKPOINT_ROOT", None)
     environment["TB_ROOT"] = "/must/not/be/used"
     environment["BENCHMARK_WARMUP_UPDATES"] = "2"
     environment["BENCHMARK_MEASURED_UPDATES"] = "3"
@@ -710,8 +796,8 @@ def test_vista_benchmark_launcher_uses_trainer_without_artifacts(
     )
 
     captured = capture.read_text().splitlines()
-    assert captured[:6] == [str(repository_root), "1", "x", "", "2", "3"]
-    assert captured[6:] == [
+    assert captured[:8] == [str(repository_root), "1", "x", "", "2", "3", "", ""]
+    assert captured[8:] == [
         "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
         "--module", "modded_nanogpt_moe.train", "--config",
         str(repository_root / "configs/moe_e8k2_r2.toml"),
