@@ -20,6 +20,7 @@ def _grad_em_responsibilities(selected, values, valid,
     selected = tl.where(valid, selected, -float("inf"))
     scores = values
     base = tl.full(values.shape, 0., tl.float32)
+    scale = tl.full((), 1., tl.float32)
     if SCORE_NORMALIZATION:
         base_exp = tl.exp(selected - tl.max(selected, axis=0))
         base = base_exp / tl.sum(base_exp, axis=0)
@@ -35,7 +36,7 @@ def _grad_em_responsibilities(selected, values, valid,
         scores = centered / scale
     tilted = tl.where(valid, selected - ETA * scores, -float("inf"))
     exp_tilted = tl.exp(tilted - tl.max(tilted, axis=0))
-    return exp_tilted / tl.sum(exp_tilted, axis=0), base
+    return exp_tilted / tl.sum(exp_tilted, axis=0), base, scale
 
 
 @triton.jit
@@ -53,7 +54,7 @@ def _grad_em_expert_backward(X, Z, Indices, Rows, Grad, GradX, Q, V,
                              WR: tl.constexpr = 0, WC: tl.constexpr = 0,
                              MIX_LAMBDA: tl.constexpr = 1.0,
                              NEED_WEIGHTS: tl.constexpr = False,
-                             Base=None, SAVE_BASE: tl.constexpr = False,
+                             RouterSignal=None, SAVE_SIGNAL: tl.constexpr = False,
                              SCORE_NORM_EPS: tl.constexpr = 1e-6):
     token = tl.program_id(0)
     slots, columns = tl.arange(0, SLOTS), tl.arange(0, COLS)
@@ -65,10 +66,12 @@ def _grad_em_expert_backward(X, Z, Indices, Rows, Grad, GradX, Q, V,
     # Unlike standard combine's weight gradient, do NOT round products to BF16.
     v = tl.sum(values * grad[None, :], axis=1)
     selected = tl.load(Z + token * ZR + ids * ZC, slots < K, other=0).to(tl.float32)
-    q, base = _grad_em_responsibilities(
+    q, base, scale = _grad_em_responsibilities(
         selected, v, slots < K, ETA, SCORE_NORMALIZATION, SCORE_NORM_EPS)
-    if SAVE_BASE:
-        tl.store(Base + token * K + slots, base, slots < K)
+    if SAVE_SIGNAL:
+        # Reuse compact scratch for the complete adaptive-temperature signal.
+        # Scale is still in registers: no extra buffer or variance reduction.
+        tl.store(RouterSignal + token * K + slots, (scale / ETA) * (base - q), slots < K)
     tl.store(Q + token * K + slots, q, slots < K)
     if SAVE_V:
         tl.store(V + token * K + slots, v, slots < K)
@@ -95,19 +98,19 @@ def _grad_em_router_backward(Z, Indices, Q, GradZ,
                              ZR: tl.constexpr, ZC: tl.constexpr,
                              IR: tl.constexpr, IC: tl.constexpr,
                              EXPERTS: tl.constexpr, SLOTS: tl.constexpr,
-                             Base=None, REUSE_BASE: tl.constexpr = False):
+                             RouterSignal=None, REUSE_SIGNAL: tl.constexpr = False):
     token = tl.program_id(0)
     experts, slots = tl.arange(0, EXPERTS), tl.arange(0, SLOTS)
     ids = tl.load(Indices + token * IR + slots * IC, slots < K, other=-1)
-    if REUSE_BASE:
-        a = tl.load(Base + token * K + slots, slots < K, other=0)
+    if REUSE_SIGNAL:
+        selected_grad = tl.load(RouterSignal + token * K + slots, slots < K, other=0)
     else:
         logits = tl.load(Z + token * ZR + ids * ZC, slots < K,
                          other=-float("inf")).to(tl.float32)
         exps = tl.exp(logits - tl.max(logits, axis=0))
         a = exps / tl.sum(exps, axis=0)
-    q = tl.load(Q + token * K + slots, slots < K, other=0)
-    selected_grad = (a - q) / ETA
+        q = tl.load(Q + token * K + slots, slots < K, other=0)
+        selected_grad = (a - q) / ETA
     # Register-local matching gives exactly zero outside the unique support.
     # One store per dense output entry; no overlapping zero/scatter writes,
     # atomics, full-E softmax, or global dense intermediate.
@@ -160,9 +163,9 @@ def cuda_backward(out_sorted, logits, indices, rows, grad_output, eta,
     gx = torch.empty(out_sorted.shape, device=out_sorted.device, dtype=out_sorted.dtype) if need_x else None
     gz = torch.empty(logits.shape, device=logits.device, dtype=logits.dtype) if need_logits else None
     q = torch.empty((n, k), device=logits.device, dtype=torch.float32)
-    reuse_base = score_normalization == "std" and need_logits
+    reuse_signal = score_normalization == "std" and need_logits
     # Compact scratch only in normalized mode; raw mode is unchanged.
-    base = torch.empty((n, k), device=logits.device, dtype=torch.float32) if reuse_base else None
+    signal = torch.empty((n, k), device=logits.device, dtype=torch.float32) if reuse_signal else None
     v = torch.empty((n, k), device=logits.device, dtype=torch.float32) if save_v else None
     if n and (need_x or need_logits or save_v or grad_weights is not None):
         with torch.cuda.device(out_sorted.device):
@@ -175,12 +178,12 @@ def cuda_backward(out_sorted, logits, indices, rows, grad_output, eta,
                 triton.next_power_of_2(k), triton.next_power_of_2(d),
                 weights, grad_weights, *(weights.stride() if weights is not None else (0, 0)),
                 mix_lambda, grad_weights is not None,
-                Base=base, SAVE_BASE=reuse_base, SCORE_NORM_EPS=score_norm_eps,
+                RouterSignal=signal, SAVE_SIGNAL=reuse_signal, SCORE_NORM_EPS=score_norm_eps,
                 num_warps=4, enable_fp_fusion=False)
             if need_logits:
                 _grad_em_router_backward[(n,)](
                     logits, indices, q, gz, eta, e, k, *logits.stride(), *indices.stride(),
                     triton.next_power_of_2(e), triton.next_power_of_2(k),
-                    Base=base, REUSE_BASE=reuse_base,
+                    RouterSignal=signal, REUSE_SIGNAL=reuse_signal,
                     num_warps=4, enable_fp_fusion=False)
     return gx, gz, q, v

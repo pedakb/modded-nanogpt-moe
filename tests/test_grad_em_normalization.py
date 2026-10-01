@@ -28,6 +28,77 @@ def _responsibilities(base_probs, normalized_scores, beta=0.3):
     return torch.softmax(base_probs.log() - beta * normalized_scores, dim=-1)
 
 
+@pytest.mark.parametrize("k", [1, 2, 4, 8])
+@pytest.mark.parametrize("spread", [1e-9, 0.2, 4.0])
+def test_adaptive_temperature_contract_and_previous_q(k, spread):
+    torch.manual_seed(910 + k)
+    logits = torch.randn(7, k) * 2
+    scores = torch.randn(7, k) * spread
+    indices = torch.arange(k).expand(7, k)
+    eta, eps = 0.3, 1e-6
+    result = grad_em_reference(logits, indices, scores[..., None],
+                               torch.ones(7, 1), eta, "std", eps)
+    normalized, scale = normalize_grad_em_scores(scores, result.a, "std", eps,
+                                                 return_scale=True)
+    previous_q = (logits - eta * normalized).softmax(-1)
+    torch.testing.assert_close(result.q, previous_q, rtol=0, atol=0)
+    expected_q = (logits - (eta / scale) * scores).softmax(-1)
+    torch.testing.assert_close(result.q, expected_q, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(result.grad_logits,
+                               (scale / eta) * (result.a - result.q), rtol=0, atol=0)
+    assert torch.isfinite(result.grad_logits).all()
+    assert not scale.requires_grad and not result.q.requires_grad
+
+
+@pytest.mark.parametrize("k", [2, 4, 8])
+def test_affine_scores_preserve_q_and_rescale_router_signal(k):
+    torch.manual_seed(221 + k)
+    logits, scores = torch.randn(9, k), torch.randn(9, k)
+    indices = torch.arange(k).expand(9, k)
+    def run(values):
+        return grad_em_reference(logits, indices, values[..., None],
+                                 torch.ones(9, 1), 0.4, "std")
+    original, transformed = run(scores), run(3.75 * scores - 8.5)
+    torch.testing.assert_close(transformed.q, original.q, rtol=3e-6, atol=5e-7)
+    torch.testing.assert_close(transformed.grad_logits, 3.75 * original.grad_logits,
+                               rtol=2e-5, atol=3e-6)
+
+
+@pytest.mark.parametrize("k", [2, 4, 8])
+@pytest.mark.parametrize("spread", [0.2, 4.0])
+def test_small_eta_recovers_raw_bp_scale(k, spread):
+    torch.manual_seed(326 + k)
+    logits, scores = torch.randn(11, k), spread * torch.randn(11, k)
+    indices = torch.arange(k).expand(11, k)
+    p = logits.softmax(-1)
+    bp = p * (scores - (p * scores).sum(-1, keepdim=True))
+    errors = []
+    for eta in (0.1, 0.001):
+        result = grad_em_reference(logits, indices, scores[..., None],
+                                   torch.ones(11, 1), eta, "std")
+        errors.append((result.grad_logits - bp).norm() / bp.norm())
+    assert errors[1] < errors[0]
+    # FP32 subtraction contributes O(machine-epsilon/eta), alongside O(eta)
+    # truncation. This checks the raw BP scale, not the old 1/std amplification.
+    assert errors[1] < 0.002
+
+
+def test_softmin_potential_gradient_with_detached_scale():
+    torch.manual_seed(12)
+    logits = torch.randn(5, 4, dtype=torch.float64, requires_grad=True)
+    scores = torch.randn(5, 4, dtype=torch.float64)
+    p = logits.softmax(-1)
+    centered = scores - (p * scores).sum(-1, keepdim=True)
+    scale = (p * centered.square()).sum(-1, keepdim=True).sqrt().clamp_min(1e-6).detach()
+    eta = 0.3
+    tilted = logits - eta / scale * scores
+    potential = -(scale.squeeze(-1) / eta) * (
+        tilted.logsumexp(-1) - logits.logsumexp(-1))
+    actual, = torch.autograd.grad(potential.sum(), logits)
+    expected = scale / eta * (p - tilted.softmax(-1))
+    torch.testing.assert_close(actual, expected, rtol=1e-13, atol=1e-14)
+
+
 @pytest.mark.parametrize("eps", [1e-12, 1e-6, 10.0])
 def test_none_is_exactly_the_legacy_responsibility_and_gradient_rule(eps):
     generator = torch.Generator().manual_seed(91)

@@ -67,8 +67,11 @@ def test_cuda_oracle_and_direct_autograd(
     inactive = torch.ones_like(z, dtype=torch.bool).scatter_(1, ids, False)
     assert torch.count_nonzero(gz[inactive]) == 0
     kl_logits = z.detach().float().requires_grad_()
-    kl_loss = torch.nn.functional.kl_div(
-        kl_logits.gather(1, ids).log_softmax(-1), ref.q.detach(), reduction="sum") / eta
+    _, scale = em.normalize_grad_em_scores(
+        ref.v, ref.a, score_normalization, return_scale=True)
+    kl_loss = (torch.nn.functional.kl_div(
+        kl_logits.gather(1, ids).log_softmax(-1), ref.q.detach(), reduction="none")
+        * (scale / eta)).sum()
     kl_grad, = torch.autograd.grad(kl_loss, kl_logits)
     torch.testing.assert_close(gz, kl_grad.to(dtype), **tolerance(dtype))
     if case == "random" and k < e:

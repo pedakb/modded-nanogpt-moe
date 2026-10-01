@@ -21,7 +21,7 @@ def _mixed_combine_backward(X, Z, Weights, Indices, Rows, Grad,
                             NEED_WEIGHTS: tl.constexpr, SAVE_V: tl.constexpr,
                             SLOTS: tl.constexpr, COLS: tl.constexpr,
                             MIX_LAMBDA: tl.constexpr = 1.0,
-                            Base=None, SAVE_BASE: tl.constexpr = False,
+                            RouterSignal=None, SAVE_SIGNAL: tl.constexpr = False,
                             SCORE_NORM_EPS: tl.constexpr = 1e-6):
     token = tl.program_id(0)
     slots, columns = tl.arange(0, SLOTS), tl.arange(0, COLS)
@@ -35,10 +35,10 @@ def _mixed_combine_backward(X, Z, Weights, Indices, Rows, Grad,
     products = values * grad[None, :]
     v = tl.sum(products, axis=1)
     selected = tl.load(Z + token * ZR + ids * ZC, slots < K, other=0).to(tl.float32)
-    q, base = _grad_em_responsibilities(
+    q, base, scale = _grad_em_responsibilities(
         selected, v, slots < K, ETA, SCORE_NORMALIZATION, SCORE_NORM_EPS)
-    if SAVE_BASE:
-        tl.store(Base + token * K + slots, base, slots < K)
+    if SAVE_SIGNAL:
+        tl.store(RouterSignal + token * K + slots, (scale / ETA) * (base - q), slots < K)
     tl.store(Q + token * K + slots, q, slots < K)
     if SAVE_V:
         tl.store(V + token * K + slots, v, slots < K)
@@ -102,8 +102,8 @@ def combine_backward(out, logits, weights, indices, rows, grad, eta,
     gz = torch.empty_like(logits) if need_logits else None
     gw = torch.empty_like(weights) if need_weights else None
     q = torch.empty((n, k), device=out.device, dtype=torch.float32)
-    reuse_base = score_normalization == "std" and need_logits
-    base = torch.empty_like(q) if reuse_base else None
+    reuse_signal = score_normalization == "std" and need_logits
+    signal = torch.empty_like(q) if reuse_signal else None
     v = torch.empty_like(q) if save_v else None
     if n:
         with torch.cuda.device(out.device):
@@ -114,13 +114,13 @@ def combine_backward(out, logits, weights, indices, rows, grad, eta,
                 score_normalization == "std", need_weights, save_v,
                 triton.next_power_of_2(k), triton.next_power_of_2(d),
                 mix_lambda,
-                Base=base, SAVE_BASE=reuse_base, SCORE_NORM_EPS=score_norm_eps,
+                RouterSignal=signal, SAVE_SIGNAL=reuse_signal, SCORE_NORM_EPS=score_norm_eps,
                 num_warps=4, enable_fp_fusion=False)
             if need_logits:
                 _grad_em_router_backward[(n,)](
                     logits, indices, q, gz, eta, e, k, *logits.stride(), *indices.stride(),
                     triton.next_power_of_2(e), triton.next_power_of_2(k),
-                    Base=base, REUSE_BASE=reuse_base,
+                    RouterSignal=signal, REUSE_SIGNAL=reuse_signal,
                     num_warps=4, enable_fp_fusion=False)
     return bp, ge, gz, q, gw, v
 

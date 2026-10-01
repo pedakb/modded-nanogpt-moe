@@ -3,7 +3,7 @@
 `modded_nanogpt_moe/grad_em.py::grad_em_reference` is a small detached PyTorch
 value oracle, not an autograd implementation or an optimized training path.
 It takes full logits `z [T,E]`, fixed selected indices `[T,K]`, selected expert
-outputs `h [T,K,D]`, and incoming output gradient `g [T,D]`. In FP32:
+outputs `h [T,K,D]`, and incoming output gradient `g [T,D]`. In raw mode, in FP32:
 
 ```text
 v[t,i] = sum_d g[t,d] * h[t,i,d]
@@ -42,15 +42,45 @@ in exact arithmetic `log(p_selected)` differs only by a common shift.
 
 ## Normalized Grad-EM
 
-`grad_em_score_normalization = "std"` replaces each token's raw Grad-EM
-sensitivity score with its router-weighted z-score on the selected support:
+`grad_em_score_normalization = "std"` is **adaptive-temperature Grad-EM**.
+It uses each token's router-weighted score spread on the selected support:
 
 ```text
 mu = sum_i a_i * v_i
 variance = sum_i a_i * (v_i - mu)^2
-score_i = (v_i - mu) / max(sqrt(variance), eps)
-q_i proportional to a_i * exp(-eta * score_i)
+scale = max(sqrt(variance), eps)
+eta_eff = eta / scale
+q_i proportional to a_i * exp(-eta_eff * v_i)
+r_GE = (scale / eta) * (a - q)
 ```
+
+Centering the exponent cancels in softmax, so responsibility computation still
+uses `softmax(z_selected - eta * (v-mu)/scale)`, numerically unchanged from the
+earlier normalized implementation. The router signal now uses `scale/eta`,
+not `1/eta`. Expert signals remain `q*g`.
+
+With `p = softmax(r)` on selected support, the variational objective is
+
+\[
+\min_q\{\langle q,s\rangle + (\mathrm{scale}/\eta)D_{\mathrm{KL}}(q\|p)\}.
+\]
+
+Treat scores and scale as detached/fixed. The soft-min potential is
+
+\[
+\mathcal G(r)=-\frac{\mathrm{scale}}{\eta}
+\left[\operatorname{LSE}\left(r-\frac{\eta}{\mathrm{scale}}s\right)
+-\operatorname{LSE}(r)\right],\qquad
+\nabla_r\mathcal G=\frac{\mathrm{scale}}{\eta}(p-q).
+\]
+
+Away from the floor, scale is sigma, giving exactly
+`-(sigma/eta) * [LSE(r-(eta/sigma)*s)-LSE(r)]` and gradient
+`(sigma/eta)*(p-q)`. For small eta this approaches
+`p*(s-E_p[s])`, the raw normalized-Top-K BP router gradient. This normalizes
+responsibility/KL displacement while preserving raw gradient scale; merely
+z-scoring with router denominator `1/eta` would amplify it by `1/scale`.
+No gradients pass through scores, scale, or q at the custom-autograd boundary.
 
 All statistics use the same normalized selected-support base distribution `a`
 used to construct the Grad-EM responsibilities, even when the unchanged
@@ -69,8 +99,9 @@ and guarantees `q = a` for constant scores and K=1. The raw sensitivity diagnost
 
 This optional method is called **Normalized Grad-EM**. Its motivation is scale
 invariance: replacing `v` by `c*v+b` for `c>0` leaves normalized
-responsibilities unchanged when both standard deviations are above the epsilon
-floor (up to FP32 rounding). The floor intentionally breaks exact scale
+responsibilities unchanged and multiplies the router signal by `c` when both
+standard deviations are above the epsilon floor (up to FP32 rounding).
+The floor intentionally breaks exact scale
 invariance in the numerically degenerate regime. It does not impose an exact
 constant-KL target.
 For small tilt strength, standardization approximately normalizes the
@@ -123,6 +154,10 @@ Do not treat old Grad-EM checkpoints/results as continuations of this corrected
 algorithm: their router rule differed. Config mode/eta alone do not distinguish
 these semantics, so retain the code revision with every result and start fresh
 comparisons. This patch does not add checkpoint migrations or version fields.
+Likewise, prior normalized checkpoints used the unscaled router correction;
+their config fields do not distinguish that older rule. Preserve code revisions
+and start fresh controlled comparisons rather than interpreting those resumes
+as an unchanged algorithm. Checkpoint loading/serialization itself is unchanged.
 
 ## Unified two-parameter interpolation
 
@@ -147,7 +182,8 @@ u_upstream      = u_BP     + beta  *(u_GE      - u_BP)
 
 Given each layer's incoming gradient `g`, expert signals are
 `[p + lambda*(q-p)]*g`, where `p` is the actual activation-dtype forward
-weight. Router signals are `(1-lambda)*r_BP + lambda*(a-q)/eta`. The BP term
+weight. Router signals are `(1-lambda)*r_BP + lambda*r_GE`, with
+`r_GE=(a-q)/eta` in raw mode and `r_GE=(scale/eta)*(a-q)` in std mode. The BP term
 uses the original softmax/Top-K/normalization/cast graph, preserving
 `normalize_topk=False`; the GE term retains the selected-logit softmax `a`.
 At alpha one, these parameter signals also drive the existing input-gradient
@@ -193,7 +229,7 @@ forward uses exactly the existing mixing weights.
 At lambda one, CPU backward unsorts the selected expert outputs into `[T,K,D]`,
 invokes the Stage-1 FP32 oracle, and gathers q*g back to expert-sorted order. The existing
 FC2/activation/FC1 graph receives that gradient unchanged except for casting to
-the original output dtype. It scatters `(a-q)/eta` **directly to selected logits** (cast to
+the original output dtype. It scatters `r_GE` **directly to selected logits** (cast to
 the logits dtype) and **None for mixing weights**: ordinary top-k, normalization
 and softmax gradients cannot be double-counted. The router linear remains
 connected to x, so expert and router input gradients both accumulate normally.
@@ -210,7 +246,7 @@ boundary. In backward, the ordinary output graph is differentiated only with
 respect to a detached local copy of the MoE input, producing the exact standard
 BP input VJP. The same forward's selected expert outputs and router logits are
 differentiated only with respect to MoE parameters using `q*g` and
-`(a-q)/eta`. Thus expert/router replacement gradients remain local and cannot
+`r_GE`. Thus expert/router replacement gradients remain local and cannot
 change the signal passed to an earlier block. No expert forward is repeated.
 
 This loop reference is once-differentiable. Its portable smoke configuration
@@ -250,8 +286,11 @@ backward only), besides required outputs/gradients. At T=65536,K=8 these are
 
 Normalized mode fuses its two weighted reductions and denominator floor into
 the existing expert/mixed-combine backward kernel. It computes the base softmax
-there and reuses it in the router kernel via an additional compact FP32 `[T,K]`
-buffer (2 MiB at T=65536,K=8), allocated only when router gradients are needed.
+there and uses the same register-local scale to form `(scale/eta)*(a-q)`.
+The existing compact FP32 `[T,K]` buffer now carries that complete router
+signal instead of base probabilities (2 MiB at T=65536,K=8), allocated only
+when router gradients are needed. The router kernel reads/scatters the signal;
+it does not recompute statistics, softmax, or read q again in normalized mode.
 Thus a full backward still has two softmaxes total (base and tilted), two kernel
 launches, and no additional activation-sized temporary, synchronization or
 host/device transfer. When router gradients are not needed, normalization

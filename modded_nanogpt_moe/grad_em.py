@@ -19,13 +19,14 @@ from .config import (
 
 
 @torch.no_grad()
-def normalize_grad_em_scores(scores, base_probs, normalization="none", eps=1e-6):
+def normalize_grad_em_scores(scores, base_probs, normalization="none", eps=1e-6,
+                             *, return_scale=False):
     """Return raw scores or per-token router-weighted FP32 z-scores."""
     validate_grad_em_score_normalization(normalization)
     validate_grad_em_score_norm_eps(eps)
     scores = scores.float()
     if normalization == "none":
-        return scores
+        return (scores, 1.0) if return_scale else scores
     probabilities = base_probs.float()
     # Shift the origin before the weighted mean: algebraically identical for
     # normalized probabilities, but constant scores center to EXACT zero even
@@ -34,7 +35,9 @@ def normalize_grad_em_scores(scores, base_probs, normalization="none", eps=1e-6)
     mean = (probabilities * shifted).sum(dim=-1, keepdim=True)
     centered = shifted - mean
     variance = (probabilities * centered.square()).sum(dim=-1, keepdim=True)
-    return centered / variance.sqrt().clamp_min(eps)
+    scale = variance.sqrt().clamp_min(eps)
+    normalized = centered / scale
+    return (normalized, scale) if return_scale else normalized
 
 
 def require_grad_em_device(device):
@@ -235,9 +238,10 @@ def grad_em_reference(router_logits, topk_idx, expert_outputs, grad_h, eta=0.1,
     q = softmax(selected_logits - eta * score) is detached, where score is
     <g,h_i> in raw mode and its router-weighted per-token z-score in normalized
     mode.
-    Return q*g for selected experts and
-    (a - q) / eta on selected logits, zero elsewhere, where a is the
-    selected-logit softmax. This is the gradient of KL(q.detach() || a) / eta.
+    Return q*g for selected experts and scale*(a - q)/eta on selected logits,
+    zero elsewhere, where a is the selected-logit softmax. Scale is 1 in raw
+    mode and max(weighted_std(v), eps) in normalized mode, detached along with
+    q. This is the gradient of scale*KL(q.detach() || a)/eta.
     This deliberately is NOT the derivative of the ordinary MoE forward.
     Validation is for the reference, not a GPU hot-path implementation.
     """
@@ -270,8 +274,10 @@ def grad_em_reference(router_logits, topk_idx, expert_outputs, grad_h, eta=0.1,
     v = (g * expert_outputs.float()).sum(dim=-1)
     selected_logits = logits.gather(1, topk_idx)
     a = torch.softmax(selected_logits, dim=-1)
-    responsibility_scores = normalize_grad_em_scores(
-        v, a, score_normalization, score_norm_eps)
+    responsibility_scores, scale = normalize_grad_em_scores(
+        v, a, score_normalization, score_norm_eps, return_scale=True)
     q = torch.softmax(selected_logits - eta * responsibility_scores, dim=-1)
-    grad_logits = torch.zeros_like(logits).scatter_(1, topk_idx, (a - q) / eta)
+    router_signal = ((scale / eta) * (a - q) if score_normalization == "std"
+                     else (a - q) / eta)
+    grad_logits = torch.zeros_like(logits).scatter_(1, topk_idx, router_signal)
     return GradEMResult(v, q, a, q[..., None] * g, grad_logits)
