@@ -58,6 +58,10 @@ relative; the application does not depend on the symlink's physical target.
 
 ## Training
 
+Optional auxiliary load balancing and router z-loss are documented in
+[router regularization](docs/router_regularization.md), including normalization,
+Grad-EM gradient separation, and Vista smoke commands. Both are disabled by default.
+
 ### Router optimizer ablation
 
 `[optimizers] router_optimizer = "muon"` is the default. Selecting `"adamw"`

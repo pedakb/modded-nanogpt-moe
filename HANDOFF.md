@@ -1,5 +1,32 @@
 # Current handoff
 
+## Optional router regularizers (2026-10-08, ready for review)
+
+Isolated branch `router-regularizers`, base `bdb53fc`, worktree
+`/tmp/modded-nanogpt-moe-router-reg`. Original checkout/code and production
+configs unchanged. No jobs, installs, commits or pushes.
+
+- Added independently disabled `[model] router_aux_loss_coef` and
+  `router_z_loss_coef`, FP32 objectives, separate TensorBoard metrics, and
+  legacy-zero checkpoint compatibility. Resume rejects changed coefficients.
+- A separate ordinary-BP transformer replay supplies additive regularizer
+  gradients without contaminating any upstream/global/local-BP Grad-EM signal.
+  Costs extra transformer work/memory when enabled; no replay when disabled.
+  Token means/layer means are multiplied by microbatch tokens to match summed
+  CE. Load counts are per microbatch, not pooled across an update.
+- Dirty files: README, this handoff, model/config/checkpoint/train, existing
+  diagnostics/package tests; new router_regularization module, focused tests,
+  and docs/router_regularization.md. No existing TOMLs changed.
+- New tests: 16 passed, 3 CUDA skips. Full suite with GCC/G++: 849 passed,
+  339 skipped, 7 launcher failures; all 7 reproduced on untouched base checkout.
+  `git diff --check` passes. No CUDA device visible; GPU/memory/performance
+  validation pending. No performance claim.
+- Review and Vista CUDA smoke instructions/coefficient reasoning are in
+  docs/router_regularization.md. Use original provisioned environment through
+  UV_PROJECT_ENVIRONMENT; ignored data symlink is already present here.
+  Next: review diff, run CUDA tests and BP/global/local-BP E256/K6 smokes on an
+  existing allocation only when requested. Preserve the queued BP jobs.
+
 ## Legacy config archive cleanup (2026-10-08, complete, uncommitted)
 
 Base `1f63e7c`, branch `cleanup-active-codebase`; continued on top of the

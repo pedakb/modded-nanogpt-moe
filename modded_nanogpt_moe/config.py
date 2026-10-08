@@ -47,6 +47,8 @@ DEFAULT_CONFIG = {
         "grad_em_eta": 0.1,
         "grad_em_lambda": 1.0,
         "grad_em_alpha": None,  # Omitted: global=1, local_bp=0.
+        "router_aux_loss_coef": 0.0,
+        "router_z_loss_coef": 0.0,
     },
     "training": {
         "sequence_length": 1024,
@@ -189,6 +191,13 @@ def validate_experiment_config(config, require_run_name=False):
     if config["model"]["grad_em_mode"] not in ("global", "local_bp"):
         raise ValueError("model.grad_em_mode must be 'global' or 'local_bp'")
     validate_grad_em_eta(config["model"]["grad_em_eta"])
+    for key in ("router_aux_loss_coef", "router_z_loss_coef"):
+        value = config["model"][key]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0):
+            raise ValueError(f"model.{key} must be finite and nonnegative")
+        if value and config["model"]["mlp_type"] != "moe":
+            raise ValueError(f"model.{key} requires MoE")
     validate_grad_em_lambda(config["model"]["grad_em_lambda"], config["model"]["grad_em_mode"])
     resolve_grad_em_alpha(config["model"]["grad_em_alpha"], config["model"]["grad_em_mode"])
     if (config["model"]["moe_backward"] == "grad_em"

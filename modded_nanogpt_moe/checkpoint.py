@@ -206,6 +206,8 @@ def _with_legacy_defaults(config):
         config["model"].setdefault("grad_em_lambda", 1.0)
         config["model"].setdefault("num_shared_experts", 0)
         config["model"].setdefault("shared_expert_ratio", 0.5)
+        config["model"].setdefault("router_aux_loss_coef", 0.0)
+        config["model"].setdefault("router_z_loss_coef", 0.0)
         from .config import resolve_grad_em_alpha
         config["model"]["grad_em_alpha"] = resolve_grad_em_alpha(
             config["model"].get("grad_em_alpha"), config["model"]["grad_em_mode"])

@@ -618,8 +618,17 @@ class GPT(nn.Module):
                  num_shared_experts: int = 0, shared_expert_ratio: float = 0.5,
                  moe_parameter_layout: str = "modulelist", moe_backward: str = "standard",
                  grad_em_mode: str = "global", grad_em_eta: float = 0.1, grad_em_lambda: float = 1.0,
-                 grad_em_alpha: float | None = None):
+                 grad_em_alpha: float | None = None,
+                 router_aux_loss_coef: float = 0.0, router_z_loss_coef: float = 0.0):
         super().__init__()
+        for name, value in (("router_aux_loss_coef", router_aux_loss_coef),
+                            ("router_z_loss_coef", router_z_loss_coef)):
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and nonnegative")
+            if value and mlp_type != "moe":
+                raise ValueError(f"{name} requires MoE")
+            setattr(self, name, value)
         from .config import validate_grad_em_eta, validate_grad_em_lambda, resolve_grad_em_alpha
         validate_grad_em_eta(grad_em_eta)
         validate_grad_em_lambda(grad_em_lambda, grad_em_mode)

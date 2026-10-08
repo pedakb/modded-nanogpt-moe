@@ -564,7 +564,8 @@ def test_trainer_has_only_canonical_loss_and_performance_tags():
         and isinstance(node.args[0], ast.Constant)]
     assert "perf/train_s" not in constant_tags
     assert set(constant_tags) == {
-        "metric/loss/train", "metric/loss/val", "perf/step_ms", "perf/tok_s"}
+        "metric/loss/train", "metric/loss/val", "perf/step_ms", "perf/tok_s",
+        "metric/router/aux_loss", "metric/router/z_loss", "metric/router/regularization"}
     assert constant_tags.count("metric/loss/train") == 1
     source = inspect.getsource(train.main)
     assert 'extra_scalars={"metric/loss/train": train_loss}' in source

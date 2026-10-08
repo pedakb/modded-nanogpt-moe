@@ -459,7 +459,9 @@ def main(argv=None):
                 grad_em_mode=model_config["grad_em_mode"],
                 grad_em_eta=model_config["grad_em_eta"],
                 grad_em_lambda=model_config["grad_em_lambda"],
-                grad_em_alpha=model_config["grad_em_alpha"])
+                grad_em_alpha=model_config["grad_em_alpha"],
+                router_aux_loss_coef=model_config["router_aux_loss_coef"],
+                router_z_loss_coef=model_config["router_z_loss_coef"])
     assert model.hidden_dim == hidden_dim
     gmm_implementation = (model.blocks[0].mlp.gmm_implementation if mlp_type == "moe" else "n/a")
     configured_shared_hidden_dim = (
@@ -828,6 +830,9 @@ def main(argv=None):
                     step + 1 if repro_diagnostics_dir and step in (0, 1) else None)
                 diagnostic_losses = [] if diagnostic_update is not None else None
                 tensorboard_losses = [] if writer is not None or guard.enabled else None
+                aux_coef = model_config["router_aux_loss_coef"]
+                z_coef = model_config["router_z_loss_coef"]
+                regularization_metrics = []
                 collect_tb = tb_diagnostics is not None and tb_diagnostics.due(step + 1)
                 with tb_diagnostics.capture_routing() if collect_tb else nullcontext():
                     for i in range(len(inputs) // mbs):
@@ -840,7 +845,27 @@ def main(argv=None):
                                 tensorboard_losses.append(loss.detach())
                         with nsys_range(nsys_capture_active, f"backward.microbatch_{i}"):
                             loss.backward()
+                            if aux_coef or z_coef:
+                                from .router_regularization import model_router_losses
+                                aux_loss, z_loss = model_router_losses(
+                                    model, inputs[i*mbs:(i+1)*mbs])
+                                regularization = aux_coef * aux_loss + z_coef * z_loss
+                                # LM CE is summed, and gradients are summed across
+                                # microbatches/ranks. Convert token/layer means to
+                                # the same token-sum scale without changing CE.
+                                (regularization * targets[i*mbs:(i+1)*mbs].numel()).backward()
+                                if writer is not None:
+                                    regularization_metrics.append(torch.stack([
+                                        aux_loss.detach(), z_loss.detach(),
+                                        regularization.detach()]))
                         del loss
+                if writer is not None and regularization_metrics:
+                    metrics = torch.stack(regularization_metrics).mean(0)
+                    if aux_coef:
+                        writer.add_scalar("metric/router/aux_loss", metrics[0], step + 1)
+                    if z_coef:
+                        writer.add_scalar("metric/router/z_loss", metrics[1], step + 1)
+                    writer.add_scalar("metric/router/regularization", metrics[2], step + 1)
                 for name, p in model.named_parameters():
                     assert p.grad is not None, name
                     dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
