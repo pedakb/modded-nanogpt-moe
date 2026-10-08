@@ -101,10 +101,13 @@ class LocalBPGradEM(torch.autograd.Function):
                     (selected_outputs, logits), inner_x, signals(ctx.boundary_mix),
                     retain_graph=True, create_graph=False)
 
-        parameter_grads = torch.autograd.grad(
-            (selected_outputs, logits), parameters,
-            parameter_signals,
-            create_graph=False, allow_unused=True)
+        parameter_grads = (
+            torch.autograd.grad(
+                (selected_outputs, logits), parameters,
+                parameter_signals,
+                create_graph=False, allow_unused=True)
+            if parameters else ()
+        )
         parameter_grads = tuple(
             torch.zeros_like(parameter) if gradient is None else gradient
             for parameter, gradient in zip(parameters, parameter_grads))

@@ -4,6 +4,15 @@ Scientific settings live in these TOMLs; machine roots remain environment
 settings. The canonical standard-BP references are `dense_baseline.toml`,
 `moe_e8k2_r2.toml`, and `moe_e64k8_r0.5.toml`.
 
+## Shared-expert comparison
+
+`moe_e256k6_r0.5_shared_r0.5.toml` and `moe_e256k6_r0.5.toml` are the
+standard-BP E256/K6 comparison. Both use packed routed experts of width 384;
+the first additionally enables one dense shared expert of width 384. The
+shared expert runs for every token and is not part of routing or Grad-EM
+responsibilities. Their distinct run names give them separate TensorBoard and
+checkpoint directories under the normal Vista roots.
+
 ## Main Grad-EM comparison
 
 All entries below use grouped GEMM with packed experts, the Muon router, no

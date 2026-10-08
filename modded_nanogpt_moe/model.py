@@ -243,7 +243,9 @@ def combine_expert_outputs(out_sorted: Tensor, topk_weights: Tensor, order: Tens
 
 
 class MoE(nn.Module):
-    """Top-k routed sparse MoE. Each expert is an MLP identical in architecture,
+    """Top-k routed sparse MoE with an optional always-on dense shared MLP.
+
+    Each routed expert is an MLP identical in architecture,
     init, and dtype behavior to the dense MLP above. num_experts=1, top_k=1 reduces
     exactly to a single MLP: softmax over one logit is always 1, so expert 0 receives
     every token with routing weight 1.
@@ -277,6 +279,7 @@ class MoE(nn.Module):
     production nn.ModuleList instead of a separate ParameterList."""
     def __init__(self, dim: int, num_experts: int, top_k: int, normalize_topk: bool = True,
                  moe_backend: str = "loop", hidden_dim: int | None = None,
+                 shared_expert_hidden_dim: int | None = None,
                  moe_parameter_layout: str = "modulelist", moe_backward: str = "standard",
                  grad_em_mode: str = "global", grad_em_eta: float = 0.1, grad_em_lambda: float = 1.0,
                  grad_em_alpha: float | None = None):
@@ -307,6 +310,8 @@ class MoE(nn.Module):
         self.normalize_topk = normalize_topk
         self.moe_backend = moe_backend
         self.moe_parameter_layout = moe_parameter_layout
+        self.num_shared_experts = int(shared_expert_hidden_dim is not None)
+        self.shared_expert_hidden_dim = shared_expert_hidden_dim
         self._routing_diagnostics = None  # Transient observer, never checkpointed.
         # Offline-only observer. Normal training leaves this unset, so no
         # diagnostic tensors or graph references are created on its hot path.
@@ -331,6 +336,10 @@ class MoE(nn.Module):
                     self.fc_bias[index].copy_(expert.fc.bias)
                     self.proj_weight[index].copy_(expert.proj.weight.mT)
                     self.proj_bias[index].copy_(expert.proj.bias)
+        self.shared_expert = (
+            MLP(dim, shared_expert_hidden_dim)
+            if shared_expert_hidden_dim is not None else None
+        )
         self.gmm_implementation = implementation_from_environment() if moe_backend == "grouped_gemm" else "extension"
         self._gmm = None
         if moe_backend == "grouped_gemm" and self.gmm_implementation == "extension":
@@ -363,18 +372,26 @@ class MoE(nn.Module):
         self._grad_em_alpha = value
 
     def forward(self, x: Tensor):
+        # The shared branch is deliberately outside every routed Grad-EM
+        # boundary. It is absent from routing responsibilities and receives
+        # ordinary autograd through both its parameters and the original x.
+        shared = self.shared_expert(x) if self.shared_expert is not None else None
         if (self.moe_backward == "grad_em" and self.grad_em_mode == "local_bp"
                 and self.grad_em_lambda != 0 and self.moe_backend == "loop"):
             from .grad_em import LocalBPGradEM
-            parameters = tuple(parameter for parameter in self.parameters()
-                               if parameter.requires_grad)
-            return LocalBPGradEM.apply(x, self, *parameters)
+            parameters = tuple(
+                parameter for name, parameter in self.named_parameters()
+                if parameter.requires_grad and not name.startswith("shared_expert."))
+            routed = LocalBPGradEM.apply(x, self, *parameters)
+            return routed if shared is None else routed + shared
         if self.moe_backward == "grad_em":
             from .grad_em import require_grad_em_device
             require_grad_em_device(x.device)
         if self.moe_backend == "grouped_gemm":
-            return self._forward_grouped_gemm(x)
-        return self._forward_loop(x)
+            routed = self._forward_grouped_gemm(x)
+        else:
+            routed = self._forward_loop(x)
+        return routed if shared is None else routed + shared
 
     def _forward_loop(self, x: Tensor, *, return_local_components=False):
         B, T, D = x.shape
@@ -569,6 +586,7 @@ class Block(nn.Module):
     def __init__(self, dim: int, mlp_type: str = "dense", num_experts: int = 1,
                  top_k: int = 1, normalize_topk: bool = True, moe_backend: str = "loop",
                  hidden_dim: int | None = None, moe_parameter_layout: str = "modulelist",
+                 shared_expert_hidden_dim: int | None = None,
                  moe_backward: str = "standard", grad_em_mode: str = "global",
                  grad_em_eta: float = 0.1, grad_em_lambda: float = 1.0,
                  grad_em_alpha: float | None = None):
@@ -579,6 +597,7 @@ class Block(nn.Module):
         elif mlp_type == "moe":
             self.mlp = MoE(dim, num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
                             moe_backend=moe_backend, hidden_dim=hidden_dim,
+                            shared_expert_hidden_dim=shared_expert_hidden_dim,
                             moe_parameter_layout=moe_parameter_layout,
                             moe_backward=moe_backward, grad_em_mode=grad_em_mode,
                             grad_em_eta=grad_em_eta, grad_em_lambda=grad_em_lambda, grad_em_alpha=grad_em_alpha)
@@ -596,6 +615,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, mlp_type: str = "dense",
                  num_experts: int = 1, top_k: int = 1, normalize_topk: bool = True,
                  moe_backend: str = "loop", mlp_ratio: float = 4,
+                 num_shared_experts: int = 0, shared_expert_ratio: float = 0.5,
                  moe_parameter_layout: str = "modulelist", moe_backward: str = "standard",
                  grad_em_mode: str = "global", grad_em_eta: float = 0.1, grad_em_lambda: float = 1.0,
                  grad_em_alpha: float | None = None):
@@ -610,20 +630,33 @@ class GPT(nn.Module):
             raise ValueError("grad_em_mode must be 'global' or 'local_bp'")
         if moe_backward == "grad_em" and mlp_type != "moe":
             raise ValueError("Grad-EM requires MoE")
+        if (isinstance(num_shared_experts, bool) or not isinstance(num_shared_experts, int)
+                or num_shared_experts not in (0, 1)):
+            raise ValueError("num_shared_experts must be 0 or 1")
+        if num_shared_experts and mlp_type != "moe":
+            raise ValueError("shared experts require mlp_type='moe'")
         if moe_parameter_layout not in ("modulelist", "packed"):
             raise ValueError(f"unknown moe_parameter_layout: {moe_parameter_layout!r}")
         if moe_parameter_layout == "packed" and (mlp_type != "moe" or moe_backend != "grouped_gemm"):
             raise ValueError("packed parameters require grouped_gemm MoE")
         hidden_dim = resolve_mlp_hidden_dim(model_dim, mlp_ratio)
+        resolved_shared_expert_hidden_dim = resolve_mlp_hidden_dim(
+            model_dim, shared_expert_ratio)
+        shared_expert_hidden_dim = (
+            resolved_shared_expert_hidden_dim if num_shared_experts else None)
         self.model_dim = model_dim
         self.mlp_ratio = mlp_ratio
         self.hidden_dim = hidden_dim
+        self.num_shared_experts = num_shared_experts
+        self.shared_expert_ratio = shared_expert_ratio
+        self.shared_expert_hidden_dim = shared_expert_hidden_dim
         self.moe_parameter_layout = moe_parameter_layout
         self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
         self.blocks = nn.ModuleList([
             Block(model_dim, mlp_type=mlp_type, num_experts=num_experts, top_k=top_k,
                   normalize_topk=normalize_topk, moe_backend=moe_backend,
                   hidden_dim=hidden_dim, moe_parameter_layout=moe_parameter_layout,
+                  shared_expert_hidden_dim=shared_expert_hidden_dim,
                   moe_backward=moe_backward, grad_em_mode=grad_em_mode,
                   grad_em_eta=grad_em_eta, grad_em_lambda=grad_em_lambda, grad_em_alpha=grad_em_alpha)
             for _ in range(num_layers)

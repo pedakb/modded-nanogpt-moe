@@ -326,6 +326,8 @@ def test_dense_example_config_resolves_current_training_defaults():
         "mlp_ratio": 4,
         "num_experts": 1,
         "top_k": 1,
+        "num_shared_experts": 0,
+        "shared_expert_ratio": 0.5,
         "normalize_topk": True,
         "moe_backend": "loop",
         "moe_parameter_layout": "modulelist",

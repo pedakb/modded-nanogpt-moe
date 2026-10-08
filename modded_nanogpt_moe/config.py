@@ -37,6 +37,8 @@ DEFAULT_CONFIG = {
         "mlp_ratio": 4.0,
         "num_experts": 1,
         "top_k": 1,
+        "num_shared_experts": 0,
+        "shared_expert_ratio": 0.5,
         "normalize_topk": True,
         "moe_backend": "loop",
         "moe_parameter_layout": "modulelist",
@@ -168,6 +170,11 @@ def validate_experiment_config(config, require_run_name=False):
 
     for key in ("vocab_size", "num_layers", "model_dim", "num_experts", "top_k"):
         _positive_int(config, "model", key)
+    num_shared_experts = config["model"]["num_shared_experts"]
+    if (isinstance(num_shared_experts, bool)
+            or not isinstance(num_shared_experts, int)
+            or num_shared_experts not in (0, 1)):
+        raise ValueError("model.num_shared_experts must be 0 or 1")
     for key in (
         "sequence_length", "global_batch_tokens", "microbatch_sequences",
         "total_steps",
@@ -203,6 +210,17 @@ def validate_experiment_config(config, require_run_name=False):
             or not math.isfinite(hidden_dim) or not float(hidden_dim).is_integer()):
         raise ValueError(
             "model.mlp_ratio must be positive and produce an integer hidden width")
+    shared_ratio = config["model"]["shared_expert_ratio"]
+    shared_hidden_dim = config["model"]["model_dim"] * shared_ratio
+    if (isinstance(shared_ratio, bool)
+            or not isinstance(shared_ratio, (int, float))
+            or not math.isfinite(shared_ratio) or shared_ratio <= 0
+            or not math.isfinite(shared_hidden_dim)
+            or not float(shared_hidden_dim).is_integer()):
+        raise ValueError(
+            "model.shared_expert_ratio must be positive and produce an integer hidden width")
+    if num_shared_experts and config["model"]["mlp_type"] != "moe":
+        raise ValueError("shared experts require model.mlp_type='moe'")
     if config["model"]["mlp_type"] == "moe" and (
             config["model"]["top_k"] > config["model"]["num_experts"]):
         raise ValueError("model.top_k cannot exceed model.num_experts")

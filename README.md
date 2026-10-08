@@ -26,6 +26,12 @@ The [config catalog](configs/README.md) lists the standard BP, global Grad-EM,
 and local-BP comparison configs, resolved run identities, and Vista run-length
 and TensorBoard behavior.
 
+MoE configs may enable one dense shared expert with
+`num_shared_experts = 1` and set its width using `shared_expert_ratio`. It is
+added to the routed result for every token, uses ordinary backpropagation in
+all backward modes, and is optimized like the existing dense MLP rather than
+as a packed routed expert.
+
 ## Environment
 
 Create the environment appropriate for the current platform with `uv`. Cluster

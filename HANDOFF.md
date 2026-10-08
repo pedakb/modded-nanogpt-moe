@@ -1,5 +1,31 @@
 # Current handoff
 
+## Optional shared expert (2026-10-08, implemented locally, uncommitted)
+
+Base `356d6a8`, branch `cleanup-active-codebase`. No installs, commits, pushes,
+remote jobs, or full training runs. The worktree was clean before this task.
+
+- MoE can enable one dense shared `MLP` with an independently resolved width.
+  Its output is added outside routed combine/Grad-EM autograd boundaries, so it
+  always uses ordinary BP while routed expert/router mathematics are unchanged.
+  Disabled defaults preserve parameter keys, initialization/RNG, and execution.
+- Config fields are `model.num_shared_experts` (0/1, default 0) and
+  `model.shared_expert_ratio` (default 0.5). Shared 2D weights follow dense Muon
+  ownership; 1D biases use AdamW. Legacy checkpoints default to shared-disabled.
+- Added standard-BP E256/K6/r0.5 configs with and without one r0.5 shared expert:
+  `configs/moe_e256k6_r0.5_shared_r0.5.toml` and
+  `configs/moe_e256k6_r0.5.toml`. Both retain the production schedule/settings.
+- Focused shared tests: 13 passed. Full local suite: 788 passed, 335 skipped,
+  18 unrelated existing failures (17 Vista launcher extraction/Bash issues and
+  one router test requiring a scoped grouped-GEMM implementation override; that
+  router test passes alone with `MOE_GMM_IMPLEMENTATION=torch`). CUDA/GH200
+  kernel execution, production-memory feasibility, and a Vista smoke remain
+  pending because this host has no CUDA. `git diff --check` passes.
+- Task files: model.py, grad_em.py, config.py, train.py, checkpoint.py,
+  test_shared_expert.py, test_package.py, the two configs, README/config catalog,
+  and this handoff. Next: review, then run focused CUDA tests and a `--smoke
+  --steps 2` E256/K6 shared config on an existing Vista allocation.
+
 ## Mixed local-BP optimization (2026-09-29, validated, uncommitted)
 
 Base `1928123`, branch `cleanup-active-codebase`. Complete report, numerical

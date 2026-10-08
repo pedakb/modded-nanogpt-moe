@@ -452,6 +452,8 @@ def main(argv=None):
                 num_layers=model_config["num_layers"], model_dim=model_dim, mlp_type=mlp_type,
                 num_experts=num_experts, top_k=top_k, normalize_topk=normalize_topk,
                 moe_backend=moe_backend, mlp_ratio=mlp_ratio,
+                num_shared_experts=model_config["num_shared_experts"],
+                shared_expert_ratio=model_config["shared_expert_ratio"],
                 moe_parameter_layout=model_config["moe_parameter_layout"],
                 moe_backward=model_config["moe_backward"],
                 grad_em_mode=model_config["grad_em_mode"],
@@ -460,12 +462,18 @@ def main(argv=None):
                 grad_em_alpha=model_config["grad_em_alpha"])
     assert model.hidden_dim == hidden_dim
     gmm_implementation = (model.blocks[0].mlp.gmm_implementation if mlp_type == "moe" else "n/a")
+    configured_shared_hidden_dim = (
+        int(model_dim * model_config["shared_expert_ratio"])
+        if model_config["num_shared_experts"] else None
+    )
     print0(
         f"configuration: model_dim={model.model_dim} mlp_ratio={float(model.mlp_ratio):g} "
         f"hidden_dim={model.hidden_dim} model_type={mlp_type} moe_backend={moe_backend} "
         f"moe_parameter_layout={model.moe_parameter_layout} "
         f"gmm_implementation={gmm_implementation} "
         f"E={num_experts} k={top_k} microbatch={mbs} "
+        f"shared_experts={model_config['num_shared_experts']} "
+        f"shared_hidden_dim={configured_shared_hidden_dim} "
         f"global_batch={batch_size} accumulation_count={accumulation_count} "
         f"trial_count={num_trials}",
         console=True,
@@ -575,6 +583,8 @@ def main(argv=None):
                 "hidden_dim": model.hidden_dim,
                 "num_experts": num_experts,
                 "top_k": top_k,
+                "num_shared_experts": model_config["num_shared_experts"],
+                "shared_expert_ratio": float(model_config["shared_expert_ratio"]),
                 "normalize_topk": normalize_topk,
                 "moe_backend": moe_backend,
                 "moe_backward": model_config["moe_backward"],
