@@ -7,7 +7,7 @@ cd "$repo_root"
 module load gcc/11.2.0
 module load cuda/12.8
 
-config_path="${1:-configs/dense_baseline.toml}"
+config_path="${1:-configs/baselines/dense.toml}"
 export TB_SYSTEM="${TB_SYSTEM:-ls6}"
 if [[ -z "${DATA_ROOT+x}" && -n "${SCRATCH:-}" ]]; then
     export DATA_ROOT="$SCRATCH/modded-nanogpt-moe"

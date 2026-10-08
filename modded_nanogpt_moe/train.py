@@ -466,6 +466,14 @@ def main(argv=None):
         int(model_dim * model_config["shared_expert_ratio"])
         if model_config["num_shared_experts"] else None
     )
+    if mlp_type == "dense":
+        active_ffn_expansion = float(mlp_ratio)
+    else:
+        active_ffn_expansion = (
+            top_k * float(mlp_ratio)
+            + model_config["num_shared_experts"]
+            * float(model_config["shared_expert_ratio"])
+        )
     print0(
         f"configuration: model_dim={model.model_dim} mlp_ratio={float(model.mlp_ratio):g} "
         f"hidden_dim={model.hidden_dim} model_type={mlp_type} moe_backend={moe_backend} "
@@ -474,6 +482,7 @@ def main(argv=None):
         f"E={num_experts} k={top_k} microbatch={mbs} "
         f"shared_experts={model_config['num_shared_experts']} "
         f"shared_hidden_dim={configured_shared_hidden_dim} "
+        f"active_ffn_expansion={active_ffn_expansion:g} "
         f"global_batch={batch_size} accumulation_count={accumulation_count} "
         f"trial_count={num_trials}",
         console=True,

@@ -293,8 +293,9 @@ def test_shared_config_validation_and_legacy_checkpoint_compatibility():
     validate_checkpoint_config(checkpoint, current)
 
 
-def test_e256k6_configs_resolve_target_geometry_and_distinct_runs(cpu_grouped_gemm):
-    root = Path(__file__).resolve().parents[1] / "configs"
+def test_archived_e256k6_prototypes_remain_loadable(cpu_grouped_gemm):
+    root = (Path(__file__).resolve().parents[1] / "configs" / "archive"
+            / "prototypes")
     shared = load_experiment_config(root / "moe_e256k6_r0.5_shared_r0.5.toml")
     unshared = load_experiment_config(root / "moe_e256k6_r0.5.toml")
     assert shared["run_name"] != unshared["run_name"]

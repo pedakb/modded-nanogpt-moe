@@ -161,7 +161,7 @@ differentiated only with respect to MoE parameters using `q*g` and
 change the signal passed to an earlier block. No expert forward is repeated.
 
 This loop reference is once-differentiable. Its portable smoke configuration
-remains `configs/moe_e8k2_r2_gradem_local_bp.toml`.
+remains `configs/archive/grad_em/moe_e8k2_r2_gradem_local_bp.toml`.
 
 The grouped implementation records the existing Grad-EM parameter graph on
 detached inputs. Input-only forward identities reuse the router logits and
@@ -169,7 +169,7 @@ expert activations to supply a separate standard-BP input VJP, with direct
 dgrad-only backend calls and the existing softmax/top-k/normalization backward.
 There is no repeated expert forward or wgrad. See
 [`grouped_local_bp.md`](grouped_local_bp.md) for the derivation, precise costs,
-validation results, and `configs/moe_e8k2_r2_gradem_local_bp_packed.toml`.
+validation results, and `configs/archive/grad_em/moe_e8k2_r2_gradem_local_bp_packed.toml`.
 
 ## CUDA implementation
 
@@ -232,7 +232,7 @@ grad_em_config="$(mktemp /tmp/moe-grad-em-XXXXXX.toml)"
 uv run --no-sync python - "$grad_em_config" <<'PY'
 import sys
 from pathlib import Path
-text = Path("configs/moe_e64k8_r0.5.toml").read_text()
+text = Path("configs/archive/legacy/moe_e64k8_r0.5.toml").read_text()
 assert 'moe_backward' not in text and 'grad_em_eta' not in text
 text = text.replace('run_name = "moe-e64k8-r0.5"', 'run_name = "moe-e64k8-r0.5-grad-em"')
 text = text.replace('[model]\n', '[model]\nmoe_backward = "grad_em"\ngrad_em_eta = 0.1\n')
@@ -247,7 +247,7 @@ scripts/vista/train.sh --smoke --steps 5 "$grad_em_config" 2>&1 | tee "$log_dir/
 grep -E 'val_loss|step:|mem_alloc_peak|mem_reserved_peak|Traceback|Error' "$log_dir"/smoke-*.log
 
 BENCHMARK_WARMUP_UPDATES=10 BENCHMARK_MEASURED_UPDATES=30 \
-  scripts/vista/benchmark.sh configs/moe_e64k8_r0.5.toml 2>&1 | tee "$log_dir/standard.log"
+  scripts/vista/benchmark.sh configs/archive/legacy/moe_e64k8_r0.5.toml 2>&1 | tee "$log_dir/standard.log"
 BENCHMARK_WARMUP_UPDATES=10 BENCHMARK_MEASURED_UPDATES=30 \
   scripts/vista/benchmark.sh "$grad_em_config" 2>&1 | tee "$log_dir/grad-em.log"
 grep -E 'model_dim=|gmm_implementation=|warmup_updates=|ms/update=|tokens/sec=|peak_.*GiB=' \

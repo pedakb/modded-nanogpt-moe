@@ -194,7 +194,8 @@ def test_invalid_eta_rejected_by_reference_and_config(eta):
         validate_experiment_config(config)
 
 
-@pytest.mark.parametrize("path", sorted((Path(__file__).resolve().parents[1] / "configs").glob("*.toml")))
+@pytest.mark.parametrize(
+    "path", sorted((Path(__file__).resolve().parents[1] / "configs").rglob("*.toml")))
 def test_existing_configs_have_valid_backward_configuration(path):
     config = load_experiment_config(path)
     assert config["model"]["moe_backward"] in ("standard", "grad_em")

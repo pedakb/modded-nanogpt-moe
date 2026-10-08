@@ -150,7 +150,8 @@ def test_packed_forward_uses_storage_without_stacking(cpu_gmm, monkeypatch):
 ])
 def test_packed_config_and_optimizer_assignment(cpu_gmm, filename, run_name):
     root = Path(__file__).resolve().parents[1]
-    config = load_experiment_config(root / "configs" / filename)
+    config = load_experiment_config(
+        root / "configs" / "archive" / "legacy" / filename)
     assert config["run_name"] == run_name
     assert config["model"]["moe_parameter_layout"] == "packed"
     assert config["diagnostics"]["scalar_interval"] == 25

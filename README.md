@@ -83,11 +83,13 @@ router_optimizer = "adamw"
 router_adamw_lr = 0.003
 ```
 
-`configs/moe_e64k8_r0.5_gradem_eta0.01_router_adamw.toml` supplies the full
-E64/K8 packed experiment, with a unique run name, 3250-update horizon and
-checkpoint interval 50. The corresponding dedicated-LR experiment is
-`configs/moe_e64k8_r0.5_gradem_eta0.01_router_adamw_lr0.003.toml`. For a
-500-update prefix, use `scripts/vista/train.sh --steps 500 CONFIG`; normal
+The historical router ablations are archived at
+`configs/archive/router_ablations/moe_e64k8_r0.5_gradem_eta0.01_router_adamw.toml`
+and
+`configs/archive/router_ablations/moe_e64k8_r0.5_gradem_eta0.01_router_adamw_lr0.003.toml`.
+They retain their unique run names, 3250-update horizons, and checkpoint
+interval 50. For a 500-update prefix, use
+`scripts/vista/train.sh --steps 500 CONFIG`; normal
 TensorBoard logging and checkpointing remain enabled. Do not use
 `TRAIN_STEPS_OVERRIDE=500` (changes the schedule). Vista package launches
 need `MOE_GMM_IMPLEMENTATION=torch` scoped to the training process.
@@ -99,18 +101,24 @@ setting without changing their grouping.
 
 ### Launching training
 
-Run from the repository root. A single-GPU dense baseline is:
+Run from the repository root. The active BP baselines and architecture studies
+are under `configs/baselines/` and `configs/moe_architectures/`; see
+[the config catalog](configs/README.md) for widths, active expansion, parameter
+counts, and the archive policy. A
+single-GPU active dense baseline is:
 
 ```bash
 uv run --no-sync torchrun \
   --standalone \
   --nproc_per_node=1 \
   --module modded_nanogpt_moe.train \
-  --config configs/dense_baseline.toml
+  --config configs/baselines/dense.toml
 ```
 
-The production comparison uses dense ratio 4, E8/K2 ratio 2, and E64/K8 ratio
-0.5. Both MoE configs use grouped GEMM with packed experts. All three share
+The older canonical comparison uses dense ratio 4, E8/K2 ratio 2, and E64/K8
+ratio 0.5. Its byte-identical TOMLs remain available under
+`configs/archive/legacy/` for previous experiments and checkpoint resumes. Both
+MoE configs use grouped GEMM with packed experts. All three share
 D=768, 12 layers, 3250 updates, seed 1234, a 524288-token global batch,
 microbatch 64, 10485760 validation tokens per evaluation, diagnostics every 25
 updates, and checkpoints every 250 updates. Evaluation runs every 125 updates,
@@ -123,7 +131,7 @@ uv run --no-sync torchrun \
   --standalone \
   --nproc_per_node=1 \
   --module modded_nanogpt_moe.train \
-  --config configs/moe_e8k2_r2.toml
+  --config configs/archive/legacy/moe_e8k2_r2.toml
 ```
 
 Vista machine setup is reusable without selecting any experiment state:
@@ -144,15 +152,16 @@ GH200 training and breaks CPU unit tests. The Vista training launchers scope it
 only to the trainer process.
 
 The Vista launcher is the single entry point for both current-node runs and
-Slurm submissions. It defaults to the production E64/K8 config when no path is
-supplied. Short runs stay on an already allocated node:
+Slurm submissions. It defaults to the active matrix E64/K8 config when no path
+is supplied. Nested config paths are accepted. Short runs stay on an already
+allocated node:
 
 ```bash
-scripts/vista/train.sh --smoke --steps 2 configs/moe_e64k8_r0.5.toml
-scripts/vista/train.sh --steps 30 configs/moe_e64k8_r0.5.toml
-scripts/vista/train.sh --steps 100 configs/moe_e64k8_r0.5.toml
-scripts/vista/train.sh configs/moe_e64k8_r0.5.toml
-scripts/vista/train.sh configs/moe_e8k2_r2.toml
+scripts/vista/train.sh --smoke --steps 2 configs/baselines/moe_e64k8.toml
+scripts/vista/train.sh --steps 30 configs/baselines/moe_e64k8.toml
+scripts/vista/train.sh --steps 100 configs/baselines/moe_e64k8.toml
+scripts/vista/train.sh configs/baselines/moe_e64k8.toml
+scripts/vista/train.sh configs/archive/legacy/moe_e8k2_r2.toml
 ```
 
 It resolves the repository root from its location, uses that root as
@@ -173,16 +182,15 @@ behavior is unchanged.
 Submit one config by adding `--submit`:
 
 ```bash
-scripts/vista/train.sh --submit configs/moe_e64k8_r0.5.toml
+scripts/vista/train.sh --submit configs/baselines/moe_e64k8.toml
 ```
 
 Multiple configs run sequentially in the supplied order inside one allocation:
 
 ```bash
 scripts/vista/train.sh --submit \
-  configs/dense_baseline.toml \
-  configs/moe_e8k2_r2.toml \
-  configs/moe_e64k8_r0.5.toml
+  configs/baselines/dense.toml \
+  configs/baselines/moe_e64k8.toml
 ```
 
 `train.sh --submit` submits the same script in a non-recursive worker mode. It
@@ -193,7 +201,7 @@ Slurm settings with `--time`, `--job-name`, and `--account`, for example:
 scripts/vista/train.sh --submit \
   --job-name dense-moe-comparison --account YOUR_ALLOCATION --time 06:00:00 \
   --sbatch-arg=--partition=gh \
-  configs/dense_baseline.toml configs/moe_e8k2_r2.toml configs/moe_e64k8_r0.5.toml
+  configs/baselines/dense.toml configs/baselines/moe_e64k8.toml
 ```
 
 Use repeatable `--sbatch-arg=--option=value` (or `--sbatch-arg --flag`) for other
@@ -216,7 +224,7 @@ is kept at
 For optional Slurm email notifications, set `SLURM_MAIL_USER` for submission:
 
 ```bash
-SLURM_MAIL_USER="you@example.com" scripts/vista/train.sh --submit configs/moe_e8k2_r2.toml
+SLURM_MAIL_USER="you@example.com" scripts/vista/train.sh --submit configs/archive/legacy/moe_e8k2_r2.toml
 ```
 
 A nonempty value adds `--mail-user` and `--mail-type=ALL`; unset/empty adds no
@@ -244,7 +252,7 @@ TOML cadence for every config in one invocation when needed:
 ```bash
 scripts/vista/train.sh --submit \
   --checkpoint-interval 250 \
-  configs/moe_e64k8_r0.5.toml
+  configs/archive/legacy/moe_e64k8_r0.5.toml
 ```
 
 After a failure, resubmit only the unfinished configs. To resume the first one,
@@ -254,8 +262,8 @@ pass its checkpoint explicitly; `--resume` never applies to later configs:
 checkpoint_dir="$STOCKYARD/checkpoints/modded-nanogpt-moe/moe-e8k2-r2"
 scripts/vista/train.sh --submit \
   --resume "$checkpoint_dir/latest.pt" \
-  configs/moe_e8k2_r2.toml \
-  configs/moe_e64k8_r0.5.toml
+  configs/archive/legacy/moe_e8k2_r2.toml \
+  configs/archive/legacy/moe_e64k8_r0.5.toml
 ```
 
 Each successful save retains one `step_NNNNNN.pt` payload. `latest.pt` and
@@ -278,7 +286,7 @@ TensorBoard run directories are not migrated or overwritten.
 The LS6 launcher remains available as before:
 
 ```bash
-scripts/ls6/train.sh configs/moe_e8k2_r2.toml
+scripts/ls6/train.sh configs/archive/legacy/moe_e8k2_r2.toml
 ```
 
 TensorBoard events are written under:

@@ -304,9 +304,9 @@ def test_training_benchmark_settings_and_summary_are_cpu_testable():
 
 def test_dense_example_config_resolves_current_training_defaults():
     repository_root = Path(__file__).resolve().parents[1]
-    config = load_experiment_config(repository_root / "configs/dense_baseline.toml")
+    config = load_experiment_config(repository_root / "configs/archive/legacy/dense_baseline.toml")
     grouped_config = load_experiment_config(
-        repository_root / "configs/moe_e8k2_r2.toml")
+        repository_root / "configs/archive/legacy/moe_e8k2_r2.toml")
 
     assert config["run_name"] == "dense-baseline"
     assert config["num_trials"] == 1
@@ -356,9 +356,9 @@ def test_dense_example_config_resolves_current_training_defaults():
 def test_olmoe_style_production_config_changes_only_controlled_geometry():
     repository_root = Path(__file__).resolve().parents[1]
     intended_reference = load_experiment_config(
-        repository_root / "configs/moe_e8k2_r2.toml")
+        repository_root / "configs/archive/legacy/moe_e8k2_r2.toml")
     experiment = load_experiment_config(
-        repository_root / "configs/moe_e64k8_r0.5.toml")
+        repository_root / "configs/archive/legacy/moe_e64k8_r0.5.toml")
 
     intended_reference["run_name"] = "moe-e64k8-r0.5"
     intended_reference["model"] = {
@@ -425,7 +425,7 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path, steps, smok
     environment["CXX"] = "/stale/cxx"
     environment["CUDAHOSTCXX"] = "/stale/cuda-host-cxx"
 
-    config_path = repository_root / "configs/moe_e64k8_r0.5_gradem_local_bp_eta0.01.toml"
+    config_path = repository_root / "configs/archive/grad_em/moe_e64k8_r0.5_gradem_local_bp_eta0.01.toml"
     step_arguments = [] if steps is None else ["--steps", str(steps)]
     if smoke:
         step_arguments.insert(0, "--smoke")
@@ -476,8 +476,8 @@ def test_vista_launcher_scopes_machine_and_run_environment(tmp_path, steps, smok
          "cannot be combined with checkpoint or resume options"),
         (["--steps", "1", "--resume", "/unused/checkpoint.pt"],
          "cannot be combined with checkpoint or resume options"),
-        (["--steps", "1", "configs/dense_baseline.toml",
-          "configs/moe_e8k2_r2.toml"], "--steps requires exactly one config"),
+        (["--steps", "1", "configs/archive/legacy/dense_baseline.toml",
+          "configs/archive/legacy/moe_e8k2_r2.toml"], "--steps requires exactly one config"),
     ],
 )
 def test_vista_launcher_rejects_invalid_step_options(arguments, message):
@@ -520,7 +520,7 @@ def test_vista_launcher_submits_itself_as_nonrecursive_worker(tmp_path, mail_use
             "bash", str(launcher), "--submit", "--time", "08:00:00",
             "--job-name", "dense-moe comparison", "--account", "allocation",
             "--sbatch-arg=--partition=gh", "--sbatch-arg", "--exclusive",
-            "configs/dense_baseline.toml", "configs/moe_e8k2_r2.toml",
+            "configs/archive/legacy/dense_baseline.toml", "configs/archive/legacy/moe_e8k2_r2.toml",
         ],
         cwd=tmp_path,
         env=environment,
@@ -536,8 +536,8 @@ def test_vista_launcher_submits_itself_as_nonrecursive_worker(tmp_path, mail_use
         "--worker-repo-root",
         str(repository_root),
         "--",
-        str(repository_root / "configs/dense_baseline.toml"),
-        str(repository_root / "configs/moe_e8k2_r2.toml"),
+        str(repository_root / "configs/archive/legacy/dense_baseline.toml"),
+        str(repository_root / "configs/archive/legacy/moe_e8k2_r2.toml"),
     ]
 
 
@@ -575,7 +575,7 @@ def test_vista_worker_uses_submit_side_root_when_slurm_copies_script(tmp_path):
         [
             "bash", str(spool_script), "--worker", "--worker-repo-root",
             str(repository_root), "--",
-            str(repository_root / "configs/dense_baseline.toml"),
+            str(repository_root / "configs/archive/legacy/dense_baseline.toml"),
         ],
         cwd=tmp_path,
         env=environment,
@@ -587,7 +587,7 @@ def test_vista_worker_uses_submit_side_root_when_slurm_copies_script(tmp_path):
     assert captured[2:] == [
         "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
         "--module", "modded_nanogpt_moe.train", "--config",
-        str(repository_root / "configs/dense_baseline.toml"),
+        str(repository_root / "configs/archive/legacy/dense_baseline.toml"),
     ]
 
 
@@ -660,8 +660,8 @@ def test_vista_launcher_runs_configs_in_order_with_explicit_checkpoints(
     subprocess.run(
         [
             "bash", str(launcher), "--checkpoint-interval", "7",
-            "--resume", str(resume), "configs/dense_baseline.toml",
-            "configs/moe_e8k2_r2.toml",
+            "--resume", str(resume), "configs/archive/legacy/dense_baseline.toml",
+            "configs/archive/legacy/moe_e8k2_r2.toml",
         ],
         cwd=tmp_path,
         env=environment,
@@ -675,9 +675,9 @@ def test_vista_launcher_runs_configs_in_order_with_explicit_checkpoints(
     assert capture.read_text().splitlines() == [
         f"{custom_root}|7|"
         f"{resume}||||{command_prefix}"
-        f"{repository_root / 'configs/dense_baseline.toml'}",
+        f"{repository_root / 'configs/archive/legacy/dense_baseline.toml'}",
         f"{custom_root}|7|||||"
-        f"{command_prefix}{repository_root / 'configs/moe_e8k2_r2.toml'}",
+        f"{command_prefix}{repository_root / 'configs/archive/legacy/moe_e8k2_r2.toml'}",
     ]
     assert custom_root.is_dir()
 
@@ -791,7 +791,7 @@ def test_vista_benchmark_launcher_uses_trainer_without_artifacts(
         environment.pop(name, None)
 
     subprocess.run(
-        ["bash", str(launcher), "configs/moe_e8k2_r2.toml"],
+        ["bash", str(launcher), "configs/archive/legacy/moe_e8k2_r2.toml"],
         cwd=outside_repository,
         env=environment,
         check=True,
@@ -802,7 +802,7 @@ def test_vista_benchmark_launcher_uses_trainer_without_artifacts(
     assert captured[8:] == [
         "run", "--no-sync", "torchrun", "--standalone", "--nproc_per_node=1",
         "--module", "modded_nanogpt_moe.train", "--config",
-        str(repository_root / "configs/moe_e8k2_r2.toml"),
+        str(repository_root / "configs/archive/legacy/moe_e8k2_r2.toml"),
     ]
 
 
@@ -855,9 +855,9 @@ def test_existing_environment_overrides_take_precedence(monkeypatch):
     monkeypatch.setenv("TOP_K_OVERRIDE", "2")
     monkeypatch.setenv("MOE_BACKEND_OVERRIDE", "grouped_gemm")
     config, path = parse_train_args([
-        "--config", str(repository_root / "configs/dense_baseline.toml")])
+        "--config", str(repository_root / "configs/archive/legacy/dense_baseline.toml")])
 
-    assert path == repository_root / "configs/dense_baseline.toml"
+    assert path == repository_root / "configs/archive/legacy/dense_baseline.toml"
     assert config["training"]["microbatch_sequences"] == 32
     assert config["training"]["total_steps"] == 20
     assert config["model"]["mlp_type"] == "moe"
@@ -872,15 +872,15 @@ def test_checkpoint_environment_override_precedes_toml(monkeypatch):
     monkeypatch.setenv("CHECKPOINT_INTERVAL", "17")
 
     config, _ = parse_train_args([
-        "--config", str(repository_root / "configs/moe_e64k8_r0.5.toml")])
+        "--config", str(repository_root / "configs/archive/legacy/moe_e64k8_r0.5.toml")])
 
     assert config["checkpoint"]["interval"] == 17
 
 
 @pytest.mark.parametrize("filename,run_name,ratio,experts,top_k", [
-    ("dense_baseline.toml", "dense-baseline", 4, None, None),
-    ("moe_e8k2_r2.toml", "moe-e8k2-r2", 2, 8, 2),
-    ("moe_e64k8_r0.5.toml", "moe-e64k8-r0.5", 0.5, 64, 8),
+    ("archive/legacy/dense_baseline.toml", "dense-baseline", 4, None, None),
+    ("archive/legacy/moe_e8k2_r2.toml", "moe-e8k2-r2", 2, 8, 2),
+    ("archive/legacy/moe_e64k8_r0.5.toml", "moe-e64k8-r0.5", 0.5, 64, 8),
 ])
 def test_production_configs_share_training_policy(filename, run_name, ratio, experts, top_k):
     repository_root = Path(__file__).resolve().parents[1]

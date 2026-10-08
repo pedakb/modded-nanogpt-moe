@@ -273,20 +273,24 @@ def test_resume_rejects_changed_dedicated_router_lr():
 
 
 def test_ablation_config_changes_only_requested_settings():
-    root = Path(__file__).resolve().parents[1] / "configs"
-    reference = load_experiment_config(root / "moe_e64k8_r0.5_gradem_eta0.1.toml")
+    root = Path(__file__).resolve().parents[1] / "configs" / "archive"
+    reference = load_experiment_config(
+        root / "grad_em" / "moe_e64k8_r0.5_gradem_eta0.1.toml")
     expected = copy.deepcopy(reference)
     expected["run_name"] = "moe-e64k8-r0.5-gradem-eta0.01-router-adamw"
     expected["model"]["grad_em_eta"] = 0.01
     expected["optimizers"]["router_optimizer"] = "adamw"
     expected["checkpoint"]["interval"] = 50
-    actual = load_experiment_config(root / "moe_e64k8_r0.5_gradem_eta0.01_router_adamw.toml")
+    actual = load_experiment_config(
+        root / "router_ablations"
+        / "moe_e64k8_r0.5_gradem_eta0.01_router_adamw.toml")
     assert actual == expected
     assert actual["training"]["total_steps"] == 3250
 
 
 def test_dedicated_lr_config_changes_only_router_lr_and_run_name():
-    root = Path(__file__).resolve().parents[1] / "configs"
+    root = (Path(__file__).resolve().parents[1] / "configs" / "archive"
+            / "router_ablations")
     reference = load_experiment_config(
         root / "moe_e64k8_r0.5_gradem_eta0.01_router_adamw.toml")
     expected = copy.deepcopy(reference)

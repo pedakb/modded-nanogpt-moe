@@ -40,13 +40,13 @@ def test_submission_parser_and_forwarding(tmp_path, options, expected):
     result = subprocess.run(
         ["bash", "-c", script, "test", "--submit", *options,
          "--checkpoint-interval", "100", "--resume", "/checkpoints/with spaces/latest.pt",
-         "--", "configs/dense_baseline.toml", "configs/moe_e8k2_r2.toml"],
+         "--", "configs/archive/legacy/dense_baseline.toml", "configs/archive/legacy/moe_e8k2_r2.toml"],
         env=env, capture_output=True, text=True)
     assert result.returncode == 23, result.stderr
     assert capture.read_text().splitlines() == [
         *expected, str(LAUNCHER), "--worker", "--checkpoint-interval", "100",
         "--resume", "/checkpoints/with spaces/latest.pt", "--",
-        "configs/dense_baseline.toml", "configs/moe_e8k2_r2.toml",
+        "configs/archive/legacy/dense_baseline.toml", "configs/archive/legacy/moe_e8k2_r2.toml",
     ]
 
 

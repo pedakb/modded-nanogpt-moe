@@ -32,7 +32,7 @@ def evaluation_steps(total_steps, evaluation=PRODUCTION_EVALUATION, start=0):
 )
 def test_production_configs_parse_evaluation_section(filename):
     root = Path(__file__).resolve().parents[1]
-    path = root / "configs" / filename
+    path = root / "configs" / "archive" / "legacy" / filename
     raw = tomllib.loads(path.read_text())
     config = load_experiment_config(path)
 

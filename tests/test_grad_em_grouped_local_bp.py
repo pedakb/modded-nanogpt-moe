@@ -344,7 +344,8 @@ def test_numerical_report(cpu_backend, dtype, e, k, normalize):
 
 
 def test_packed_config_preserves_loop_experiment():
-    configs = Path(__file__).resolve().parents[1] / "configs"
+    configs = (Path(__file__).resolve().parents[1] / "configs" / "archive"
+               / "grad_em")
     loop = load_experiment_config(configs / "moe_e8k2_r2_gradem_local_bp.toml")
     packed = load_experiment_config(configs / "moe_e8k2_r2_gradem_local_bp_packed.toml")
     assert packed["run_name"] != loop["run_name"]

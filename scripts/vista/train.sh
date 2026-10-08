@@ -12,7 +12,7 @@ usage() {
 Usage: scripts/vista/train.sh [options] [CONFIG ...]
 
 Run configs on the current allocated node, or submit them as one Slurm suite.
-If no config is supplied, configs/moe_e64k8_r0.5.toml is used.
+If no config is supplied, configs/baselines/moe_e64k8.toml is used.
 
 Options:
   --submit                 Submit this script through sbatch
@@ -215,7 +215,7 @@ if [[ "$benchmark_worker" -eq 1 && ( -n "$steps" || -n "$checkpoint_interval" ||
 fi
 
 if [[ ${#config_arguments[@]} -eq 0 ]]; then
-    config_arguments=(configs/moe_e64k8_r0.5.toml)
+    config_arguments=(configs/baselines/moe_e64k8.toml)
 fi
 if [[ -n "$steps" && ${#config_arguments[@]} -ne 1 ]]; then
     echo "Error: --steps requires exactly one config" >&2
@@ -229,7 +229,7 @@ fi
 # Resolve every config and its TOML run identity before submission or training.
 config_paths=()
 run_names=()
-declare -A seen_run_names=()
+seen_run_names=()
 for config_argument in "${config_arguments[@]}"; do
     config_path="$config_argument"
     if [[ "$config_path" != /* ]]; then
@@ -252,11 +252,15 @@ for config_argument in "${config_arguments[@]}"; do
         echo "Error: run_name must be a single directory-safe name: $run_name" >&2
         exit 2
     fi
-    if [[ -n "${seen_run_names[$run_name]:-}" ]]; then
-        echo "Error: duplicate run_name in suite: $run_name" >&2
-        exit 2
+    if [[ ${#seen_run_names[@]} -gt 0 ]]; then
+        for seen_run_name in "${seen_run_names[@]}"; do
+            if [[ "$seen_run_name" == "$run_name" ]]; then
+                echo "Error: duplicate run_name in suite: $run_name" >&2
+                exit 2
+            fi
+        done
     fi
-    seen_run_names["$run_name"]=1
+    seen_run_names+=("$run_name")
     config_paths+=("$config_path")
     run_names+=("$run_name")
 done

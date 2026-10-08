@@ -1,5 +1,71 @@
 # Current handoff
 
+## Legacy config archive cleanup (2026-10-08, complete, uncommitted)
+
+Base `1f63e7c`, branch `cleanup-active-codebase`; continued on top of the
+uncommitted BP matrix organization. No commit, push, install, GPU run, or Slurm
+submission.
+
+- Moved all 36 former root TOMLs byte-for-byte into four purpose-based archive
+  directories: 5 under `configs/archive/legacy/`, 29 under
+  `configs/archive/grad_em/`, and 2 under
+  `configs/archive/router_ablations/`. The two existing shared-expert artifacts
+  are under `configs/archive/prototypes/`. All 38 archived files compare
+  byte-identically with `HEAD`; run names and resolved configs are unchanged.
+- The `configs/` root now contains only `README.md` and organized directories.
+  Active dense/E64 BP work remains under `configs/baselines/`; architecture
+  studies remain under `configs/moe_architectures/`. Vista still defaults to
+  `configs/baselines/moe_e64k8.toml`, and LS6 now defaults to the active
+  `configs/baselines/dense.toml`.
+- Updated launcher, documentation, handoff, and test references to explicit
+  archive paths. Historical resume examples retain the original TOMLs and run
+  identities. The config catalog inventories every archived family and purpose.
+- Recursive inventory loads 47 TOMLs with unique run names. The focused config
+  layout/checkpoint/launcher suite passes 25 tests. The broader relevant suite
+  passes 303 with 89 CUDA skips and two environment-sensitive failures: the
+  router test passes when rerun with the documented scoped torch grouped-GEMM
+  implementation, while the copied-worker test is blocked by sandbox access to
+  `/dev/fd`. Shell syntax, Python compilation, reference resolution, and
+  `git diff --check` pass. CUDA/GH200 execution remains out of scope here.
+
+## BP experiment matrix organization (2026-10-08, complete, uncommitted)
+
+Base `1f63e7c`, branch `cleanup-active-codebase`; worktree was clean. No commit,
+push, install, GPU run, or Slurm submission.
+
+- Added nine explicit standard-BP configs: dense and E64/K8 under
+  `configs/baselines/`; E64/K8 shared, E128/K8, E256/K6, and E512/K10
+  architecture studies under `configs/moe_architectures/`, with shared and
+  unshared variants where applicable.
+  All use D768/L12, packed grouped GEMM, the 3250-update/524288-token batch
+  policy, seed 1234, production optimizer/evaluation/diagnostic settings, and
+  unique `bp-matrix-*` run names. Widths are 16-aligned and active expansion is
+  reported at startup.
+- Archived only the unlaunched E256/K6 H384 prototypes directly under
+  `configs/archive/prototypes/`; byte comparison against `1f63e7c` passes. The
+  later legacy cleanup moved all historical TOMLs into purpose-based archive
+  directories and updated their references. The loader/checkpoint format was
+  not changed.
+- Vista now defaults to `configs/baselines/moe_e64k8.toml` and uses a Bash-3-compatible
+  indexed duplicate-run-name check. A fake-sbatch test confirms nested dense and
+  E64 paths survive real `--submit` preflight without launching a job.
+- The nine active TOMLs were moved byte-for-byte: their SHA-256 digests match
+  before and after the layout change. The obsolete intermediate hierarchy was
+  removed, and no active script or documentation still references it.
+- Recursive inventory: 47 TOMLs load with 47 unique run names. Focused config,
+  checkpoint-identity, shared-expert, Grad-EM, launcher, and legacy
+  production-policy tests: 128 passed. Full local suite before the final
+  directory-only move: 820 passed, 335 skipped, 9 unrelated existing failures
+  (two extracted worker-loop fixtures, one sandboxed process-substitution worker
+  test, one unscoped grouped-GEMM optimizer test, and five submission-parser
+  extraction tests). `bash -n`, `py_compile`, config byte checks, and
+  `git diff --check` pass.
+- Modified: AGENTS.md, HANDOFF.md, README.md, configs/README.md, train.py,
+  Vista train.sh, recursive Grad-EM config test, shared-expert archive path test;
+  added matrix/archive TOMLs and `tests/test_experiment_configs.py`.
+- Remaining: review diff, then GH200 smoke/memory validation for the larger E256
+  and E512 packed configurations before scheduling them.
+
 ## Optional shared expert (2026-10-08, implemented locally, uncommitted)
 
 Base `356d6a8`, branch `cleanup-active-codebase`. No installs, commits, pushes,
@@ -12,9 +78,9 @@ remote jobs, or full training runs. The worktree was clean before this task.
 - Config fields are `model.num_shared_experts` (0/1, default 0) and
   `model.shared_expert_ratio` (default 0.5). Shared 2D weights follow dense Muon
   ownership; 1D biases use AdamW. Legacy checkpoints default to shared-disabled.
-- Added standard-BP E256/K6/r0.5 configs with and without one r0.5 shared expert:
-  `configs/moe_e256k6_r0.5_shared_r0.5.toml` and
-  `configs/moe_e256k6_r0.5.toml`. Both retain the production schedule/settings.
+- Added standard-BP E256/K6/r0.5 configs with and without one r0.5 shared expert.
+  They are now preserved as superseded prototypes under `configs/archive/`;
+  the active approximately-4x BP matrix replaces them.
 - Focused shared tests: 13 passed. Full local suite: 788 passed, 335 skipped,
   18 unrelated existing failures (17 Vista launcher extraction/Bash issues and
   one router test requiring a scoped grouped-GEMM implementation override; that
@@ -23,8 +89,8 @@ remote jobs, or full training runs. The worktree was clean before this task.
   pending because this host has no CUDA. `git diff --check` passes.
 - Task files: model.py, grad_em.py, config.py, train.py, checkpoint.py,
   test_shared_expert.py, test_package.py, the two configs, README/config catalog,
-  and this handoff. Next: review, then run focused CUDA tests and a `--smoke
-  --steps 2` E256/K6 shared config on an existing Vista allocation.
+  and this handoff. The subsequent config-organization task supersedes the old
+  prototype launch instruction with the active BP matrix paths.
 
 ## Mixed local-BP optimization (2026-09-29, validated, uncommitted)
 
@@ -73,7 +139,7 @@ No installation, remote training, submission, commit or push.
 - Grad-EM math/kernels, model, schedules, loader and optimizer step code were
   not changed. Checkpoints record ownership in resolved optimizer config;
   legacy absent fields mean Muon; differing ownership is rejected on resume.
-- Added `configs/moe_e64k8_r0.5_gradem_eta0.01_router_adamw.toml`: E64/K8 packed,
+- Added `configs/archive/router_ablations/moe_e64k8_r0.5_gradem_eta0.01_router_adamw.toml`: E64/K8 packed,
   eta .01, unique run name, horizon 3250, checkpoint interval 50. No run started.
   For the requested 500-update prefix use the package entry point with
   `STOP_AFTER_COMPLETED_UPDATES=500`, Stockyard `CHECKPOINT_DIR`, and scoped
@@ -136,7 +202,7 @@ require Bash4+ (this Mac has3.2); that unrelated limitation remains.
 
 - Dense ratio 4; E8/K2 ratio 2; E64/K8 ratio 0.5. Both MoE configs now use
   `grouped_gemm` + `packed` + selected-probability normalization. E8 is now
-  `configs/moe_e8k2_r2.toml`, run name `moe-e8k2-r2`; repository references
+  `configs/archive/legacy/moe_e8k2_r2.toml`, run name `moe-e8k2-r2`; repository references
   updated. Dense omits MoE-only fields and resolves their existing defaults.
 - Shared D=768/L=12/vocab=50304, microbatch=64, global batch=524288, sequence=1024,
   horizon=3250, cooldown=0.7, seed=1234, one trial, identical optimizers/data
@@ -199,17 +265,17 @@ on Vista only when ready. Check for existing run-name directories first.
 
 ## Production E64/K8 configuration
 
-- The production experiment is `configs/moe_e64k8_r0.5.toml`, with run name
+- The production experiment is `configs/archive/legacy/moe_e64k8_r0.5.toml`, with run name
   `moe-e64k8-r0.5`, D=768, E=64, K=8, `mlp_ratio=0.5`, 3250 updates, grouped
   GEMM execution, and packed expert parameters. Packed storage is an
   implementation detail and is no longer part of the scientific config/run name.
 - Vista production training uses `MOE_GMM_IMPLEMENTATION=torch`, scoped to the
   actual torchrun process by the launchers. Submit the full run with
-  `scripts/vista/train.sh --submit configs/moe_e64k8_r0.5.toml`.
+  `scripts/vista/train.sh --submit configs/archive/legacy/moe_e64k8_r0.5.toml`.
   **Do not globally export `MOE_GMM_IMPLEMENTATION=torch` before pytest**: CPU
   unit tests that exercise the extension/fallback contract will fail under that
   global override.
-- `configs/moe_e8k2_r2.toml` uses the same packed backend and shared production
+- `configs/archive/legacy/moe_e8k2_r2.toml` uses the same packed backend and shared production
   settings; only run name, ratio, expert count and top-k differ from E64/K8.
 
 ## Vista execution workflow
@@ -377,10 +443,10 @@ export CC=/usr/bin/gcc CXX=/usr/bin/g++ TB_ROOT=
 unset MOE_GMM_IMPLEMENTATION
 uv run --no-sync python -m pytest -q -rs tests
 # Continue only after correctness passes; unset stale overrides per docs.
-MOE_GMM_IMPLEMENTATION=extension scripts/vista/benchmark.sh configs/moe_e64k8_r0.5_packed.toml
-MOE_GMM_IMPLEMENTATION=torch scripts/vista/benchmark.sh configs/moe_e64k8_r0.5_packed.toml
-MOE_GMM_IMPLEMENTATION=extension scripts/vista/benchmark.sh configs/moe_e8k2_r2.toml
-MOE_GMM_IMPLEMENTATION=torch scripts/vista/benchmark.sh configs/moe_e8k2_r2.toml
+MOE_GMM_IMPLEMENTATION=extension scripts/vista/benchmark.sh configs/archive/legacy/moe_e64k8_r0.5.toml
+MOE_GMM_IMPLEMENTATION=torch scripts/vista/benchmark.sh configs/archive/legacy/moe_e64k8_r0.5.toml
+MOE_GMM_IMPLEMENTATION=extension scripts/vista/benchmark.sh configs/archive/legacy/moe_e8k2_r2.toml
+MOE_GMM_IMPLEMENTATION=torch scripts/vista/benchmark.sh configs/archive/legacy/moe_e8k2_r2.toml
 ```
 
 The sections below retain earlier implementation notes; historical pending
@@ -444,7 +510,7 @@ export TB_ROOT=
 set -o pipefail
 mkdir -p "$STOCKYARD/logs/modded-nanogpt-moe/vista" "$STOCKYARD/profiles/modded-nanogpt-moe/vista"
 stamp="$(date +%Y%m%d-%H%M%S)-$$"
-scripts/vista/benchmark.sh configs/moe_e64k8_r0.5_packed.toml \
+scripts/vista/benchmark.sh configs/archive/legacy/moe_e64k8_r0.5.toml \
   2>&1 | tee "$STOCKYARD/logs/modded-nanogpt-moe/vista/triton-combine-$stamp.log"
 # Separate capture: complete optimizer updates 11 and 12, not benchmark timing.
 report="$STOCKYARD/profiles/modded-nanogpt-moe/vista/triton-combine-$stamp"
@@ -452,7 +518,7 @@ TRAIN_STEPS_OVERRIDE=14 NSYS_PROFILE=1 NSYS_WARMUP_STEPS=10 NSYS_ACTIVE_STEPS=2 
 nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
   --capture-range=cudaProfilerApi --capture-range-end=stop -o "$report" \
   uv run --no-sync torchrun --standalone --nproc_per_node=1 \
-  --module modded_nanogpt_moe.train --config configs/moe_e64k8_r0.5_packed.toml \
+  --module modded_nanogpt_moe.train --config configs/archive/legacy/moe_e64k8_r0.5.toml \
   2>&1 | tee "$report.log"
 nsys stats --report cuda_gpu_kern_sum,cuda_api_sum,nvtx_kern_sum \
   --format csv "$report.nsys-rep" | tee "$report.stats.csv"
@@ -503,8 +569,8 @@ module load nvidia/25.3 cuda/12.9
 export CC=/usr/bin/gcc CXX=/usr/bin/g++
 uv run --no-sync python -m pytest -q -rs tests
 # Only after correctness passes; run sequentially on the same allocation.
-scripts/vista/benchmark.sh configs/moe_e64k8_r0.5.toml
-scripts/vista/benchmark.sh configs/moe_e8k2_r2.toml
+scripts/vista/benchmark.sh configs/archive/legacy/moe_e64k8_r0.5.toml
+scripts/vista/benchmark.sh configs/archive/legacy/moe_e8k2_r2.toml
 ```
 
 The benchmark wrapper uses the real trainer, 10 warmup + 30 measured updates,
@@ -522,10 +588,10 @@ available in Git and on the earlier branches.
 
 - The package contains model/MoE, optimizers, data loading, checkpointing,
   TOML configuration, and training in separate focused modules.
-- `configs/dense_baseline.toml` defines D=768, ratio=4 dense training;
-  `configs/moe_e8k2_r2.toml` defines E=8, k=2, ratio=2 grouped MoE. Both keep
+- `configs/archive/legacy/dense_baseline.toml` defines D=768, ratio=4 dense training;
+  `configs/archive/legacy/moe_e8k2_r2.toml` defines E=8, k=2, ratio=2 grouped MoE. Both keep
   the 524288-token global batch.
-- `configs/moe_e64k8_r0.5.toml` adds a controlled OLMoE-style geometry:
+- `configs/archive/legacy/moe_e64k8_r0.5.toml` adds a controlled OLMoE-style geometry:
   D=768, E=64, k=8, and a 384-wide expert FFN (`mlp_ratio=0.5`). It retains
   selected-probability normalization and grouped GEMM. The historical 3500-step
   checkpoint reference is superseded by the shared 3250-step production suite;
@@ -648,11 +714,11 @@ available in Git and on the earlier branches.
    commands above. Verify actual multi-rank behavior separately if needed.
    Compare the two E64/K8 layouts before drawing conclusions about the original
    E8/K2 versus E64/K8 bottleneck. Preserve console output and profile separately.
-2. Use `scripts/vista/train.sh --steps N configs/moe_e64k8_r0.5.toml` for any
+2. Use `scripts/vista/train.sh --steps N configs/archive/legacy/moe_e64k8_r0.5.toml` for any
    further short validation on an existing Vista idev GH200 node; do not queue
    an sbatch smoke.
 3. Submit the full experiment with
-   `scripts/vista/train.sh --submit configs/moe_e64k8_r0.5.toml`.
+   `scripts/vista/train.sh --submit configs/archive/legacy/moe_e64k8_r0.5.toml`.
 4. Validate the cleanup branch on LS6, including its actual data path, full
    pytest suite, and short dense/grouped smokes.
 5. Recheck checkpoint creation/resume and comparison from the cleaned paths

@@ -194,7 +194,7 @@ def test_invalid_lambda(value):
 
 
 def test_lambda_defaults_loading_and_checkpoint_compatibility(tmp_path):
-    reference = "configs/moe_e64k8_r0.5_gradem_local_bp_eta0.01.toml"
+    reference = "configs/archive/grad_em/moe_e64k8_r0.5_gradem_local_bp_eta0.01.toml"
     config = load_experiment_config(reference)
     assert config["model"]["grad_em_lambda"] == 1.
     config["model"]["grad_em_mode"] = "global"

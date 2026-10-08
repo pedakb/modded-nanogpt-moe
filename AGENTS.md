@@ -24,7 +24,11 @@ before editing; the worktree may contain another agent's changes.
 - `modded_nanogpt_moe/train.py`: training, validation, compilation,
   actual-pipeline benchmarking, logging, checkpointing, reproducibility
   diagnostics, and Nsight markers.
-- `configs/`: portable experiment definitions. `run_name` identifies a run.
+- `configs/`: portable experiment definitions. Active BP baselines are under
+  `configs/baselines/`, architecture studies under `configs/moe_architectures/`,
+  stable legacy paths remain at the root, and superseded reproducibility
+  artifacts live under `configs/archive/`. `run_name` identifies a run
+  independently of its TOML path.
 - `tests/`: package, model/MoE parity, and checkpoint tests.
 - `tools/`: grouped-GEMM validation/profiling and checkpoint comparison.
 - `scripts/`: data download and LS6/Vista launchers.
@@ -152,22 +156,23 @@ Canonical single-GPU training:
 ```bash
 uv run --no-sync torchrun --standalone --nproc_per_node=1 \
   --module modded_nanogpt_moe.train \
-  --config configs/dense_baseline.toml
+  --config configs/baselines/dense.toml
 ```
 
 Cluster launchers load the established modules and set reusable defaults:
 
 ```bash
-scripts/ls6/train.sh configs/moe_e8k2_r2.toml
+scripts/ls6/train.sh configs/baselines/dense.toml
 source scripts/vista/env.sh
-scripts/vista/train.sh --steps 30 configs/moe_e64k8_r0.5.toml
-scripts/vista/train.sh configs/moe_e64k8_r0.5.toml
+scripts/vista/train.sh --steps 30 configs/baselines/moe_e64k8.toml
+scripts/vista/train.sh configs/baselines/moe_e64k8.toml
 ```
 
 Vista `env.sh` establishes machine state only. Do not globally export
 `MOE_GMM_IMPLEMENTATION=torch`; `train.sh` scopes it to the GH200 trainer
 process and clears stale experiment/profile/checkpoint state. It defaults to
-`configs/moe_e64k8_r0.5.toml`; multiple configs run sequentially. The `--steps`
+`configs/baselines/moe_e64k8.toml`; multiple configs run
+sequentially. The `--steps`
 path is current-node only and sets only `STOP_AFTER_COMPLETED_UPDATES`,
 preserving the configured schedule horizon, normal TensorBoard logging,
 and the run's normal checkpoint directory and TOML checkpoint policy.
@@ -180,7 +185,7 @@ defaulting to 10 warmup plus 30 measured optimizer updates. They disable
 TensorBoard and reject experiment/checkpoint/profiling overrides:
 
 ```bash
-scripts/vista/benchmark.sh configs/moe_e8k2_r2.toml
+scripts/vista/benchmark.sh configs/archive/legacy/moe_e8k2_r2.toml
 ```
 
 Use `BENCHMARK_WARMUP_UPDATES` and `BENCHMARK_MEASURED_UPDATES` only when a
@@ -189,7 +194,7 @@ different benchmark window is intentionally required.
 Submit one or more Vista configs from a login node with:
 
 ```bash
-scripts/vista/train.sh --submit configs/moe_e64k8_r0.5.toml
+scripts/vista/train.sh --submit configs/baselines/moe_e64k8.toml
 ```
 
 Use `scripts/vista/train.sh --submit CONFIG [CONFIG ...]`. The script submits

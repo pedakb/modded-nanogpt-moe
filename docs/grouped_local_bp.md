@@ -162,7 +162,7 @@ Original session results are `/tmp/moe-local-bp-benchmark-{standard,global,local
 
 ## Config and Vista smoke command
 
-`configs/moe_e8k2_r2_gradem_local_bp_packed.toml` matches the existing loop
+`configs/archive/grad_em/moe_e8k2_r2_gradem_local_bp_packed.toml` matches the existing loop
 local-BP experiment except for backend, packed layout and unique run identity.
 It sets `moe_backward="grad_em"`, `grad_em_mode="local_bp"`, eta=0.1,
 E8/K2/ratio2, and preserves the 3250-update horizon and checkpoint interval 250.
@@ -171,7 +171,7 @@ From the repository root on an existing Vista GPU allocation:
 
 ```bash
 source scripts/vista/env.sh
-scripts/vista/train.sh --smoke --steps 2 configs/moe_e8k2_r2_gradem_local_bp_packed.toml
+scripts/vista/train.sh --smoke --steps 2 configs/archive/grad_em/moe_e8k2_r2_gradem_local_bp_packed.toml
 ```
 
 The launcher scopes native GEMM to the trainer and stops after two completed
@@ -190,7 +190,7 @@ training smoke or a production training run.
 - `tests/test_grad_em_grouped_local_bp.py`: parity, boundary and call-count tests.
 - `tests/test_grad_em.py`, `tests/test_grad_em_local_bp.py`: configuration acceptance.
 - `tools/benchmark_grad_em.py`: reproducible layer latency/memory measurement.
-- `configs/moe_e8k2_r2_gradem_local_bp_packed.toml`: portable E8/K2 configuration.
+- `configs/archive/grad_em/moe_e8k2_r2_gradem_local_bp_packed.toml`: portable E8/K2 configuration.
 - `README.md`, `docs/grad_em.md`, `docs/grouped_local_bp.md`: usage and results.
 
 The two pre-existing untracked BP/global E8 configuration files were untouched.
