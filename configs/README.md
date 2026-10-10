@@ -10,6 +10,8 @@ settings. No inheritance layer is used.
 - `moe_architectures/` contains the standard-BP expert-count, routing-sparsity,
   and shared-expert studies. These active configs have unique run identities
   and therefore distinct TensorBoard and checkpoint directories.
+- `grad_em/` contains active Grad-EM experiment sweeps derived from those
+  standard-BP architectures.
 - `archive/legacy/` contains five historical standard-BP baselines and scaling
   references.
 - `archive/grad_em/` contains 29 historical Grad-EM comparisons and sweeps.
@@ -54,6 +56,28 @@ config | run_name | E | K | routed H | shared H | active expansion | expert para
 
 `dense.toml` and `moe_e64k8.toml` are under `configs/baselines/`; the remaining
 seven entries are under `configs/moe_architectures/`.
+
+## Active E256/K6 shared-expert Grad-EM sweep
+
+The eight `grad_em/moe_e256k6_shared_gradem_{global,local_bp}_eta*.toml`
+configs differ from `moe_architectures/moe_e256k6_shared.toml` only in
+`run_name`, `model.moe_backward`, `model.grad_em_mode`, and
+`model.grad_em_eta`. All retain the 3250-update schedule horizon. Omitted
+Grad-EM controls resolve to `grad_em_lambda=1`; omitted `grad_em_alpha` resolves
+to 1 for global mode and 0 for local-BP mode.
+
+mode | eta values | routed/shared H | schedule horizon
+--- | --- | ---: | ---:
+global | 0.001, 0.003, 0.007, 0.01 | 432 / 432 | 3250
+local_bp | 0.001, 0.003, 0.007, 0.01 | 432 / 432 | 3250
+
+The shared expert is outside the routed Grad-EM boundary and continues through
+ordinary autograd in both modes. A `--steps 200` screening run therefore saves
+an exact resumable prefix of the original 3250-update schedule rather than
+creating a separate 200-update LR horizon.
+
+See [the E256/K6 shared Grad-EM runbook](../docs/e256k6_shared_grad_em_sweep.md)
+for Vista smoke, screening, resume, and monitoring commands.
 
 ## Archive inventory
 

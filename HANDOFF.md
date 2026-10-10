@@ -1,5 +1,31 @@
 # Current handoff
 
+## E256/K6 shared Grad-EM sweep (2026-10-10, complete, uncommitted)
+
+Continued on `cleanup-active-codebase` with the existing dirty config cleanup.
+No implementation change, commit, push, job submission, or GPU run.
+
+- Added eight full-horizon configs under `configs/grad_em/` for global and
+  local-BP Grad-EM at eta 0.001/0.003/0.007/0.01. Each differs from
+  `configs/moe_architectures/moe_e256k6_shared.toml` only in run identity,
+  `moe_backward`, `grad_em_mode`, and `grad_em_eta`; all run names are unique.
+  Resolved lambda remains 1, while omitted alpha resolves to global=1 and
+  local-BP=0.
+- `docs/e256k6_shared_grad_em_sweep.md` records the memory smokes, six-job
+  200-update screening submission, selected-run resume command, walltime
+  guidance, and monitoring. Screening queues the launcher itself with
+  `--steps 200`, preserving the 3250-update LR horizon and saving an exact
+  resumable checkpoint at update 200; it does not use the unsupported
+  `--submit --steps` combination.
+- Config/shared-expert/Grad-EM/checkpoint focused tests pass 155 tests before
+  the final checkpoint-incompatibility assertions. All eight configs match the
+  BP baseline except the four intended fields, all 55 repository run names are
+  unique, five documented shell blocks pass `bash -n`, the Stage 1 script
+  dry-run emits six independent sbatch calls, and fake-sbatch Vista preflight
+  accepts all eight configs plus account/partition/node options.
+- E256 full-model memory remains unmeasured on GH200. Run both documented
+  two-update smokes before Stage 1; no fit or throughput claim is made.
+
 ## Legacy config archive cleanup (2026-10-08, complete, uncommitted)
 
 Base `1f63e7c`, branch `cleanup-active-codebase`; continued on top of the

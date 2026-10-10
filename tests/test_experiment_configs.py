@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from modded_nanogpt_moe.config import load_experiment_config
+from modded_nanogpt_moe.config import load_experiment_config, resolve_grad_em_alpha
 from modded_nanogpt_moe.checkpoint import (
     CHECKPOINT_FORMAT_VERSION,
     validate_checkpoint_config,
@@ -34,11 +34,16 @@ MATRIX = {
     "moe_architectures/moe_e512k10_shared.toml": (
         "moe", 512, 10, 288, 1, 4.125, 2_729_718_144),
 }
+GRAD_EM_SWEEP = {
+    f"grad_em/moe_e256k6_shared_gradem_{mode}_eta{eta}.toml": (mode, eta)
+    for mode in ("global", "local_bp")
+    for eta in (0.001, 0.003, 0.007, 0.01)
+}
 
 
 def test_every_repository_config_loads_and_run_names_are_unique():
     paths = sorted(CONFIG_ROOT.rglob("*.toml"))
-    assert len(paths) == 47
+    assert len(paths) == 55
     run_names = {}
     for path in paths:
         config = load_experiment_config(path)
@@ -125,6 +130,35 @@ def test_bp_matrix_shares_scientific_training_policy():
         assert config["optimizers"] == reference["optimizers"]
         assert config["diagnostics"] == reference["diagnostics"]
         assert config["checkpoint"] == reference["checkpoint"] == {"interval": 250}
+
+
+@pytest.mark.parametrize("relative_path,mode_eta", GRAD_EM_SWEEP.items())
+def test_e256k6_shared_grad_em_sweep_changes_only_grad_em_fields(
+        relative_path, mode_eta):
+    mode, eta = mode_eta
+    baseline = load_experiment_config(
+        CONFIG_ROOT / "moe_architectures" / "moe_e256k6_shared.toml")
+    actual = load_experiment_config(CONFIG_ROOT / relative_path)
+    expected = copy.deepcopy(baseline)
+    run_mode = mode.replace("_", "-")
+    expected["run_name"] = (
+        f"gradem-moe-e256k6-h432-shared-h432-{run_mode}-eta{eta}")
+    expected["model"].update(
+        moe_backward="grad_em", grad_em_mode=mode, grad_em_eta=eta)
+    assert actual == expected
+    assert actual["training"]["total_steps"] == 3250
+    assert actual["model"]["grad_em_lambda"] == 1.0
+    assert actual["model"]["grad_em_alpha"] is None
+    assert resolve_grad_em_alpha(None, mode) == (1.0 if mode == "global" else 0.0)
+    checkpoint = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "resolved_config": copy.deepcopy(actual),
+    }
+    validate_checkpoint_config(checkpoint, actual)
+    incompatible = copy.deepcopy(actual)
+    incompatible["model"]["grad_em_eta"] *= 2
+    with pytest.raises(ValueError, match="configuration is incompatible"):
+        validate_checkpoint_config(checkpoint, incompatible)
 
 
 @pytest.mark.parametrize("relative_path", MATRIX)
