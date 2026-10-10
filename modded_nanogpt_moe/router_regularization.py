@@ -18,6 +18,33 @@ def router_losses(logits, top_k):
     return aux, z
 
 
+def bp_regularized_forward(model, forward, inputs, targets, aux_coef, z_coef):
+    """Capture regularizers in the original BP graph; return CE, aux, and z.
+
+    Zero coefficients use the original forward without hooks or extra loss
+    computations. The caller combines token-mean regularizers with summed CE
+    and performs one backward. Grad-EM must use the separate replay below.
+    """
+    if not (aux_coef or z_coef):
+        return forward(inputs, targets), None, None
+    values = []
+    with ExitStack() as stack:
+        for module in model.modules():
+            if not isinstance(module, MoE):
+                continue
+            if module.moe_backward != "standard":
+                raise ValueError("single-pass router regularization requires standard BP")
+            def observe(router, args, logits, top_k=module.top_k):
+                values.append(router_losses(logits, top_k))
+            handle = module.router.register_forward_hook(observe)
+            stack.callback(handle.remove)
+        ce_loss = forward(inputs, targets)
+    if not values:
+        raise ValueError("router regularization requires MoE layers")
+    aux, z = (torch.stack([pair[i] for pair in values]).mean() for i in (0, 1))
+    return ce_loss, aux, z
+
+
 def model_router_losses(model, inputs):
     """Replay only the transformer with ordinary BP and average over MoE layers.
 

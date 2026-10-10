@@ -38,7 +38,7 @@ MATRIX = {
 
 def test_every_repository_config_loads_and_run_names_are_unique():
     paths = sorted(CONFIG_ROOT.rglob("*.toml"))
-    assert len(paths) == 47
+    assert len(paths) == 52
     run_names = {}
     for path in paths:
         config = load_experiment_config(path)

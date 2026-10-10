@@ -1,31 +1,40 @@
 # Current handoff
 
-## Optional router regularizers (2026-10-08, ready for review)
+## E256/K6 shared BP auxiliary sweep (2026-10-10, prepared, uncommitted)
 
-Isolated branch `router-regularizers`, base `bdb53fc`, worktree
-`/tmp/modded-nanogpt-moe-router-reg`. Original checkout/code and production
-configs unchanged. No jobs, installs, commits or pushes.
+Branch `router-regularizers`, base `7095ce6`, persistent worktree at
+`.worktrees/router-regularizers` inside the original repository. Recreated the
+missing temporary checkout. Original checkout code and active BP/Grad-EM
+configs are unchanged by this task. No jobs, training, benchmarks, installs,
+merges, commits or pushes; no active runs/checkpoints from this task.
 
-- Added independently disabled `[model] router_aux_loss_coef` and
-  `router_z_loss_coef`, FP32 objectives, separate TensorBoard metrics, and
-  legacy-zero checkpoint compatibility. Resume rejects changed coefficients.
-- A separate ordinary-BP transformer replay supplies additive regularizer
-  gradients without contaminating any upstream/global/local-BP Grad-EM signal.
-  Costs extra transformer work/memory when enabled; no replay when disabled.
-  Token means/layer means are multiplied by microbatch tokens to match summed
-  CE. Load counts are per microbatch, not pooled across an update.
-- Dirty files: README, this handoff, model/config/checkpoint/train, existing
-  diagnostics/package tests; new router_regularization module, focused tests,
-  and docs/router_regularization.md. No existing TOMLs changed.
-- New tests: 16 passed, 3 CUDA skips. Full suite with GCC/G++: 849 passed,
-  339 skipped, 7 launcher failures; all 7 reproduced on untouched base checkout.
-  `git diff --check` passes. No CUDA device visible; GPU/memory/performance
-  validation pending. No performance claim.
-- Review and Vista CUDA smoke instructions/coefficient reasoning are in
-  docs/router_regularization.md. Use original provisioned environment through
-  UV_PROJECT_ENVIRONMENT; ignored data symlink is already present here.
-  Next: review diff, run CUDA tests and BP/global/local-BP E256/K6 smokes on an
-  existing allocation only when requested. Preserve the queued BP jobs.
+- Five configs under `configs/router_regularizers/` sweep auxiliary coefficient
+  0.001/0.003/0.01/0.03/0.1 with explicit standard BP, z-loss zero, and enabled
+  divergence guard defaults. They otherwise exactly match the resolved E256/K6
+  shared BP baseline, including H432/D768/L12, seed, 524288-token batch,
+  microbatch 64/accumulation 8, optimizers/LR schedule, and 3250 updates.
+- BP now captures router objectives in its original forward graph and uses one
+  backward per microbatch. Grad-EM replay is unchanged. Detached routed-only
+  counts normalize balanced auxiliary loss to one; per-microbatch/per-layer
+  means become token sums before addition to summed CE. Zero coefficients
+  retain exact CE/gradient/RNG parity. Native BF16 joint gradients match an
+  independent objective exactly; FP32 gradients also match the prior replay.
+- Dirty: this handoff, regularizer module/train.py, router-regularization docs
+  and tests, config-inventory count; new five TOMLs, sweep doc and config tests.
+  No existing TOML or launcher modified. The ignored data link reuses original
+  FineWeb storage; UV_PROJECT_ENVIRONMENT reuses the provisioned environment.
+- Focused tests: 59 passed, 3 CUDA skips; config/inventory checks: 31 passed.
+  Full suite: 865 passed, 339 skipped, 7 existing launcher-fixture failures.
+  All seven reproduce on an untouched archive
+  of 7095ce6. Shell syntax, Python compilation, diff checks and five fake-sbatch
+  launcher preflights pass, including all-five job/storage collision checks.
+  All five real checkpoint/TensorBoard/local-log paths are absent at preparation.
+- Exact 03:05:00/email submission block: docs/e256k6_shared_aux_sweep.md.
+  Live scheduler access is blocked from this session; the block queries squeue
+  on the login host and aborts on failure/collision before any submission.
+  No CUDA device is accessible; GH200 smoke and full-model memory fit remain
+  pending. No throughput or walltime-completion claim. Guard stops save the
+  stopping update and normally report COMPLETED/END with DIVERGENCE_STOP in logs.
 
 ## Legacy config archive cleanup (2026-10-08, complete, uncommitted)
 

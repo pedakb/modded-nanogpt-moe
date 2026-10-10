@@ -22,8 +22,13 @@ equal-sized microbatches receive equal weight across gradient accumulation.
 The trainer multiplies the weighted mean by microbatch tokens to match summed
 CE, then uses the unchanged gradient summation across microbatches and ranks.
 
-Regularization uses a separate ordinary-BP transformer replay without the LM
-head. Temporarily selecting standard backward avoids both the current layer's
+Standard BP captures router losses in the original transformer forward and
+backpropagates summed CE plus the token-scaled regularizer once per microbatch.
+No transformer replay is used for BP. With zero coefficients, no hooks or
+regularizer computations are added, preserving the original forward/backward.
+
+Grad-EM regularization uses a separate ordinary-BP transformer replay without
+the LM head. Temporarily selecting standard backward avoids both the current layer's
 local-BP custom router boundary and upstream Grad-EM boundaries. This is necessary
 even in global mode: a regularizer added directly to later router logits would
 otherwise feed into earlier Grad-EM loss-to-go signals. The original LM graph
@@ -32,9 +37,9 @@ eta, lambda, and alpha never scale it. Shared experts use ordinary BP, including
 upstream effects on later router losses. Replay restores modes and diagnostic
 hooks on success or failure. No Grad-EM functions or optimizer math were edited.
 
-Enabled regularization costs an extra eager transformer forward/backward and
-activation memory. Both BP and Grad-EM use this same replay definition. With zero
-coefficients no replay occurs. Validation, divergence detection and LM loss logs
+Enabled Grad-EM regularization costs an extra eager transformer forward/backward
+and activation memory. BP uses one forward/backward. With zero coefficients
+no replay occurs. Validation, divergence detection and LM loss logs
 remain CE-only. Rank-zero TensorBoard logs microbatch averages under
 `metric/router/aux_loss`, `metric/router/z_loss`, and
 `metric/router/regularization`; individual losses are logged when their coefficient

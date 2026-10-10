@@ -1,10 +1,14 @@
 import copy
+import ast
+from contextlib import nullcontext
+from pathlib import Path
 
 import pytest
 import torch
 
 from modded_nanogpt_moe.model import GPT, eager_prefix
-from modded_nanogpt_moe.router_regularization import router_losses, model_router_losses
+from modded_nanogpt_moe.router_regularization import (
+    router_losses, model_router_losses, bp_regularized_forward)
 from modded_nanogpt_moe.config import load_experiment_config, validate_experiment_config
 from modded_nanogpt_moe.checkpoint import validate_checkpoint_config, CHECKPOINT_FORMAT_VERSION
 from test_shared_expert import cpu_grouped_gemm
@@ -41,6 +45,120 @@ def test_values_and_balance():
     expected = (f.detach() * p.mean(0)).sum() + x.logsumexp(-1).square().mean()
     torch.testing.assert_close(torch.autograd.grad(aux + z, x)[0],
                                torch.autograd.grad(expected, x)[0])
+
+
+def run_training_microbatch(model, inputs, aux_coef, z_coef):
+    """Execute the actual trainer's microbatch loop without CUDA setup."""
+    source = ast.parse((Path(__file__).parents[1] / "modded_nanogpt_moe/train.py").read_text())
+    loop = next(node for node in ast.walk(source)
+                if isinstance(node, ast.For)
+                and isinstance(node.target, ast.Name) and node.target.id == "i"
+                and "single_pass_regularization" in ast.unparse(node))
+    namespace = dict(__name__="modded_nanogpt_moe.train", __package__="modded_nanogpt_moe",
+                     model=model, model_config={"moe_backward": "standard"},
+                     inputs=inputs, targets=inputs, mbs=len(inputs),
+                     aux_coef=aux_coef, z_coef=z_coef, run_forward=model,
+                     nsys_range=lambda *args: nullcontext(), nsys_capture_active=False,
+                     diagnostic_losses=None, tensorboard_losses=[],
+                     regularization_metrics=[], writer=None)
+    code = compile(ast.Module(body=[loop], type_ignores=[]), "trainer_microbatch", "exec")
+    exec(code, namespace)
+    return namespace["tensorboard_losses"][0]
+
+
+@pytest.mark.parametrize("backend,layout", [
+    ("loop", "modulelist"), ("grouped_gemm", "packed")])
+def test_bp_training_single_pass_matches_replay(backend, layout, cpu_grouped_gemm, monkeypatch):
+    model = small_model(backend=backend, layout=layout, shared=1)
+    # Single-graph and separate-graph BF16 embedding gradients round at
+    # different points. Establish mathematical additivity in FP32 here;
+    # native BF16 is compared against an independent joint objective below.
+    model.embed.float()
+    reference = copy.deepcopy(model)
+    inputs = torch.randint(16, (2, 3))
+    ce = reference(inputs, inputs)
+    ce.backward()
+    aux, _ = model_router_losses(reference, inputs)
+    (0.03 * aux * inputs.numel()).backward()
+    expected = grads(reference)
+    forward_calls, backward_calls = [], []
+    handle = model.embed.register_forward_hook(lambda *args: forward_calls.append(1))
+    original_backward = torch.Tensor.backward
+    def backward(tensor, *args, **kwargs):
+        backward_calls.append(1)
+        return original_backward(tensor, *args, **kwargs)
+    monkeypatch.setattr(torch.Tensor, "backward", backward)
+    def no_replay(*args, **kwargs):
+        raise AssertionError("standard BP must not replay")
+    monkeypatch.setattr("modded_nanogpt_moe.router_regularization.model_router_losses", no_replay)
+    try:
+        actual_ce = run_training_microbatch(model, inputs, 0.03, 0.0)
+    finally:
+        handle.remove()
+    assert len(forward_calls) == len(backward_calls) == 1
+    torch.testing.assert_close(actual_ce, ce.detach(), rtol=0, atol=0)
+    for name, gradient in grads(model).items():
+        torch.testing.assert_close(gradient, expected[name])
+    assert expected["blocks.0.mlp.router.weight"].count_nonzero() > 0
+    assert not model.blocks[0].mlp.router._forward_hooks
+
+
+def test_bf16_bp_single_graph_gradients(cpu_grouped_gemm):
+    model = small_model(backend="grouped_gemm", layout="packed", shared=1)
+    assert model.embed.weight.dtype == torch.bfloat16
+    reference = copy.deepcopy(model)
+    inputs = torch.randint(16, (2, 3))
+    values, handles = [], []
+    def observe(router, args, logits):
+        logits = logits.flatten(0, -2).float()
+        probabilities = logits.softmax(-1)
+        selected = probabilities.topk(2, dim=-1).indices
+        counts = torch.nn.functional.one_hot(selected, 4).sum((0, 1)).detach()
+        frequencies = counts.float() * (4 / selected.numel())
+        values.append((frequencies * probabilities.mean(0)).sum())
+    for block in reference.blocks:
+        handles.append(block.mlp.router.register_forward_hook(observe))
+    try:
+        ce = reference(inputs, inputs)
+    finally:
+        for handle in handles:
+            handle.remove()
+    (ce + 0.03 * torch.stack(values).mean() * inputs.numel()).backward()
+    actual_ce = run_training_microbatch(model, inputs, 0.03, 0.0)
+    torch.testing.assert_close(actual_ce, ce.detach(), rtol=0, atol=0)
+    for name, gradient in grads(model).items():
+        torch.testing.assert_close(gradient, grads(reference)[name], rtol=0, atol=0)
+
+
+def test_zero_coefficient_bp_training_exact(cpu_grouped_gemm, monkeypatch):
+    model = small_model(backend="grouped_gemm", layout="packed", shared=1)
+    reference = copy.deepcopy(model)
+    inputs = torch.randint(16, (2, 3))
+    rng = torch.get_rng_state()
+    ce = reference(inputs, inputs)
+    ce.backward()
+    expected_rng = torch.get_rng_state()
+    torch.set_rng_state(rng)
+    def no_regularizers(*args, **kwargs):
+        raise AssertionError("zero coefficients must use original forward")
+    monkeypatch.setattr("modded_nanogpt_moe.router_regularization.bp_regularized_forward", no_regularizers)
+    monkeypatch.setattr("modded_nanogpt_moe.router_regularization.model_router_losses", no_regularizers)
+    actual_ce = run_training_microbatch(model, inputs, 0.0, 0.0)
+    torch.testing.assert_close(actual_ce, ce.detach(), rtol=0, atol=0)
+    torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0, atol=0)
+    for name, gradient in grads(model).items():
+        torch.testing.assert_close(gradient, grads(reference)[name], rtol=0, atol=0)
+    assert list(model.state_dict()) == list(reference.state_dict())
+
+
+def test_bp_capture_removes_hooks_on_error():
+    model = small_model(shared=1)
+    inputs = torch.randint(16, (2, 3))
+    def fail(*args):
+        raise RuntimeError("forward failed")
+    with pytest.raises(RuntimeError, match="forward failed"):
+        bp_regularized_forward(model, fail, inputs, inputs, 0.01, 0.0)
+    assert all(not block.mlp.router._forward_hooks for block in model.blocks)
 
 
 @pytest.mark.parametrize("mode,backend,layout", [

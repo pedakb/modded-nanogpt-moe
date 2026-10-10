@@ -836,29 +836,45 @@ def main(argv=None):
                 collect_tb = tb_diagnostics is not None and tb_diagnostics.due(step + 1)
                 with tb_diagnostics.capture_routing() if collect_tb else nullcontext():
                     for i in range(len(inputs) // mbs):
+                        micro_inputs = inputs[i*mbs:(i+1)*mbs]
+                        micro_targets = targets[i*mbs:(i+1)*mbs]
+                        single_pass_regularization = (
+                            model_config["moe_backward"] == "standard"
+                            and bool(aux_coef or z_coef))
                         with nsys_range(nsys_capture_active, f"forward.microbatch_{i}"):
-                            loss = run_forward(
-                                inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+                            if single_pass_regularization:
+                                from .router_regularization import bp_regularized_forward
+                                loss, aux_loss, z_loss = bp_regularized_forward(
+                                    model, run_forward, micro_inputs, micro_targets,
+                                    aux_coef, z_coef)
+                            else:
+                                loss = run_forward(micro_inputs, micro_targets)
                             if diagnostic_losses is not None:
                                 diagnostic_losses.append(loss.detach())
                             if tensorboard_losses is not None:
                                 tensorboard_losses.append(loss.detach())
                         with nsys_range(nsys_capture_active, f"backward.microbatch_{i}"):
-                            loss.backward()
-                            if aux_coef or z_coef:
+                            if single_pass_regularization:
+                                regularization = aux_coef * aux_loss + z_coef * z_loss
+                                (loss + regularization * micro_targets.numel()).backward()
+                            else:
+                                loss.backward()
+                            if (aux_coef or z_coef) and not single_pass_regularization:
                                 from .router_regularization import model_router_losses
                                 aux_loss, z_loss = model_router_losses(
-                                    model, inputs[i*mbs:(i+1)*mbs])
+                                    model, micro_inputs)
                                 regularization = aux_coef * aux_loss + z_coef * z_loss
                                 # LM CE is summed, and gradients are summed across
                                 # microbatches/ranks. Convert token/layer means to
                                 # the same token-sum scale without changing CE.
-                                (regularization * targets[i*mbs:(i+1)*mbs].numel()).backward()
-                                if writer is not None:
-                                    regularization_metrics.append(torch.stack([
-                                        aux_loss.detach(), z_loss.detach(),
-                                        regularization.detach()]))
+                                (regularization * micro_targets.numel()).backward()
+                            if (aux_coef or z_coef) and writer is not None:
+                                regularization_metrics.append(torch.stack([
+                                    aux_loss.detach(), z_loss.detach(),
+                                    regularization.detach()]))
                         del loss
+                        if aux_coef or z_coef:
+                            del aux_loss, z_loss, regularization
                 if writer is not None and regularization_metrics:
                     metrics = torch.stack(regularization_metrics).mean(0)
                     if aux_coef:
